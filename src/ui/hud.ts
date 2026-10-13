@@ -70,6 +70,7 @@ export class Hud {
     this.nameEl = this.root.querySelector('.name')!;
     this.comboEl = this.root.querySelector('.combo')!;
     this.hintEl = this.root.querySelector('.hint')!;
+    if (touch) this.hintEl.classList.add('touch');
     this.helpEl = this.root.querySelector('.help')!;
     this.todBtn = this.root.querySelector('.tod')!;
     this.soundBtn = this.root.querySelector('.snd')!;

@@ -91,7 +91,7 @@ export class Skater {
       const repl = mats.map((m: any) => {
         if (m.map) {
           const map = faceTex ?? m.map; map.colorSpace = SRGBColorSpace;
-          return toonMaterial({ map, bands: 0.85, wrap: 0.45, rim: 0.7, name: 'skinFace' });
+          return toonMaterial({ map, bands: 0.45, wrap: 0.6, rim: 0.6, name: 'skinFace' });
         }
         return toonMaterial({ vertexColors: true, bands: 0.85, wrap: 0.42, rim: 0.75, name: 'skaterVC' });
       });
@@ -343,7 +343,7 @@ export class Skater {
 
     // ---------------- board pose
     let roll = 0, yaw = 0, lift = 0;
-    if (ph.flip && inAir) {
+    if (ph.flip && inAir && !ph.flip.done) {
       const pr = clamp(ph.flip.t / ph.flip.dur, 0, 1);
       const e = pr < 1 ? 0.5 - 0.5 * Math.cos(Math.PI * pr) : 1;
       if (ph.flip.kind === 'kickflip') roll = -Math.PI * 2 * e;
@@ -589,7 +589,7 @@ export class Skater {
         const off = new Vector3(e.x - s.x, 0, e.z - s.z).multiply(this.model.scale).applyQuaternion(this.clipRootQ);
         if (gu !== 'idle') this.clipRootPos.add(off);
         this.phase = 'getup'; this.phaseT = 0;
-        this.play(gu, { rate: gu === 'getup_knock' ? 1.15 : gu === 'idle' ? 1 : 1.75, fade: gu === 'idle' ? 0.4 : 0.12, loop: gu === 'idle' });
+        this.play(gu, { rate: gu === 'getup_knock' ? 1.3 : gu === 'idle' ? 1 : 2.1, fade: gu === 'idle' ? 0.4 : 0.12, loop: gu === 'idle' });
       }
     } else if (this.phase === 'getup') {
       const dur = a ? a.getClip().duration / Math.abs(a.timeScale) : 1;
@@ -626,24 +626,26 @@ export class Skater {
     }
     void board;
     this.mixer.update(dt);
-  }
-
-  private snap = new Map<Bone, { q: Quaternion; p: Vector3 }>();
-  /** blend the clip pose (sampled into a snapshot) with the procedural pose currently on the bones */
-  private blendClip() {
-    // procedural pose is on the bones; capture it, evaluate the mixer, then mix
-    const w = this.procW;
-    const all = [...this.b.values(), ...this.fingerBones, ...this.thumbBones];
-    for (const bi of all) {
-      let s = this.snap.get(bi.bone);
-      if (!s) { s = { q: new Quaternion(), p: new Vector3() }; this.snap.set(bi.bone, s); }
+    // the mixer only writes changed values, so keep our own copy of the clip pose
+    for (const bi of this.allBones()) {
+      let s = this.clipPose.get(bi.bone);
+      if (!s) { s = { q: new Quaternion(), p: new Vector3() }; this.clipPose.set(bi.bone, s); }
       s.q.copy(bi.bone.quaternion); s.p.copy(bi.bone.position);
     }
-    this.mixer.update(0);
-    for (const bi of all) {
-      const s = this.snap.get(bi.bone)!;
-      bi.bone.quaternion.slerp(s.q, w);
-      bi.bone.position.lerp(s.p, w);
+  }
+
+  private clipPose = new Map<Bone, { q: Quaternion; p: Vector3 }>();
+  private _all: BoneInfo[] | null = null;
+  private allBones() { return this._all ??= [...this.b.values(), ...this.fingerBones, ...this.thumbBones]; }
+  /** mix the captured clip pose with the procedural pose currently on the bones (procW = procedural weight) */
+  private blendClip() {
+    const w = this.procW;
+    for (const bi of this.allBones()) {
+      const s = this.clipPose.get(bi.bone);
+      if (!s) continue;
+      const q = _q.copy(s.q).slerp(bi.bone.quaternion, w);
+      bi.bone.quaternion.copy(q);
+      bi.bone.position.lerpVectors(s.p, bi.bone.position, w);
     }
   }
 

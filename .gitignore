@@ -7,6 +7,6 @@ dist/
 *.FBX
 *.blend
 *.blend1
-public/textures/src/
+
 tools/**/__pycache__/
 .vite/

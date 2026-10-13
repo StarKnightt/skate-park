@@ -26,7 +26,11 @@ export class CameraRig {
     this.heading = heading;
     this.yaw = heading + Math.PI;
     this.userYaw = 0; this.userPitch = 0;
+    this.dist = this.distOverride ?? 3.6;
+    this.pitch = 0.2;
+    this.snapNext = true;
   }
+  snapNext = false;
 
   addOrbit(dx: number, dy: number) {
     this.userYaw -= dx * 0.006;
@@ -43,7 +47,12 @@ export class CameraRig {
     }
     const hv = Math.hypot(vel.x, vel.z);
     // heading follows horizontal travel; hold it on vert walls / when slow
-    if (hv > 1.2 && mode !== 'bail' && steepness < 0.6) this.heading = dampAngle(this.heading, Math.atan2(vel.x, vel.z), mode === 'air' ? 1.2 : 2.6, dt);
+    if (hv > 1.2 && mode !== 'bail' && steepness < 0.6) {
+      const want = Math.atan2(vel.x, vel.z);
+      // riding back and forth (half pipe, fakie): don't swing the camera around, turn slowly
+      const reversed = Math.abs(wrapAngle(want - this.heading)) > 1.9;
+      this.heading = dampAngle(this.heading, want, reversed ? 0.35 : mode === 'air' ? 1.2 : 2.6, dt);
+    }
     this.idleT += dt;
     if (this.idleT > 2.5 && hv > 1.5) {
       this.userYaw *= Math.exp(-0.8 * dt);
@@ -54,14 +63,16 @@ export class CameraRig {
       this.userYaw += this.orbitMode.speed * dt;
     }
     const baseYaw = this.heading + Math.PI;
-    this.yaw = dampAngle(this.yaw, baseYaw + this.userYaw, 6, dt);
+    this.yaw = this.snapNext ? baseYaw + this.userYaw : dampAngle(this.yaw, baseYaw + this.userYaw, 6, dt);
     const tgtPitch = 0.2 + this.userPitch + (mode === 'air' ? 0.06 : 0) + clamp(steepness * 0.25, 0, 0.25);
     this.pitch += (tgtPitch - this.pitch) * (1 - Math.exp(-4 * dt));
-    const wantDist = this.distOverride ?? ((this.orbitMode ? this.orbitMode.dist : 3.5 + clamp(speed / 9, 0, 1) * 1.3) + (mode === 'air' ? 0.4 : 0));
+    const portrait = this.cam.aspect < 1 ? 1.45 : 1;
+    const wantDist = this.distOverride ?? ((this.orbitMode ? this.orbitMode.dist : (3.5 + clamp(speed / 9, 0, 1) * 1.3) * portrait) + (mode === 'air' ? 0.4 : 0));
     this.dist += (wantDist - this.dist) * (1 - Math.exp(-2.5 * dt));
     // smoothed focus (lag a little behind the skater for weight)
     const f = this.tmp.copy(focus);
     f.y += this.orbitMode ? this.orbitMode.height : 0.35;
+    if (this.snapNext) { this.target.set(f); this.dist = wantDist; this.snapNext = false; }
     this.target.update(f, dt, mode === 'bail' ? 4 : 10);
     const t = this.target.x;
     const cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
@@ -81,8 +92,7 @@ export class CameraRig {
     }
     this.cam.position.copy(this.pos);
     this.cam.lookAt(t);
-    this.fovS.update(56 + clamp(speed / 10, 0, 1) * 8, dt);
+    this.fovS.update((this.cam.aspect < 1 ? 64 : 56) + clamp(speed / 10, 0, 1) * 8, dt);
     if (Math.abs(this.cam.fov - this.fovS.x) > 0.01) { this.cam.fov = this.fovS.x; this.cam.updateProjectionMatrix(); }
-    void wrapAngle;
   }
 }

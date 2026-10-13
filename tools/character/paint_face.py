@@ -42,9 +42,9 @@ for s in (1, -1):
     d.ellipse([cx - m(0.014), cy - m(0.008), cx + m(0.014), cy + m(0.008)], fill=(240, 128, 112, 105))
 paste(l, blur=9)
 l = layer(); d = ImageDraw.Draw(l)
-cx, cy = px(0, 1.612)
-d.ellipse([cx - m(0.008), cy - m(0.0035), cx + m(0.008), cy + m(0.0035)], fill=(196, 128, 98, 120))
-paste(l, blur=4)
+cx, cy = px(0, 1.6125)
+d.ellipse([cx - m(0.0055), cy - m(0.0022), cx + m(0.0055), cy + m(0.0022)], fill=(206, 140, 112, 60))
+paste(l, blur=5)
 
 # freckles
 rng = np.random.default_rng(7)

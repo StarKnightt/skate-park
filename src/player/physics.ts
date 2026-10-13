@@ -675,7 +675,7 @@ export class SkatePhysics {
       this.pos.addScaledVector(sep, r - d);
       const vn = this.vel.dot(sep);
       if (vn < 0) {
-        if (-vn > 4.2 && this.mode !== 'grind') { this.toBail(Math.random() < 0.5 ? 'knock' : 'face', 'wall'); return; }
+        if (-vn > 4.2 && this.mode !== 'grind') { this.toBail('back', 'wall', sep.clone()); return; }
         this.vel.addScaledVector(sep, -vn * 1.25);
         this.vel.multiplyScalar(0.75);
         if (-vn > 1.2) { this.bonk = 0.3; this.wobble = Math.max(this.wobble, 0.4); this.emit('bonk'); }
@@ -685,7 +685,7 @@ export class SkatePhysics {
   }
 
   // ---------------------------------------------------------------------------------------- bail
-  toBail(kind: BailKind, reason: string) {
+  toBail(kind: BailKind, reason: string, wallN?: Vector3) {
     if (this.mode === 'bail' || this.mode === 'recover') return;
     const heading = Math.atan2(this.vel.x, this.vel.z);
     const hspeed = Math.hypot(this.vel.x, this.vel.z);
@@ -693,8 +693,8 @@ export class SkatePhysics {
     this.bail = {
       kind, t: 0,
       body: this.pos.clone(),
-      bodyVel: this.vel.clone().multiplyScalar(0.55),
-      heading: hspeed > 0.5 ? heading : Math.atan2(this.fwd.x, this.fwd.z),
+      bodyVel: wallN ? this.vel.clone().projectOnPlane(wallN).multiplyScalar(0.3).addScaledVector(wallN, 1.2) : this.vel.clone().multiplyScalar(0.55),
+      heading: wallN ? Math.atan2(-wallN.x, -wallN.z) : hspeed > 0.5 ? heading : Math.atan2(this.fwd.x, this.fwd.z),
       boardPos: this.pos.clone().addScaledVector(this.up, 0.06),
       boardVel: this.vel.clone().multiplyScalar(0.95).add(new Vector3((Math.random() - 0.5) * 1.5, 1.6, (Math.random() - 0.5) * 1.5)),
       boardQ: bQ,

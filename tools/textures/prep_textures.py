@@ -8,7 +8,7 @@ from scipy import ndimage
 
 GEN, PROJ = sys.argv[1], sys.argv[2]
 OUT = os.path.join(PROJ, "public", "textures")
-SRC = os.path.join(OUT, "src")
+SRC = os.path.join(PROJ, "assets_src", "textures")
 os.makedirs(OUT, exist_ok=True)
 
 
@@ -38,7 +38,7 @@ murals = {
 for name, (aspect, cy) in murals.items():
     im = Image.open(os.path.join(GEN, name + ".jpg")).convert("RGB")
     im = crop_aspect(im, aspect, cy)
-    im = im.resize((1536, int(1536 / aspect)), Image.LANCZOS)
+    im = im.resize((1024, int(1024 / aspect)), Image.LANCZOS)
     save(im, name + ".webp", 80)
 
 # deck graphic: centre strip matching the deck outline (0.21 x 0.81 m)
