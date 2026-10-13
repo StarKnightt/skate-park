@@ -11,29 +11,63 @@ Everything in the game is original: the park, the skater "Sol", the board and it
 - **Live:** https://starknightt.github.io/skate-park/ (GitHub Pages, once deployed)
 - **Local:** `pnpm install` then `pnpm dev` and open http://127.0.0.1:5188/
 
-### Keyboard + mouse
-| Input | Action |
-|---|---|
-| W | push (flat ground) / pump down transitions |
-| A / D | steer and carve; spin in the air |
-| S | foot brake |
-| Space | hold to crouch, release to ollie (longer crouch = higher pop) |
-| ← → ↓ ↑ + Space | kickflip, heelflip, pop shove-it, tre flip (hold the arrow at the pop, or press arrow + Space in the air) |
-| E | grind / slide a rail, ledge, curb or coping (50-50 when aligned, boardslide when across) |
-| Shift | manual (W / S to keep your balance) |
-| hold W at a bowl lip | air out of the bowl onto the deck instead of back in |
-| Mouse drag | orbit the camera · C recenters |
-| T | time of day (golden hour → sunset → blue hour → bright noon) |
-| R | respawn · H help |
+### Controls
+Three control modes. Switch them in the pause menu; the choice is remembered.
 
-### Gamepad (standard mapping)
-Left stick push / brake / steer · A hold + release to ollie · D-pad + A flip tricks · X grind · B or RB manual ·
-right stick camera · Y time of day · Start help · Back respawn.
+- **Easy** (the default on every device): he keeps rolling at a comfortable cruise by himself (W / stick up for more
+  speed, S / stick down slows down and stops), the steering is forgiving, a tap of Space pops a good ollie (hold for
+  higher), one flip button (F, or Space again in the air) cycles kickflip, heelflip, pop shove-it and tre flip, grinds
+  lock on by themselves near rails and ledges (E still works), landings straighten themselves and bails are short.
+- **Auto-ride**: he skates the park on his own, flowing through hand-made lines. Any movement or trick input takes over
+  instantly (with the Easy controls); about 4 s after you let go, while rolling, he carries on. Q, gamepad Y or the
+  touch AUTO button toggles auto-ride in any mode.
+- **Pro**: the full manual scheme: flips picked by direction, E grinds, Shift manuals, real bails.
 
-### Touch (phones and tablets, portrait or landscape)
-Left virtual stick: up pushes, down brakes, sideways steers · OLLIE: hold to crouch, release to pop; swipe ← → ↓ ↑
-as you release for kickflip / heelflip / shove-it / tre flip · GRIND and MANUAL buttons · drag anywhere else to look
-around · the time-of-day and help buttons sit top right.
+#### Keyboard + mouse (no arrow keys needed)
+| Input | Pro | Easy / Auto-ride |
+|---|---|---|
+| W | push / pump transitions | faster (he cruises by himself) |
+| S | brake | slow down / stop |
+| A / D | steer and carve; spin in the air | the same, softer |
+| Space | hold to crouch, release to ollie (longer = higher) | tap to ollie (hold for higher); in the air: flip trick |
+| F | flip trick. The WASD key held when you press F picks it: none or A kickflip, D heelflip, S pop shove-it, W tre flip. Rolling: quick pop + flip · crouched on Space: pops now at the current charge + flip · in the air: late flip | flip trick, cycling kickflip, heelflip, pop shove-it, tre flip (pops one when rolling) |
+| E | grind / slide a rail, ledge, curb or coping (50-50 when aligned, boardslide when across) | grinds lock on by themselves; E still works |
+| Shift | manual (W / S to keep your balance) | the same |
+| Q | auto-ride on / off | the same |
+| T · R · C · H | time of day · respawn · recenter camera · help | the same |
+| Esc | pause menu | the same |
+| Mouse (optional) | click the game to lock the mouse and look around (raw mouse look), or drag to orbit; Esc frees the mouse and opens the pause menu | the same |
+
+The camera follows by itself, so the keyboard alone is enough. Hold W at a bowl lip to air out onto the deck instead
+of back in. Mouse sensitivity and invert-Y are in the pause menu.
+
+#### Gamepad (standard mapping)
+| Input | Pro | Easy / Auto-ride |
+|---|---|---|
+| Left stick | steer · up push · down brake | steer · up faster · down slow / stop |
+| A | hold to crouch, release to ollie | tap to ollie; in the air: flip trick |
+| X | flip trick; the left-stick direction picks it (none or left kickflip, right heelflip, down shove-it, up tre flip) | flip trick, cycling the flips |
+| D-pad + A | hold a direction as you release A: the same flips (alternate) | the same |
+| B | grind | grind (grinds also lock on by themselves) |
+| LB / RB | manual | the same |
+| Y | auto-ride on / off | the same |
+| Right stick · L3 / R3 | camera · recenter | the same |
+| Start · Back · LT | pause menu · respawn · time of day | the same |
+
+#### Touch (phones and tablets, portrait or landscape)
+- **Pro:** left virtual stick (up pushes, down brakes, sideways steers) · OLLIE: hold to crouch, release to pop; swipe
+  left / right / down / up as you release for kickflip / heelflip / shove-it / tre flip · GRIND and MANUAL buttons.
+- **Easy / Auto-ride:** stick (steer; he cruises, up for more speed, down slows down and stops) · OLLIE: tap to pop ·
+  TRICK: flip trick, cycling the flips · AUTO: auto-ride on / off (lit while it drives). Grinds are automatic, so there
+  is no GRIND button.
+- **Every mode:** drag anywhere else to look around · the pause button sits top left · time of day, sound and help top right.
+
+#### Pause menu
+Esc, gamepad Start, the touch pause button or the menu pill (top right on desktop) open it: the game freezes and the
+sound ducks. Resume (locks the mouse again if it was locked) · Respawn · Controls (the full reference per device and
+mode) · control mode · time of day · music and sound volume · mouse sensitivity and invert-Y · graphics quality (Auto,
+Low, Medium, High) · fullscreen. Keyboard: W / S move, A / D change, Enter or Space select, Esc resumes. Gamepad:
+D-pad or left stick, A selects, B goes back / resumes, Start resumes.
 
 ### How it feels
 Momentum based: pushing gives diminishing returns, transitions convert height into speed and back, uphill costs you,

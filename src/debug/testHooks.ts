@@ -1,6 +1,7 @@
 import { Vector3 } from 'three';
 import type { Game } from '../game';
 import { PRESETS } from '../render/timeOfDay';
+import { settings, MOUSE_RAD_PER_COUNT } from '../core/settings';
 
 interface Step { at: number; down?: string[]; up?: string[] }
 
@@ -8,7 +9,8 @@ interface Step { at: number; down?: string[]; up?: string[] }
  * window.__skate test API (enabled with ?debug or ?test):
  *  teleport(x,y,z,headingDeg,speed) · setTime(nameOrIndex, instant) · script(steps) · hold(codes) · release(codes)
  *  manual(true) + advance(frames, dt) for deterministic frame-stepped capture · shot(landmark) · free() · orbit(speed,dist,h)
- *  state() · hud(bool) · touch(bool)
+ *  state() (physics) · view() (interpolated state the frame draws) · frame() (steps / acc / alpha of the last frame)
+ *  look(dx, dy) (raw mouse counts) · input · pause(on) · hud(bool) · touch(bool)
  */
 export function installTestHooks(g: Game) {
   const held = new Set<string>();
@@ -33,32 +35,47 @@ export function installTestHooks(g: Game) {
     get ready() { return g.ready; },
     teleport(x: number, y: number, z: number, headingDeg = 180, speed = 0) {
       g.respawn(new Vector3(x, y, z), (headingDeg * Math.PI) / 180);
-      if (speed) g.physics.vel.copy(g.physics.fwd).multiplyScalar(speed);
+      if (speed) { g.physics.vel.copy(g.physics.fwd).multiplyScalar(speed); g.physics.speed = speed; g.resnap(); }
       return api.state();
     },
     setTime(n: string | number, instant = true) {
-      const i = typeof n === 'number' ? n : g.tod.byName(n);
-      g.tod.set(i, instant);
-      if (instant) { g.applyEnv(g.tod.cur); }
-      g.hud.setTimeLabel(PRESETS[g.tod.index].name);
+      g.setTime(typeof n === 'number' ? n : g.tod.byName(n), instant);
     },
     script(s: Step[]) { steps = [...s].sort((a, b) => a.at - b.at); scriptStart = g.simTime; held.clear(); },
     hold(codes: string[]) { codes.forEach((c) => held.add(c)); },
     release(codes?: string[]) { if (!codes) held.clear(); else codes.forEach((c) => held.delete(c)); },
     manual(on: boolean) { g.manualClock = on; g.lastFrame = 0; },
+    /** frame-stepped: input + simulate per frame (never paused), one render at the end */
     advance(frames = 1, dt = 1 / 30, render = true) {
-      for (let i = 0; i < frames; i++) g.simulate(dt);
+      for (let i = 0; i < frames; i++) { g.frameInput(dt); g.simulate(dt); }
       if (render) g.render(dt);
       return g.simTime;
+    },
+    /** raw mouse-look counts, as with the pointer locked (dx > 0 looks right, dy > 0 looks down) */
+    look(dx: number, dy: number) {
+      const k = MOUSE_RAD_PER_COUNT * settings.mouseSens;
+      g.rig.look(-dx * k, (settings.invertY ? -1 : 1) * dy * k * 0.8);
+    },
+    get input() { return g.input; },
+    pause(on: boolean) { g.setPaused(on, true); return g.paused; },
+    /** what the last frame drew: physics steps run, leftover time, interpolation fraction */
+    frame() { return { steps: g.frameSteps, acc: +g.acc.toFixed(5), alpha: +g.frameAlpha.toFixed(4), t: +g.simTime.toFixed(4), paused: g.paused }; },
+    /** view(px,py,pz,lx,ly,lz): fixed camera; view(): the interpolated state the last frame drew */
+    view(px?: number, py = 0, pz = 0, lx = 0, ly = 0, lz = 0) {
+      if (px !== undefined) { g.rig.override = { pos: new Vector3(px, py, pz), look: new Vector3(lx, ly, lz) }; return null; }
+      const v = g.view, r = (a: number[]) => a.map((x) => +x.toFixed(4));
+      return {
+        mode: v.mode, pos: r(v.pos.toArray()), vel: r(v.vel.toArray()), up: r(v.up.toArray()), fwd: r(v.fwd.toArray()),
+        speed: +v.speed.toFixed(4), time: +v.time.toFixed(5), alpha: +g.frameAlpha.toFixed(4), steps: g.frameSteps,
+        flipP: v.flip ? +v.flipProgress().toFixed(4) : null, pushT: +v.pushT.toFixed(4), kickturnT: +v.kickturn.t.toFixed(4),
+        airTime: +v.airTime.toFixed(4), tti: v.predicted ? +v.predicted.tti.toFixed(4) : null, steerS: +v.steerS.toFixed(4),
+      };
     },
     shot(name: string) {
       const l = g.landmarks[name];
       if (!l) return Object.keys(g.landmarks);
       g.rig.override = { pos: l.pos.clone(), look: l.look.clone() };
       return true;
-    },
-    view(px: number, py: number, pz: number, lx: number, ly: number, lz: number) {
-      g.rig.override = { pos: new Vector3(px, py, pz), look: new Vector3(lx, ly, lz) };
     },
     free() { g.rig.override = null; g.rig.orbitMode = null; },
     orbit(speed = 0.6, dist = 3.2, height = 0.2) { g.rig.orbitMode = { t: 0, speed, dist, height }; },

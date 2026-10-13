@@ -1,10 +1,10 @@
 import {
-  BufferAttribute, BufferGeometry, CanvasTexture, Color, DoubleSide, Group, IcosahedronGeometry, Mesh, NoColorSpace, RepeatWrapping,
+  BufferAttribute, BufferGeometry, CanvasTexture, Color, DoubleSide, Group, Mesh, NoColorSpace, RepeatWrapping,
   SRGBColorSpace, Vector3, ClampToEdgeWrapping,
 } from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { toonMaterial } from '../render/materials';
-import { FoliageBuilder, foliageMaterial, Leaf } from './foliage';
+import { agaveGeo, agaveMaterial, FoliageBuilder, foliageMaterial, Leaf } from './foliage';
 import type { EdgeStrip, ParkData, PathPt, Plant, RGB } from './park';
 
 const UP = new Vector3(0, 1, 0);
@@ -323,22 +323,6 @@ function planterBush(f: FoliageBuilder, p: Plant, rnd: () => number) {
 
 function plantGeo(kind: number, s: number, rnd: () => number): BufferGeometry[] {
   const out: BufferGeometry[] = [];
-  const colorize = (g: BufferGeometry, top: RGB, bot: RGB, jit = 0.1) => {
-    const gg = g.index ? g.toNonIndexed() : g;
-    if (gg.getAttribute('uv')) gg.deleteAttribute('uv');
-    gg.computeVertexNormals();
-    const n = gg.getAttribute('normal'), cnt = n.count;
-    const col = new Float32Array(cnt * 3);
-    for (let i = 0; i < cnt; i += 3) {
-      const j = 1 + (rnd() - 0.5) * jit;
-      for (let k = 0; k < 3; k++) {
-        const ny = n.getY(i + k), f = 0.5 + 0.5 * ny;
-        for (let q = 0; q < 3; q++) col[(i + k) * 3 + q] = (bot[q] + (top[q] - bot[q]) * f) * j;
-      }
-    }
-    gg.setAttribute('color', new BufferAttribute(col, 3));
-    return gg;
-  };
   if (kind === 1) {
     // ornamental grass: arching blades (double sided)
     const base = lin('#5f7a3a'), tipC = lin('#d9c67e');
@@ -361,18 +345,6 @@ function plantGeo(kind: number, s: number, rnd: () => number): BufferGeometry[] 
     const n = g.getAttribute('normal');
     for (let i = 0; i < n.count; i++) n.setY(i, Math.abs(n.getY(i)) * 0.5 + 0.5);
     out.push(g);
-  } else {
-    // agave rosette
-    const leaf = lin('#6f9a8a'), tipC = lin('#4d6a5c');
-    for (let i = 0; i < 11; i++) {
-      const a = (i / 11) * Math.PI * 2 + rnd() * 0.3, up = 0.5 + rnd() * 0.6, len = (0.42 + rnd() * 0.2) * s;
-      const g = new IcosahedronGeometry(1, 0);
-      g.scale(len * 0.5, 0.05 * s, 0.09 * s);
-      g.translate(len * 0.5, 0, 0);
-      g.rotateZ(up);
-      g.rotateY(-a);
-      out.push(colorize(g, leaf, tipC, 0.1));
-    }
   }
   return out;
 }
@@ -453,11 +425,18 @@ export function buildParkDetail(park: ParkData): Group {
   }
   if (d.plants.length) {
     const rnd = mulberry(5);
-    const parts: BufferGeometry[] = [];
+    const parts: BufferGeometry[] = [], agaves: BufferGeometry[] = [];
     const leaves = new FoliageBuilder();
     for (const p of d.plants) {
       const ry = rnd() * Math.PI * 2;
       if (p.kind === 0 || p.kind === 2) { planterBush(leaves, p, rnd); continue; }
+      if (p.kind === 3) {
+        // own random stream; the shared one advances as the old faceted rosette did, so every plant after it is unchanged
+        const geo = agaveGeo(p.s, mulberry(Math.floor(p.pos.x * 131 + p.pos.z * 71) >>> 0));
+        for (let i = 0; i < 253; i++) rnd();
+        geo.rotateY(ry); geo.translate(p.pos.x, p.pos.y, p.pos.z); agaves.push(geo);
+        continue;
+      }
       for (const geo of plantGeo(p.kind, p.s, rnd)) { geo.rotateY(ry); geo.translate(p.pos.x, p.pos.y, p.pos.z); parts.push(geo); }
     }
     if (parts.length) {
@@ -465,6 +444,7 @@ export function buildParkDetail(park: ParkData): Group {
         toonMaterial({ vertexColors: true, side: DoubleSide, bands: 0.45, wrap: 0.6, rim: 0.45, name: 'planterPlants' }));
     }
     if (!leaves.empty) add(leaves.geometry(), foliageMaterial()).name = 'planterBushes';
+    if (agaves.length) add(mergeGeometries(agaves), agaveMaterial()).name = 'planterAgaves';
   }
   if (d.sails.length) {
     const s = new Soup();

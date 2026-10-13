@@ -16,20 +16,15 @@ export const damp = (a: number, b: number, lambda: number, dt: number) => lerp(a
 export const dampAngle = (a: number, b: number, lambda: number, dt: number) =>
   a + wrapAngle(b - a) * (1 - Math.exp(-lambda * dt));
 
-/** Critically damped spring for scalars (no overshoot, no pops between states). */
+/** Critically damped spring for scalars (no overshoot, no pops between states). Exact step: the same motion at any
+ *  frame rate. */
 export class Spring {
   v = 0;
   constructor(public x = 0, public omega = 12) {}
   update(target: number, dt: number, omega = this.omega) {
-    const f = 1 + 2 * dt * omega;
-    const oo = omega * omega;
-    const hoo = dt * oo;
-    const hhoo = dt * hoo;
-    const detInv = 1 / (f + hhoo);
-    const detX = f * this.x + dt * this.v + hhoo * target;
-    const detV = this.v + hoo * (target - this.x);
-    this.x = detX * detInv;
-    this.v = detV * detInv;
+    const xp = this.x - target, c = this.v + omega * xp, e = Math.exp(-omega * dt);
+    this.x = target + (xp + c * dt) * e;
+    this.v = (this.v - omega * c * dt) * e;
     return this.x;
   }
   set(x: number) { this.x = x; this.v = 0; }
@@ -41,16 +36,11 @@ export class SpringV3 {
   x = new Vector3();
   constructor(public omega = 12) {}
   update(target: Vector3, dt: number, omega = this.omega) {
-    const f = 1 + 2 * dt * omega;
-    const oo = omega * omega;
-    const hoo = dt * oo;
-    const hhoo = dt * hoo;
-    const detInv = 1 / (f + hhoo);
+    const e = Math.exp(-omega * dt);
     for (const k of ['x', 'y', 'z'] as const) {
-      const detX = f * this.x[k] + dt * this.v[k] + hhoo * target[k];
-      const detV = this.v[k] + hoo * (target[k] - this.x[k]);
-      this.x[k] = detX * detInv;
-      this.v[k] = detV * detInv;
+      const xp = this.x[k] - target[k], c = this.v[k] + omega * xp;
+      this.x[k] = target[k] + (xp + c * dt) * e;
+      this.v[k] = (this.v[k] - omega * c * dt) * e;
     }
     return this.x;
   }

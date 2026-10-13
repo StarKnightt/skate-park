@@ -1,6 +1,6 @@
 import {
-  BufferAttribute, BufferGeometry, CanvasTexture, CylinderGeometry, Group, Matrix4, Mesh, Quaternion,
-  SRGBColorSpace, Texture, Vector3, BoxGeometry, SphereGeometry,
+  BufferAttribute, BufferGeometry, CanvasTexture, CylinderGeometry, Group, Material, Matrix4, Mesh, MeshLambertMaterial, Quaternion,
+  SRGBColorSpace, Texture, TextureLoader, Vector3, BoxGeometry, SphereGeometry,
 } from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { toonMaterial } from '../render/materials';
@@ -85,7 +85,9 @@ function deckGeometry() {
  * Grip tape over the whole deck (0.8 mm texels): charcoal grit with glints and worn patches where the feet stand, and the
  * filed edge all round (pale wood + light grit), so the grip side reads as a board, not a black cut-out, when it faces you.
  */
+let gripTex: CanvasTexture | null = null;
 function gripTexture() {
+  if (gripTex) return gripTex;
   const W = 256, H = 1024;
   const c = document.createElement('canvas'); c.width = W; c.height = H;
   const x = c.getContext('2d')!;
@@ -114,7 +116,8 @@ function gripTexture() {
       const edge = hw - Math.abs(xx); // metres inside the deck outline
       let g = 96 + (rnd() - 0.5) * 56 + (mottle(i, j) - 0.5) * 22 + wearAt(z, xx) * 22;
       if (rnd() < 0.02) g += 55 + rnd() * 50; // grit glints
-      let r = g, gg = g, b = g + 5;
+      // a cool charcoal: the warm low sun turns it a warm dark grey rather than tan
+      let r = g * 0.95, gg = g * 0.98, b = g * 1.07;
       if (edge < 0.0035) { r = 232 + rnd() * 14; gg = 204 + rnd() * 12; b = 160 + rnd() * 12; } // rounded wood edge
       else if (edge < 0.006) { const k = 160 + rnd() * 34; r = k; gg = k; b = k + 4; } // filed grip edge
       const o = (j * W + i) * 4;
@@ -123,7 +126,7 @@ function gripTexture() {
   }
   x.putImageData(img, 0, 0);
   const t = new CanvasTexture(c); t.colorSpace = SRGBColorSpace; t.anisotropy = 8;
-  return t;
+  return (gripTex = t);
 }
 function plyTexture() {
   const c = document.createElement('canvas'); c.width = 4; c.height = 64;
@@ -145,7 +148,9 @@ export class BoardView {
   plainM = new Matrix4();
   constructor(deckTex: Texture) {
     deckTex.colorSpace = SRGBColorSpace;
-    const gripM = toonMaterial({ map: gripTexture(), bands: 0.15, wrap: 0.5, rim: 0.6, spec: 0.12, shininess: 12, name: 'grip' });
+    heroDeckTex ??= deckTex;
+    // grip tape is rough and dark: no sheen (a broad lobe of the low sun turned it tan), a little less of the key light
+    const gripM = toonMaterial({ map: gripTexture(), bands: 0.15, wrap: 0.5, rim: 0.6, key: 0.7, name: 'grip' });
     const bottomM = toonMaterial({ map: deckTex, bands: 0.3, rim: 0.3, name: 'deckBottom' });
     const plyM = toonMaterial({ map: plyTexture(), bands: 0.2, wrap: 0.5, rim: 0.5, name: 'ply' });
     const deckMesh = new Mesh(deckGeometry(), [gripM, bottomM, plyM]);
@@ -230,4 +235,42 @@ export class BoardView {
     out.applyMatrix4(useDeck ? this.deck.matrix : this.plainM);
     return out.applyMatrix4(this.root.matrixWorld);
   }
+}
+
+let heroDeckTex: Texture | null = null;
+let propParts: { geo: BufferGeometry; mat: Material | Material[] }[] | null = null;
+
+/**
+ * A board lying around (other skaters'): the hero board's deck, grip, graphic, trucks and wheels at rest, merged into
+ * one mesh per material and shared by every prop board. Wheels on the ground (y = 0), nose towards +z.
+ */
+export function boardProp(): Group {
+  if (!propParts) {
+    const tex = heroDeckTex ?? new TextureLoader().load(import.meta.env.BASE_URL + 'textures/deck_graphic.webp');
+    const v = new BoardView(tex);
+    // older boards lying around: worn, dusty grip, a little lighter than the hero's fresh sheet
+    ((v.deckMesh.material as Material[])[0] as MeshLambertMaterial).color.setScalar(1.4);
+    v.pose(0, 0, 0, 0, 0, 0);
+    v.root.updateMatrixWorld(true);
+    const byMat = new Map<Material, BufferGeometry[]>();
+    propParts = [];
+    v.root.traverse((o) => {
+      const m = o as Mesh;
+      if (!m.isMesh) return;
+      if (m === v.deckMesh) { propParts!.push({ geo: m.geometry, mat: m.material }); return; }
+      const g = (m.geometry.index ? m.geometry.toNonIndexed() : m.geometry.clone()).applyMatrix4(m.matrixWorld);
+      if (g.getAttribute('uv')) g.deleteAttribute('uv');
+      const mat = m.material as Material;
+      byMat.set(mat, [...(byMat.get(mat) ?? []), g]);
+    });
+    for (const [mat, gs] of byMat) propParts.push({ geo: mergeGeometries(gs), mat });
+  }
+  const g = new Group();
+  g.name = 'boardProp';
+  for (const p of propParts) {
+    const m = new Mesh(p.geo, p.mat);
+    m.castShadow = true; m.receiveShadow = true;
+    g.add(m);
+  }
+  return g;
 }

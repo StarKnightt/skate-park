@@ -43,6 +43,12 @@ export const shared = {
   uHeroMap: { value: null as Texture | null },
   uHeroMat: { value: new Matrix4() },
   uHeroInfo: { value: new Vector4(0, 0, 0, 1) },
+  /** warm light spilling out of a lit opening (the kiosk's service window): a line source A -> B (w = range m) lighting
+   *  only the side in front of its wall plane (xyz = outward normal, w = offset); colour * intensity, black = off */
+  uSpillA: { value: new Vector4(0, -999, 0, 6) },
+  uSpillB: { value: new Vector4(0, -999, 0, 0) },
+  uSpillPlane: { value: new Vector4(0, 0, 1, 0) },
+  uSpillColor: { value: new Color(0, 0, 0) },
 };
 
 export interface ToonOpts {
@@ -66,6 +72,8 @@ export interface ToonOpts {
   name?: string;
   /** hair sheen + outline on the hair part of the character vertex colours (default: the skater and people bodies) */
   hair?: boolean;
+  /** share of the direct (sun, moon, lamp) diffuse it takes; < 1 for dark rough stuff the sky fill would otherwise flatten */
+  key?: number;
 }
 
 const NOISE = /* glsl */ `
@@ -558,6 +566,7 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
     sh.uniforms.uSpec = { value: spec };
     sh.uniforms.uShin = { value: shin };
     sh.uniforms.uSeed = { value: seed };
+    sh.uniforms.uKey = { value: o.key ?? 1 };
     let vs = (hair ? '#define TOON_HAIR\n' : '') + sh.vertexShader;
     vs = vs.replace('#include <common>', `#include <common>
       varying vec3 vWorldPos; varying vec3 vWorldNrm;
@@ -613,8 +622,9 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
       varying vec3 vWorldPos; varying vec3 vWorldNrm;
       ${hair ? 'varying float vHair; varying vec3 vHairP; varying vec3 vHairN;' : ''}
       float gHair; float gStrand;
-      uniform float uTime, uBands, uWrap, uRim, uSpec, uShin, uLampIntensity, uRimStrength, uSeed;
-      uniform vec3 uLampColor, uRimColor, uWarmth;
+      uniform float uTime, uBands, uWrap, uRim, uSpec, uShin, uLampIntensity, uRimStrength, uSeed, uKey;
+      uniform vec3 uLampColor, uRimColor, uWarmth, uSpillColor;
+      uniform vec4 uSpillA, uSpillB, uSpillPlane;
       uniform vec3 uLampPos[${MAX_LAMPS}];
       uniform int uLampSkip;
       uniform vec4 uLampCone;
@@ -654,7 +664,7 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
       void RE_Direct_Toon( const in IncidentLight directLight, const in vec3 geometryPosition, const in vec3 geometryNormal, const in vec3 geometryViewDir, const in vec3 geometryClearcoatNormal, const in LambertMaterial material, inout ReflectedLight reflectedLight ) {
         float d = dot( geometryNormal, directLight.direction );
         float w = saturate( (d + uWrap) / (1.0 + uWrap) );
-        reflectedLight.directDiffuse += toonRamp(w) * directLight.color * BRDF_Lambert( material.diffuseColor );
+        reflectedLight.directDiffuse += toonRamp(w) * directLight.color * BRDF_Lambert( material.diffuseColor ) * uKey;
         float nh = saturate(dot(geometryNormal, normalize(directLight.direction + geometryViewDir)));
         if (uSpec > 0.0) {
           float sp = pow(nh, uShin);
@@ -731,6 +741,9 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
           float back = smoothstep(0.0, 0.8, dot(-vW, uSunDir));
           float lit = smoothstep(-0.7, 0.1, dot(nW, uSunDir));
           float r = edge * edge * back * lit * smoothstep(0.5, 3.0, gCurv) * uRim * uRimStrength * gRimVis;
+          // hair tufts narrower than a few pixels turn their normal round within a pixel: a rim there only lights
+          // single pixels along every tuft (a dotted outline), so it keeps to the smooth outline of the head
+          r *= mix(1.0, 1.0 - smoothstep(0.22, 0.6, gCurv * gFp), gHair);
           // backlit hair glows through its outer strands whatever its colour
           outgoingLight += uSunColor * uRimColor * r * mix(0.4 + 0.6 * diffuseColor.rgb, vec3(0.75), gHair) * 0.65;
         }
@@ -743,11 +756,15 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
           // the darker the hair, the more of what we see of it is this sheen
           float nv = saturate(dot(nW, vW));
           float dark = 1.9 - 0.9 * smoothstep(0.012, 0.035, dot(diffuseColor.rgb, vec3(0.2126, 0.7152, 0.0722)));
-          float fh = (0.045 + 0.4 * pow(1.0 - nv, 3.0)) * dark;
+          // the grazing part only where the normal turns slowly across the pixel (the head's outline, not each tuft),
+          // and little of it on hair facing down (a fringe under a brim sees the brim and the face, not the sky)
+          float hAA = 1.0 - smoothstep(0.22, 0.6, gCurv * gFp);
+          float fh = (0.045 + 0.4 * pow(1.0 - nv, 3.0) * hAA) * dark * mix(0.3, 1.0, smoothstep(-0.55, 0.3, nW.y));
           vec3 tint = diffuseColor.rgb / max(max(diffuseColor.r, max(diffuseColor.g, diffuseColor.b)), 1e-4);
           vec3 sr = skyAmbient(reflect(-vW, nW));
           sr = mix(sr, vec3(dot(sr, vec3(0.2126, 0.7152, 0.0722))) * tint, 0.45);
-          outgoingLight += sr * RECIPROCAL_PI * fh * gSkyVis * gHair * gStrand;
+          // strands show where the hair faces us; towards the outline the sheen stays one smooth band
+          outgoingLight += sr * RECIPROCAL_PI * fh * gSkyVis * gHair * mix(1.0, gStrand, smoothstep(0.15, 0.6, nv) * hAA);
         }
         #endif
         ${o.lamps !== false ? `
@@ -766,6 +783,15 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
             acc += toonRamp(saturate((dot(nW, L) + uWrap) / (1.0 + uWrap))) * spot * att;
           }
           outgoingLight += diffuseColor.rgb * uLampColor * (acc * uLampIntensity * RECIPROCAL_PI);
+        }
+        if (uSpillColor.r + uSpillColor.g + uSpillColor.b > 0.001) {
+          vec3 ab = uSpillB.xyz - uSpillA.xyz;
+          vec3 lv = uSpillA.xyz + ab * saturate(dot(vWorldPos - uSpillA.xyz, ab) / max(dot(ab, ab), 1e-4)) - vWorldPos;
+          float d2 = dot(lv, lv), dd = sqrt(d2);
+          float front = smoothstep(-0.35, -0.1, dot(uSpillPlane.xyz, vWorldPos) - uSpillPlane.w);
+          float att = pow2(saturate(1.0 - pow4(dd / uSpillA.w))) / (d2 + 0.35);
+          float wl = toonRamp(saturate((dot(nW, lv / max(dd, 1e-4)) + uWrap) / (1.0 + uWrap)));
+          outgoingLight += diffuseColor.rgb * uSpillColor * (wl * att * front * RECIPROCAL_PI);
         }` : ''}
       }
       #include <opaque_fragment>`);

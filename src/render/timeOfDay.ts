@@ -68,8 +68,10 @@ export const PRESETS: EnvState[] = [
     name: 'Blue hour',
     sunDir: dir(26, -5), lightDir: dir(-30, 38),
     lightColor: C('#a4b2ee'), lightIntensity: 0.55,
-    hemiSky: C('#7480c4'), hemiGround: C('#6a6a88'), hemiIntensity: 1.05,
-    skySun: C('#a490d0'), skyAnti: C('#6e7ac8'),
+    // walls turned away from the moon live on the horizon fill + bounce (the ground sees only the zenith): the neutral
+    // tone map's toe crushes anything much darker to black, so these keep shaded walls a deep blue-violet
+    hemiSky: C('#7480c4'), hemiGround: C('#8086bc'), hemiIntensity: 1.15,
+    skySun: C('#a490d0'), skyAnti: C('#7682d2'),
     zenith: C('#101e60'), mid: C('#2546b4'), horizon: C('#7e9ce6'),
     glow: C('#d098c0'), glowStrength: 0.28,
     cloudLit: C('#8a90d6'), cloudShade: C('#29347e'),

@@ -1,5 +1,5 @@
 import {
-  Clock, Color, Fog, Group, HemisphereLight, Mesh, PCFShadowMap, PerspectiveCamera, PlaneGeometry, Quaternion, Scene,
+  Color, Fog, Group, HemisphereLight, Mesh, PCFShadowMap, PerspectiveCamera, PlaneGeometry, Quaternion, Scene,
   SRGBColorSpace, Texture, TextureLoader, Vector3, WebGLRenderer, NoToneMapping, MathUtils, DoubleSide, SpotLight,
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
@@ -14,25 +14,30 @@ import { Sky, CloudLayer, Ocean, glowPoints } from './render/environment';
 import { TimeOfDay, PRESETS, EnvState } from './render/timeOfDay';
 import { Post } from './render/post';
 import { HeroShadow } from './render/heroShadow';
-import { SkatePhysics, SkateInput, emptyInput } from './player/physics';
+import { SkatePhysics, SkateInput, emptyInput, PhysView } from './player/physics';
 import { BoardView } from './player/board';
 import { Skater } from './player/skater';
 import { CameraRig } from './player/cameraRig';
 import { TrickTracker } from './player/tricks';
+import { createAutopilot } from './player/autopilot';
 import { Input } from './core/input';
+import { settings, onSettings, type QualitySetting } from './core/settings';
 import { Hud, TouchControls } from './ui/hud';
+import { installPauseMenu } from './ui/pauseMenu';
 import { AudioEngine } from './audio/audio';
 import { params, DEBUG, clamp } from './core/util';
 import { installTestHooks } from './debug/testHooks';
 
 const BASE = import.meta.env.BASE_URL;
-const STEP = 1 / 120;
+export const STEP = 1 / 120;
+/** physics steps per displayed frame at most; a longer hitch becomes a brief slow-down */
+const MAX_STEPS = 12;
+const _f = new Vector3(), _g = new Vector3();
 
 export class Game {
   renderer: WebGLRenderer;
   scene = new Scene();
   camera = new PerspectiveCamera(58, 1, 0.08, 4000);
-  clock = new Clock();
   world!: CollisionWorld;
   physics!: SkatePhysics;
   board!: BoardView;
@@ -72,10 +77,23 @@ export class Game {
   started = false;
   ready = false;
   boardSmoothQ = new Quaternion();
+  /** physics state after the previous / the last step, and the interpolated state every visual layer draws */
+  prevV = new PhysView();
+  curV = new PhysView();
+  view = new PhysView();
+  /** last displayed frame: physics steps run, interpolation fraction */
+  frameSteps = 0;
+  frameAlpha = 0;
+  /** paused: no simulation at all, the scene is redrawn at ~10 fps */
+  paused = false;
+  onPause?: (paused: boolean) => void;
+  qualityAuto = true;
+  private pausedDrawT = 0;
 
   constructor(private container: HTMLElement) {
     const mobile = matchMedia('(pointer: coarse)').matches || /Mobi|Android/i.test(navigator.userAgent);
-    this.quality = params.has('quality') ? Number(params.get('quality')) : mobile ? 1 : 2;
+    const qs = settings.quality;
+    this.quality = params.has('quality') ? Number(params.get('quality')) : qs !== 'auto' ? qs : mobile ? 1 : 2;
     this.renderer = new WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false });
     this.renderer.outputColorSpace = SRGBColorSpace;
     this.renderer.toneMapping = NoToneMapping;
@@ -168,6 +186,15 @@ export class Game {
 
     // ---------------- player
     this.physics = new SkatePhysics(this.world);
+    this.input.attach(this.physics);
+    this.input.auto = createAutopilot(this);
+    // Easy / Auto: landing assist, auto-grind, fast recovery; Pro: none
+    const syncAssist = () => {
+      const on = settings.controlMode !== 'pro';
+      Object.assign(this.physics.assist, { landing: on, autoGrind: on, fastRecover: on });
+    };
+    syncAssist();
+    onSettings((_s, k) => { if (k === 'controlMode') syncAssist(); });
     this.board = new BoardView(deckTex);
     this.scene.add(this.board.root);
     this.skater = new Skater(gltf);
@@ -176,6 +203,7 @@ export class Game {
       // the board stays where it came to rest; the rider steps onto it (flipping it over first if it lies upside down)
       const fromP = this.board.root.position.clone(), fromQ = this.board.root.quaternion.clone();
       this.physics.finishRecover(pos, fwd);
+      this.resnap();
       const toQ = this.physics.basisQuat(this.physics.fwd, this.physics.up);
       this.boardReturn = { t: 0, fromP, fromQ, hop: fromQ.angleTo(toQ) > 1.0 };
     };
@@ -207,6 +235,8 @@ export class Game {
     this.resize();
     addEventListener('resize', () => this.resize());
     if (DEBUG) installTestHooks(this);
+    if (!params.has('quality')) this.setQuality(settings.quality);
+    onSettings((s, k) => { if (k === 'quality' && !params.has('quality')) this.setQuality(s.quality); });
     this.renderer.compile(this.scene, this.camera);
     prog(1);
     this.ready = true;
@@ -214,6 +244,31 @@ export class Game {
     setTimeout(() => loading?.remove(), 900);
     if (!touchMode && !params.has('mute')) this.hud.soundPrompt();
     this.renderer.setAnimationLoop((t) => this.frame(t));
+    installPauseMenu(this);
+  }
+
+  // ---------------------------------------------------------------- pause / time / quality (used by the pause menu)
+  setPaused(on: boolean, force = false) {
+    // frame-stepped test captures (manual clock) never pause on their own
+    if (on === this.paused || (on && this.manualClock && !force)) return;
+    this.paused = on;
+    this.pausedDrawT = -1e9;
+    this.audio.duck(on);
+    this.onPause?.(on);
+  }
+  togglePause() { this.setPaused(!this.paused); }
+
+  setTime(index: number, instant = false) {
+    const now = instant || this.paused;
+    this.tod.set(index, now);
+    if (now) { this.applyEnv(this.tod.cur); this.tod.dirty = false; this.pausedDrawT = -1e9; }
+    this.hud.setTimeLabel(PRESETS[this.tod.index].name);
+  }
+
+  /** 'auto' adapts to the frame rate; a fixed level turns the adaptation off */
+  setQuality(q: QualitySetting) {
+    this.qualityAuto = q === 'auto';
+    if (q !== 'auto' && q !== this.quality) { this.quality = q; this.applyQuality(); }
   }
 
   unlockAudio() {
@@ -223,10 +278,19 @@ export class Game {
 
   respawn(pos = this.spawn.pos, heading = this.spawn.heading) {
     this.physics.reset(pos, heading);
+    this.resnap();
     this.syncBoard(1, true);
-    this.rig.snap(this.physics.pos, Math.atan2(this.physics.fwd.x, this.physics.fwd.z));
+    this.rig.snap(this.view.pos, Math.atan2(this.view.fwd.x, this.view.fwd.z));
     this.skater.reset();
     this.boardReturn = null;
+    this.input.auto?.reset();
+  }
+
+  /** the physics state jumped (respawn, teleport, back on the board): draw it as is, no interpolation from before */
+  resnap() {
+    this.physics.snapshot(this.curV);
+    this.prevV.copy(this.curV);
+    this.view.copy(this.curV);
   }
 
   nextTime() { this.tod.next(); this.hud.setTimeLabel(PRESETS[this.tod.index].name); }
@@ -288,7 +352,7 @@ export class Game {
   /** park the shadow casting spot light in the street lamp nearest to the skater; the shader skips that lamp's pool */
   updateLampLight() {
     if (shared.uLampIntensity.value <= 0.02 * LAMP.intensity) return;
-    const p = this.physics.pos, lamps = this.scenery.lampLights;
+    const p = this.view.pos, lamps = this.scenery.lampLights;
     const n = Math.min(lamps.length, shared.uLampPos.value.length);
     const d2 = (i: number) => (lamps[i].x - p.x) ** 2 + (lamps[i].z - p.z) ** 2;
     let best = -1, bd = Infinity;
@@ -304,28 +368,28 @@ export class Game {
   }
 
   syncBoard(dt: number, snap = false) {
-    const ph = this.physics;
+    const v = this.view;
     const r = this.board.root;
-    if (ph.mode === 'bail' && ph.bail) {
-      ph.bail.board.rootPos(r.position);
-      r.quaternion.copy(ph.bail.board.q);
+    if (v.mode === 'bail' && v.bail) {
+      r.position.copy(v.bail.boardPos);
+      r.quaternion.copy(v.bail.boardQ);
       this.boardSmoothQ.copy(r.quaternion);
       this.boardVisOff.set(0, 0, 0);
-      this.prevMode = ph.mode;
+      this.prevMode = v.mode;
       return;
     }
-    const q = ph.mode === 'air' ? ph.boardQ.clone() : ph.basisQuat(ph.fwd, ph.up);
+    const q = v.boardQ;
     // the drop-in pivot is a fast, exact rotation about the trailing wheels on the coping: no smoothing lag
-    if (snap || ph.dropin) this.boardSmoothQ.copy(q); else this.boardSmoothQ.slerp(q, 1 - Math.exp(-28 * dt));
-    // catching a rail from a little below snaps the physics onto it: ease that jump out over a few frames
+    if (snap || v.dropin) this.boardSmoothQ.copy(q); else this.boardSmoothQ.slerp(q, 1 - Math.exp(-40 * dt));
+    // catching a rail / ledge snaps the physics onto it (drawn without interpolation): ease that jump out over a few frames
     if (snap) this.boardVisOff.set(0, 0, 0);
-    else if (this.prevMode === 'air' && ph.mode === 'grind') {
-      this.boardVisOff.add(this.prevPos.addScaledVector(this.prevVel, dt).sub(ph.pos));
+    else if ((this.prevMode === 'air' || this.prevMode === 'ride') && v.mode === 'grind') {
+      this.boardVisOff.add(this.prevPos.addScaledVector(this.prevVel, dt).sub(v.pos));
       if (this.boardVisOff.length() > 0.45) this.boardVisOff.setLength(0.45);
     }
     this.boardVisOff.multiplyScalar(Math.exp(-16 * dt));
-    this.prevMode = ph.mode; this.prevPos.copy(ph.pos); this.prevVel.copy(ph.vel);
-    r.position.copy(ph.pos).add(this.boardVisOff);
+    this.prevMode = v.mode; this.prevPos.copy(v.pos); this.prevVel.copy(v.vel);
+    r.position.copy(v.pos).add(this.boardVisOff);
     r.quaternion.copy(this.boardSmoothQ);
     if (this.boardReturn) {
       const br = this.boardReturn;
@@ -369,45 +433,45 @@ export class Game {
     }
   }
 
-  /** advance the simulation by dt (fixed physics substeps) */
+  /** advance the simulation by dt: fixed physics steps, then every visual layer from the state interpolated between the
+   *  last two steps (the physics keeps its own true state) */
   simulate(dt: number) {
     const ph = this.physics;
     this.acc += dt;
     ph.events.length = 0;
     let n = 0;
-    while (this.acc >= STEP && n < 10) {
+    while (this.acc >= STEP && n < MAX_STEPS) {
       if (this.scriptInput) this.input.scripted = this.scriptInput(this.simTime);
       const inp = this.input.sample(ph.mode === 'air');
       this.lastInput = inp;
+      const m0 = ph.mode;
+      this.prevV.copy(this.curV);
       ph.step(STEP, inp);
+      ph.snapshot(this.curV);
+      // never interpolate across a jump: rail / ledge catches (eased in syncBoard) and teleports
+      if ((ph.mode === 'grind' && m0 !== 'grind') || this.curV.pos.distanceToSquared(this.prevV.pos) > 0.25) this.prevV.copy(this.curV);
       this.acc -= STEP; this.simTime += STEP; n++;
     }
-    if (n === 10) this.acc = 0;
+    if (n === MAX_STEPS) this.acc = Math.min(this.acc, STEP);
+    this.frameSteps = n;
+    this.frameAlpha = clamp(this.acc / STEP, 0, 1);
+    const v = this.view.lerp(this.prevV, this.curV, this.frameAlpha);
     this.processEvents();
-    // input events
-    const ev = this.input.consumeEvents();
-    if (ev.timeOfDay) this.nextTime();
-    if (ev.respawn) this.respawn();
-    if (ev.recenter) this.rig.recenter();
-    if (ev.help) this.hud.toggleHelp();
-    const cam = this.input.consumeCamera();
-    if (cam.dx || cam.dy) this.rig.addOrbit(cam.dx, cam.dy);
-    if (this.input.camStick.x || this.input.camStick.y) this.rig.addOrbit(this.input.camStick.x * 900 * dt, this.input.camStick.y * 500 * dt);
 
     this.tod.update(dt);
     if (this.tod.dirty) { this.applyEnv(this.tod.cur); this.tod.dirty = false; }
-    // visuals
+    // visuals: all read the interpolated view, never the physics
     this.syncBoard(dt);
-    if (ph.mode === 'ride') this.board.spinWheels(ph.vel.dot(ph.fwd) * dt);
-    else if (ph.mode === 'air') this.board.spinWheels(0.6 * dt);
-    this.skater.update(dt, ph, this.board, { steer: this.lastInput.steer, crouch: this.lastInput.crouch });
-    // camera follows the hips
-    const focus = this.skater.hipsWorld(new Vector3());
-    if (ph.mode === 'ride' || ph.mode === 'grind' || ph.mode === 'air') focus.lerp(ph.pos.clone().addScaledVector(ph.up, 0.9), 0.5);
-    this.rig.update(dt, focus, ph);
+    if (v.mode === 'ride') this.board.spinWheels(v.vel.dot(v.fwd) * dt);
+    else if (v.mode === 'air') this.board.spinWheels(0.6 * dt);
+    this.skater.update(dt, v, this.board, { steer: this.lastInput.steer, crouch: this.lastInput.crouch });
+    // camera follows the hips (after the skater is posed)
+    const focus = this.skater.hipsWorld(_f);
+    if (v.mode === 'ride' || v.mode === 'grind' || v.mode === 'air') focus.lerp(_g.copy(v.pos).addScaledVector(v.up, 0.9), 0.5);
+    this.rig.update(dt, focus, v);
     this.tricks.update(dt, ph.mode === 'ride', ph.manual.active || ph.kickturn.t >= 0);
     this.hud.update(dt);
-    this.audio.update(dt, ph.speed, ph.surface, ph.mode === 'ride', ph.grind ? ph.grind.speed : 0);
+    this.audio.update(dt, v.speed, v.surface, v.mode === 'ride', v.grind ? v.grind.speed : 0);
     shared.uTime.value = this.simTime;
     this.ocean.mat.uniforms.uTime.value = this.simTime;
     this.sky.mat.uniforms.uTime.value = this.simTime;
@@ -432,14 +496,36 @@ export class Game {
     }
     const dt = Math.min(0.1, this.lastFrame ? (t - this.lastFrame) / 1000 : 1 / 60);
     this.lastFrame = t;
+    this.frameInput(dt);
+    if (this.paused) {
+      if (t - this.pausedDrawT >= 100) { this.pausedDrawT = t; this.render(dt); }
+      return;
+    }
     this.simulate(dt);
     this.render(dt);
     this.adaptQuality(dt);
   }
 
+  /** once per displayed frame, also while paused: input polling, input events, camera look */
+  frameInput(dt: number) {
+    const inp = this.input;
+    inp.poll(dt);
+    const ev = inp.consumeEvents();
+    if (ev.pause) this.togglePause();
+    const lk = inp.consumeLook(dt);
+    this.rig.locked = inp.locked;
+    if (this.paused) return;
+    if (ev.autoToggle) inp.setAuto(!inp.autoActive);
+    if (ev.timeOfDay) this.nextTime();
+    if (ev.respawn) this.respawn();
+    if (ev.recenter) this.rig.recenter();
+    if (ev.help) this.hud.toggleHelp();
+    this.rig.look(lk.yaw, lk.pitch);
+  }
+
   private qTimer = 0;
   private adaptQuality(dt: number) {
-    if (params.has('quality') || DEBUG) return;
+    if (!this.qualityAuto || params.has('quality') || DEBUG) return;
     this.frameTimes.push(dt);
     this.qTimer += dt;
     if (this.qTimer < 3) return;

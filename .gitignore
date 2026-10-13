@@ -10,3 +10,5 @@ dist/
 
 tools/**/__pycache__/
 .vite/
+tools/sim/.build*/
+tools/**/.build*/

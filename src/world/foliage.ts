@@ -1,5 +1,5 @@
 import {
-  BufferAttribute, BufferGeometry, DataTexture, DoubleSide, LinearFilter, LinearMipmapLinearFilter, MeshLambertMaterial, Quaternion, RGBAFormat,
+  BufferAttribute, BufferGeometry, Color, DataTexture, DoubleSide, LinearFilter, LinearMipmapLinearFilter, MeshLambertMaterial, Quaternion, RGBAFormat,
   SRGBColorSpace, Vector2, Vector3, Euler,
 } from 'three';
 import { toonMaterial } from '../render/materials';
@@ -18,6 +18,40 @@ function mulberry(seed: number) {
 }
 
 const ATLAS = 1024, CELL = ATLAS / 2;
+
+/**
+ * Texels under (partial) transparency take the colour of the nearest solid texel of their own cell (breadth-first
+ * from every solid texel), so a filtered or cut edge shows the leaf's own colour all the way out: no lighter rim round
+ * the dark leaves and no darker one round the light leaves. Texels no leaf reaches keep the cell's mean colour.
+ */
+function dilateUnderAlpha(d: Uint8ClampedArray, W: number, H: number, cell: number) {
+  const SOLID = 160;
+  const seen = new Uint8Array(W * H), q = new Int32Array(W * H);
+  for (let cy = 0; cy < H; cy += cell) for (let cx = 0; cx < W; cx += cell) {
+    let head = 0, tail = 0, r = 0, g = 0, b = 0, w = 0;
+    for (let y = cy; y < cy + cell; y++) for (let x = cx; x < cx + cell; x++) {
+      const i = y * W + x;
+      if (d[i * 4 + 3] >= SOLID) { seen[i] = 1; q[tail++] = i; r += d[i * 4]; g += d[i * 4 + 1]; b += d[i * 4 + 2]; w++; }
+    }
+    while (head < tail) {
+      const i = q[head++], x = i % W, y = (i / W) | 0;
+      for (let k = 0; k < 4; k++) {
+        const nx = x + (k === 0 ? 1 : k === 1 ? -1 : 0), ny = y + (k === 2 ? 1 : k === 3 ? -1 : 0);
+        if (nx < cx || ny < cy || nx >= cx + cell || ny >= cy + cell) continue;
+        const j = ny * W + nx;
+        if (seen[j]) continue;
+        seen[j] = 1; q[tail++] = j;
+        d[j * 4] = d[i * 4]; d[j * 4 + 1] = d[i * 4 + 1]; d[j * 4 + 2] = d[i * 4 + 2];
+      }
+    }
+    if (!w) continue;
+    r /= w; g /= w; b /= w;
+    for (let y = cy; y < cy + cell; y++) for (let x = cx; x < cx + cell; x++) {
+      const i = y * W + x;
+      if (!seen[i]) { d[i * 4] = r; d[i * 4 + 1] = g; d[i * 4 + 2] = b; }
+    }
+  }
+}
 
 /**
  * Painted leaf clumps on transparent cells: a dense core of overlapping leaves and a ragged rim of single leaves with
@@ -80,7 +114,7 @@ function paintAtlas(): DataTexture {
     leaves.sort((a, b) => a.v - b.v);
     for (const l of leaves) {
       const fill = pick(cell.greens, l.v);
-      const edge = rnd() < 0.45 ? pick(cell.greens, Math.min(0.999, l.v + 0.22)) : '';
+      const edge = rnd() < 0.45 ? pick(cell.greens, Math.min(0.999, l.v + 0.14)) : '';
       const rib = pick(cell.greens, Math.max(0, l.v - 0.22));
       leaf(l.px, l.py, l.ang, l.L, l.W, fill, edge, rib);
     }
@@ -118,20 +152,7 @@ function paintAtlas(): DataTexture {
   });
   const img = x.getImageData(0, 0, ATLAS, ATLAS);
   const d = img.data;
-  for (let ci = 0; ci < 4; ci++) {
-    const ox = (ci % 2) * CELL, oy = Math.floor(ci / 2) * CELL;
-    let r = 0, g = 0, b = 0, w = 0;
-    for (let yy = oy; yy < oy + CELL; yy += 2) for (let xx = ox; xx < ox + CELL; xx += 2) {
-      const o = (yy * ATLAS + xx) * 4, a = d[o + 3];
-      if (a > 200) { r += d[o]; g += d[o + 1]; b += d[o + 2]; w++; }
-    }
-    if (!w) continue;
-    r /= w; g /= w; b /= w;
-    for (let yy = oy; yy < oy + CELL; yy++) for (let xx = ox; xx < ox + CELL; xx++) {
-      const o = (yy * ATLAS + xx) * 4, a = d[o + 3] / 255;
-      if (a < 1) { d[o] = d[o] * a + r * (1 - a); d[o + 1] = d[o + 1] * a + g * (1 - a); d[o + 2] = d[o + 2] * a + b * (1 - a); }
-    }
-  }
+  dilateUnderAlpha(d, ATLAS, ATLAS, CELL);
   const tex = new DataTexture(new Uint8Array(d.buffer.slice(0)), ATLAS, ATLAS, RGBAFormat);
   tex.colorSpace = SRGBColorSpace;
   tex.generateMipmaps = true;
@@ -155,9 +176,10 @@ export function foliageMaterial(): MeshLambertMaterial {
     prev.call(m, sh, r);
     sh.uniforms.uMapSize = { value: new Vector2(ATLAS, ATLAS) };
     sh.fragmentShader = sh.fragmentShader.replace('#include <common>', `#include <common>
-      uniform vec2 uMapSize;`).replace('#include <normal_fragment_begin>', `#include <normal_fragment_begin>
+      uniform vec2 uMapSize; float gLeafLod;`).replace('#include <normal_fragment_begin>', `#include <normal_fragment_begin>
       // a card shows the clump's outward normal from either side (no back-face flip)
       normal *= faceDirection;`).replace('#include <map_fragment>', `#include <map_fragment>
+      gLeafLod = 0.0;
       #ifdef USE_MAP
       {
         // keep the clump coverage in the small mips (as the palm fronds do) so far bushes stay full
@@ -165,6 +187,19 @@ export function foliageMaterial(): MeshLambertMaterial {
         vec2 ddx = dFdx(duv), ddy = dFdy(duv);
         float lod = max(0.0, 0.5 * log2(max(dot(ddx, ddx), dot(ddy, ddy))));
         diffuseColor.a *= 1.0 + lod * 0.3;
+        gLeafLod = lod;
+      }
+      #endif`).replace('#include <alphatest_fragment>', `#ifdef USE_ALPHATEST
+      {
+        // partial coverage (alpha to coverage) only where the atlas is drawn at about a texel per pixel or larger, so a
+        // leaf outline gets a one-pixel soft edge; where the alpha changes faster than a pixel (minified cards, leaves
+        // seen through gaps) partial coverage comes out of the hardware as an ordered dither (a glittering stipple),
+        // so those pixels are cut clean. Quarters match the 4x MSAA samples.
+        float fw = max(fwidth(diffuseColor.a), 1e-4);
+        float ramp = clamp((diffuseColor.a - alphaTest) / fw + 0.5, 0.0, 1.0);
+        float a = mix(ramp, step(alphaTest, diffuseColor.a), smoothstep(0.35, 0.75, gLeafLod));
+        diffuseColor.a = floor(a * 4.0 + 0.5) * 0.25;
+        if (diffuseColor.a <= 0.0) discard;
       }
       #endif`);
   };
@@ -275,4 +310,86 @@ export class FoliageBuilder {
     g.computeBoundingSphere();
     return g;
   }
+}
+
+/** blade cross-section (side, thickness) in units of the half width / half thickness: a shallow channel on top, a keel below */
+const BLADE: [number, number][] = [[-1, 0.25], [-0.55, 0.13], [0, 0.07], [0.55, 0.13], [1, 0.25], [0.55, -0.62], [0, -1], [-0.55, -0.62]];
+const AG = { base: new Color('#9cba97'), mid: new Color('#6f9a8a'), tip: new Color('#4e6d5e'), spine: new Color('#3f3426'), wax: new Color('#bcd2bf') };
+const _Y = new Vector3(0, 1, 0), _c = new Color();
+
+/**
+ * Agave rosette around the origin (s = size): three whorls of thick, smooth blades that rise from the core, bow outwards
+ * and taper to a dark spine, painted pale at the base, glaucous along the blade, darker to the tip, with a waxy margin.
+ */
+export function agaveGeo(s: number, rnd: () => number): BufferGeometry {
+  const pos: number[] = [], col: number[] = [], idx: number[] = [];
+  const NS = 9, NR = BLADE.length;
+  const whorls: [number, number, number, number][] = [[7, 1.0, 0.42, 0.2], [5, 0.8, 0.86, 0.12], [4, 0.56, 1.2, 0.05]];
+  const fa = new Vector3(), fb = new Vector3(), fn = new Vector3(), out = new Vector3();
+  const tri = (a: number, b: number, c: number, sp: Vector3, tg: Vector3) => {
+    const v = (i: number, o: Vector3) => o.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+    v(a, out); v(b, fa).sub(out); v(c, fb).sub(out);
+    fn.crossVectors(fa, fb);
+    out.add(v(b, fa)).add(v(c, fb)).multiplyScalar(1 / 3).sub(sp);
+    out.addScaledVector(tg, -out.dot(tg));
+    if (fn.dot(out) >= 0) idx.push(a, b, c); else idx.push(a, c, b);
+  };
+  let k = 0;
+  for (const [n, lenK, rise, r0] of whorls) {
+    for (let i = 0; i < n; i++, k++) {
+      const az = k * 2.39996 + rnd() * 0.35;
+      const dir = new Vector3(Math.cos(az), 0, Math.sin(az));
+      const len = (0.42 + rnd() * 0.18) * s * lenK, up = rise + (rnd() - 0.5) * 0.25, curl = 0.35 + rnd() * 0.35;
+      const w0 = (0.084 + rnd() * 0.022) * s * (0.8 + 0.2 * lenK), h0 = 0.04 * s * (0.8 + 0.2 * lenK);
+      const tone = 0.92 + rnd() * 0.14;
+      const P: Vector3[] = [], T: Vector3[] = [];
+      const p = dir.clone().multiplyScalar(r0 * s * 0.25).setY(-0.02 * s);
+      for (let j = 0; j <= NS; j++) {
+        const t = j / NS, a = up - curl * t * t;
+        const tg = dir.clone().multiplyScalar(Math.cos(a)).setY(Math.sin(a));
+        P.push(p.clone()); T.push(tg);
+        p.addScaledVector(tg, len / NS);
+      }
+      const base = pos.length / 3;
+      for (let j = 0; j < NS; j++) {
+        const t = j / NS;
+        const S = new Vector3().crossVectors(T[j], _Y).normalize(), N = new Vector3().crossVectors(S, T[j]).normalize();
+        const w = w0 * (1 - Math.pow(t, 1.25)) * (0.72 + 0.28 * Math.sin(Math.PI * Math.min(1, t * 1.5))), h = h0 * (1 - 0.72 * t);
+        _c.copy(AG.base).lerp(AG.mid, Math.min(1, t / 0.45)).lerp(AG.tip, Math.max(0, (t - 0.55) / 0.45));
+        const core = 0.72 + 0.28 * Math.min(1, t / 0.2);
+        BLADE.forEach(([sx, nx], r) => {
+          const q = P[j].clone().addScaledVector(S, sx * w).addScaledVector(N, nx * h);
+          pos.push(q.x, q.y, q.z);
+          const edge = r === 0 || r === 4, below = nx < 0;
+          const m = tone * core * (below ? 0.84 : 1.04);
+          const cr = edge ? _c.r + (AG.wax.r - _c.r) * 0.45 : _c.r, cg = edge ? _c.g + (AG.wax.g - _c.g) * 0.45 : _c.g, cb = edge ? _c.b + (AG.wax.b - _c.b) * 0.45 : _c.b;
+          col.push(cr * m, cg * m, cb * m);
+        });
+      }
+      const tip = pos.length / 3;
+      pos.push(P[NS].x, P[NS].y, P[NS].z);
+      col.push(AG.spine.r, AG.spine.g, AG.spine.b);
+      const mid = new Vector3();
+      for (let j = 0; j < NS - 1; j++) {
+        mid.copy(P[j]).add(P[j + 1]).multiplyScalar(0.5);
+        for (let r = 0; r < NR; r++) {
+          const a = base + j * NR + r, b = base + j * NR + ((r + 1) % NR);
+          tri(a, b, b + NR, mid, T[j]); tri(a, b + NR, a + NR, mid, T[j]);
+        }
+      }
+      for (let r = 0; r < NR; r++) tri(base + (NS - 1) * NR + r, base + (NS - 1) * NR + ((r + 1) % NR), tip, P[NS - 1], T[NS - 1]);
+    }
+  }
+  const g = new BufferGeometry();
+  g.setAttribute('position', new BufferAttribute(new Float32Array(pos), 3));
+  g.setAttribute('color', new BufferAttribute(new Float32Array(col), 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+let agaveM: MeshLambertMaterial | null = null;
+/** soft painted shading along the blades, a faint waxy sheen */
+export function agaveMaterial() {
+  return (agaveM ??= toonMaterial({ vertexColors: true, bands: 0.2, wrap: 0.55, rim: 0.4, spec: 0.1, shininess: 16, name: 'agave' }));
 }

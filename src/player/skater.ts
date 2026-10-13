@@ -5,8 +5,9 @@ import {
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { toonMaterial } from '../render/materials';
 import { clamp, lerp, Spring } from '../core/util';
-import { KICKTURN_T, type BailKind, type SkatePhysics } from './physics';
+import { KICKTURN_T, PUSH, dropRootAng, type BailKind, type PhysView } from './physics';
 import { BoardView, deckTopY } from './board';
+import { planRecovery, standable, findStandSpot, walkPath, groundAt, levelness, WALK_NY, STEP_UP, STEP_DOWN, type RecoveryPlan } from './recovery';
 
 const X = new Vector3(1, 0, 0), Y = new Vector3(0, 1, 0), Z = new Vector3(0, 0, 1);
 const ONE = new Vector3(1, 1, 1);
@@ -19,9 +20,12 @@ const easeOut = (x: number) => { const t = clamp(x, 0, 1); return 1 - (1 - t) * 
 const easeOut3 = (x: number) => { const t = clamp(x, 0, 1); return 1 - (1 - t) ** 3; };
 /** rises 0 -> 1 between a and b, falls back to 0 between c and d */
 const win = (t: number, a: number, b: number, c: number, d: number) => sm((t - a) / (b - a)) * (1 - sm((t - c) / (d - c)));
+/** clamp whose ends ease in over the last m (C1), so a pose driven through a limit never stops dead in one frame */
+const softClamp = (x: number, lo: number, hi: number, m: number) =>
+  x > hi - m ? hi - m + m * Math.tanh((x - hi + m) / m) : x < lo + m ? lo + m - m * Math.tanh((lo + m - x) / m) : x;
 const wrapA = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
 /** sketchy-landing strength: eases in after the absorb, holds for the first half, then settles */
-const wobbleEnv = (ph: SkatePhysics) => {
+const wobbleEnv = (ph: PhysView) => {
   const wt = ph.wobbleDur - ph.wobble;
   return sm(wt / 0.1) * (1 - sm((wt / ph.wobbleDur - 0.5) / 0.5));
 };
@@ -57,6 +61,12 @@ const GETUPS = {
   back: { clip: 'getup_back', start: 3.05, end: 6.1, rate: 1.15 },
   front: { clip: 'getup_stomach', start: 2.0, end: 6.1, rate: 1.2 },
 };
+/** quick recovery (assist): from half way up (sitting up / on the knees), fast; the fall plays in ~0.6 s, no lying */
+const GETUPS_FAST = {
+  back: { clip: 'getup_back', start: 4.3, end: 5.85, rate: 3.0 },
+  front: { clip: 'getup_stomach', start: 3.6, end: 5.7, rate: 3.6 },
+};
+const FAST_FALL = 0.62;
 const WALK_SPEED = 1.2; // m/s; the in-place walk clip strides 1.4 m per 1.17 s loop
 
 interface ArmP { raise: number; fwd: number; elbow: number; hang: number }
@@ -136,6 +146,7 @@ export class Skater {
   private Pout = new Pose();
   private xf = { from: new Pose(), t: 1, dur: 1 };
   private crouchS = new Spring(0, 16);
+  private crouchIn = new Spring(0, 32);
   private pushS = new Spring(0, 12);
   private manS = new Spring(0, 9);
   private grindS = new Spring(0, 11);
@@ -150,6 +161,7 @@ export class Skater {
   private openS = new Spring(0, 10);
   private idleT = 0;
   private popH = 0.6;
+  private airS = { hip: new Spring(0.6, 38), p: new Spring(0, 38), c: new Spring(0, 38), h: new Spring(0, 38) };
   private steer = 0;
   private inCrouch = false;
   private deckInfo = { useDeck: true, fp: 0, kind: '' };
@@ -174,6 +186,10 @@ export class Skater {
   private lieDur = 1.2;
   private getupEnd = 6;
   private stepDelay = 0;
+  private stepDur = 0.45;
+  private fast = false; // this recovery is the quick one (assist)
+  /** where the board goes back down and his walk to it (planned at the get-up, or once the board has stopped) */
+  private plan: RecoveryPlan | null = null;
   private shakeW = 0;
   private snap: Map<Bone, { q: Quaternion; p: Vector3 }> | null = null;
   private snapW = 0;
@@ -182,7 +198,7 @@ export class Skater {
   private rigM = new Matrix4(); // hips parent (rig) -> root
   private rigInv = new Matrix4();
   private clipPose = new Map<Bone, { q: Quaternion; p: Vector3 }>();
-  private walk: null | { target: Vector3; faceYaw: number; speed: number; yaw: number; ridePos: Vector3; rideFwd: Vector3; wait: number } = null;
+  private walk: null | { target: Vector3; faceYaw: number; speed: number; yaw: number; ridePos: Vector3; rideFwd: Vector3; wait: number; blocked: number } = null;
 
   // face + cloth
   private faceMat: MeshLambertMaterial | null = null;
@@ -263,7 +279,7 @@ export class Skater {
   reset() {
     this.phase = 'ride'; this.phaseT = 0; this.procW = 1;
     this.mixer.stopAllAction(); this.action = null;
-    this.snap = null; this.snapW = 0; this.shakeW = 0; this.walk = null;
+    this.snap = null; this.snapW = 0; this.shakeW = 0; this.walk = null; this.plan = null;
     this.xf.t = this.xf.dur;
     this.fid.kind = ''; this.fid.wait = 2.4; this.glanceYaw = 0; this.capW = 0; this.footLift = 0;
     this.setExpr('neutral');
@@ -422,7 +438,8 @@ export class Skater {
     const a = (l1 * l1 - l2 * l2 + d * d) / (2 * d);
     const h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
     const po = pole.clone().addScaledVector(dir, -pole.dot(dir)).normalize();
-    if (overToe > 0.001 && other && h > 0.01) this.kneeOverToe(hip, dir, a, h, ankle, footFwd, other, po, overToe);
+    if (overToe > 0.001 && other && h > 0.01) this.kneeOverToe(side, hip, dir, a, h, ankle, footFwd, other, po, overToe);
+    this.kneeFollow(side, po, dir);
     const knee = hip.clone().addScaledVector(dir, a).addScaledVector(po, h);
     const target = hip.clone().add(toT);
     const restD1 = this.restDir(side + 'UpLeg', side + 'Leg');
@@ -444,30 +461,60 @@ export class Skater {
    * The knee can sit anywhere on a circle around the hip-ankle line. Pick the point of that circle that lies just outside
    * the vertical plane through the ankle along the foot (the side away from the other foot), nearest the given pole.
    */
-  private kneeOverToe(hip: Vector3, dir: Vector3, a: number, h: number, ankle: Vector3, footFwd: Vector3, other: Vector3, po: Vector3, w: number) {
+  private kneeOverToe(side: 'Left' | 'Right', hip: Vector3, dir: Vector3, a: number, h: number, ankle: Vector3, footFwd: Vector3, other: Vector3, po: Vector3, w: number) {
     const f = _k1.set(footFwd.x, 0, footFwd.z);
     if (f.lengthSq() < 1e-6) return;
     f.normalize();
     const n = _k2.set(-f.z, 0, f.x); // horizontal normal of the foot plane, pointing towards the other foot
-    if (n.dot(_k3.subVectors(other, ankle)) < 0) n.negate();
+    const toOther = n.dot(_k3.subVectors(other, ankle));
+    if (toOther < 0) n.negate();
     const e1 = _k3.copy(n).addScaledVector(dir, -n.dot(dir));
     const alpha = e1.length();
-    if (alpha < 0.05) return; // leg lies across the plane: any knee direction is fine
+    // fade out (never switch) where the construction degenerates: the other foot near the plane (its side is ambiguous)
+    // or the leg lying across the plane (any knee direction is fine)
+    w *= sm((Math.abs(toOther) - 0.02) / 0.04) * sm((alpha - 0.05) / 0.08);
+    if (w < 1e-4) return;
     e1.divideScalar(alpha);
     const e2 = _k4.crossVectors(dir, e1);
     // inward distance of the knee from the plane: g = (C - ankle).n + h * alpha * cos(phi); want g = -1.5 cm
     const c0 = _k5.copy(hip).addScaledVector(dir, a).sub(ankle).dot(n);
     const cphi = (-0.015 - c0) / (h * alpha);
-    if (cphi >= 1) return; // the knee can't get near the plane from the inside: keep the natural pole
-    const k = _k5;
+    // cphi >= 1: the knee can't get near the plane from the inside, keep the natural pole (blended in, not switched)
+    w *= 1 - sm((cphi - 0.93) / 0.07);
+    if (w < 1e-4) return;
+    const k = _k5, ks = this.kneeS[side];
     if (cphi <= -1) k.copy(e1).negate();
     else {
       const sphi = Math.sqrt(1 - cphi * cphi);
       const kA = _k6.copy(e1).multiplyScalar(cphi).addScaledVector(e2, sphi);
       k.copy(e1).multiplyScalar(cphi).addScaledVector(e2, -sphi);
-      if (kA.dot(po) > k.dot(po)) k.copy(kA);
+      // keep last frame's side of the circle unless the other one is clearly nearer the pole
+      const dA = kA.dot(po), dB = k.dot(po);
+      if (ks.side === 0) ks.side = dA > dB ? 1 : -1;
+      else if (ks.side === 1 ? dB > dA + 0.25 : dA > dB + 0.25) ks.side = -ks.side;
+      if (ks.side === 1) k.copy(kA);
     }
     po.lerp(k, w).normalize();
+  }
+
+  /** per leg: knee direction spring state (root space) and the over-toe solution side */
+  private kneeS = { Left: { x: new Vector3(), v: new Vector3(), t: -1, side: 0 }, Right: { x: new Vector3(), v: new Vector3(), t: -1, side: 0 } };
+  /**
+   * The knee direction follows its target through an exact critically damped spring (25/s, frame-rate independent), so a
+   * pole target that moves fast never swings the knee in one frame; the result stays perpendicular to the hip-ankle line.
+   */
+  private kneeFollow(side: 'Left' | 'Right', po: Vector3, dir: Vector3) {
+    const s = this.kneeS[side], dt = this.time - s.t;
+    if (s.t < 0 || dt > 0.1) { s.x.copy(po); s.v.set(0, 0, 0); }
+    else if (dt > 0) {
+      const W = 25, e = Math.exp(-W * dt);
+      const x0 = _k1.subVectors(s.x, po), c = _k2.copy(s.v).addScaledVector(x0, W);
+      s.x.copy(po).addScaledVector(x0, e).addScaledVector(c, dt * e);
+      s.v.addScaledVector(c, -W * dt).multiplyScalar(e);
+    }
+    s.t = this.time;
+    const q = _k3.copy(s.x).addScaledVector(dir, -s.x.dot(dir));
+    if (q.lengthSq() > 1e-6) po.copy(q.normalize());
   }
 
   private restDirs = new Map<string, Vector3>();
@@ -582,7 +629,7 @@ export class Skater {
   }
 
   // ------------------------------------------------------------------------------------- per frame
-  update(dt: number, ph: SkatePhysics, board: BoardView, input: { steer: number; crouch: boolean }) {
+  update(dt: number, ph: PhysView, board: BoardView, input: { steer: number; crouch: boolean }) {
     this.time += dt;
     this.phaseT += dt;
     this.steer = input.steer;
@@ -606,13 +653,18 @@ export class Skater {
     this.xf.t = 0; this.xf.dur = dur;
   }
 
-  private readEvents(ph: SkatePhysics, board: BoardView) {
+  private readEvents(ph: PhysView, board: BoardView) {
     for (const e of ph.events) {
       switch (e.type) {
-        case 'pop': this.popH = this.Pout.hipH; this.crossfade(0.06); break;
-        case 'leaveGround': this.crossfade(0.12); break;
+        case 'pop': {
+          const S = this.airS, o = this.Pout;
+          this.popH = o.hipH; this.crossfade(0.06);
+          S.hip.set(o.hipH); S.p.set(o.pPitch); S.c.set(o.cPitch); S.h.set(o.hPitch);
+          break;
+        }
+        case 'leaveGround': this.crossfade(0.2); break;
         case 'land':
-          this.crossfade(0.1);
+          this.crossfade(0.06);
           if (e.quality === 'clean' && (e.popped || e.flip || e.vert || e.airTime > 0.3)) this.grinT = 1.1;
           this.clothKick = clamp(e.impact / 5, 0.3, 1); this.clothKickT = 0;
           break;
@@ -624,7 +676,7 @@ export class Skater {
   }
 
   // ------------------------------------------------------------------------------------- board + root
-  private poseBoard(dt: number, ph: SkatePhysics, board: BoardView) {
+  private poseBoard(dt: number, ph: PhysView, board: BoardView) {
     const inAir = ph.mode === 'air';
     let pitch = 0, pivot = -0.36, roll = 0, yaw = 0, lift = 0;
     // ollie: the tail snaps down, the nose rises, then the front foot drags it level
@@ -645,6 +697,10 @@ export class Skater {
       pitch = Math.max(pitch, 0.5 * Math.sin(Math.PI * Math.min(1, k * 1.08)));
       pivot = -0.18;
     }
+    // drop-in: the part of the board's pitch the board root doesn't carry yet (set-up nose-up, start of the pivot) is a
+    // deck pose about the trailing truck (tail on the coping)
+    const dI = ph.dropin;
+    if (dI) { const dp = dropRootAng(dI) - dI.ang; if (dp > 1e-4) { pitch = dp * dI.lead; pivot = -0.18 * dI.lead; } }
     // flips: the board turns in open air under the feet, the deck is back to identity at the catch
     let useDeck = true, fp = 0, kind = '';
     if (inAir && ph.flip && !ph.flip.done) {
@@ -669,7 +725,7 @@ export class Skater {
     this.deckInfo.useDeck = useDeck; this.deckInfo.fp = fp; this.deckInfo.kind = kind;
   }
 
-  private manualAmp(ph: SkatePhysics) {
+  private manualAmp(ph: PhysView) {
     const m = ph.manual;
     return 0.06 + 0.1 * clamp(m.time / 2.5, 0, 1) + clamp(Math.abs(m.bvel) * 0.4, 0, 0.2);
   }
@@ -680,7 +736,7 @@ export class Skater {
     _q.setFromAxisAngle(Y, -Math.PI / 2);
     const rq = _q2.copy(bq).multiply(_q);
     if (this.phase === 'stepon') {
-      const e = sm((this.phaseT - this.stepDelay) / 0.45);
+      const e = sm((this.phaseT - this.stepDelay) / this.stepDur);
       this.root.position.lerpVectors(this.clipRootPos, board.root.position, e);
       this.root.quaternion.slerpQuaternions(this.clipRootQ, rq, e);
     } else {
@@ -691,7 +747,7 @@ export class Skater {
   }
 
   // ------------------------------------------------------------------------------------- riding pose
-  private ridePose(dt: number, ph: SkatePhysics, board: BoardView) {
+  private ridePose(dt: number, ph: PhysView, board: BoardView) {
     this.computePose(dt, ph, board, this.P);
     if (this.xf.t < this.xf.dur) {
       this.Pout.mix(this.xf.from, this.P, sm(this.xf.t / this.xf.dur));
@@ -700,7 +756,7 @@ export class Skater {
     this.applyPose(this.Pout);
   }
 
-  private computePose(dt: number, ph: SkatePhysics, board: BoardView, P: Pose) {
+  private computePose(dt: number, ph: PhysView, board: BoardView, P: Pose) {
     const st = this.stance;
     const t = this.time;
     const inAir = ph.mode === 'air';
@@ -708,7 +764,9 @@ export class Skater {
     const spd = ph.speed, spdF = clamp(spd / 9, 0, 1);
     const onTrans = ph.mode === 'ride' && ph.up.y < 0.965;
     // ---- context weights
-    const crouch = this.crouchS.update(this.inCrouch && ph.mode === 'ride' && ph.kickturn.t < 0 && !ph.manual.active ? 1 : 0, dt);
+    // two springs in a row: the hips start sinking without a jolt when the crouch key goes down
+    const crouchIn = this.crouchIn.update(this.inCrouch && ph.mode === 'ride' && ph.kickturn.t < 0 && !ph.manual.active ? 1 : 0, dt);
+    const crouch = this.crouchS.update(crouchIn, dt);
     const push = this.pushS.update(ph.pushT >= 0 ? 1 : 0, dt);
     const man = this.manS.x;
     const gr = this.grindS.update(g ? 1 : 0, dt);
@@ -717,7 +775,7 @@ export class Skater {
     const idle = this.idleS.update(this.idleT > 0.7 ? 1 : 0, dt);
     const trans = this.transS.update(onTrans ? 1 : 0, dt);
     const brake = this.brakeS.update(ph.brakeAmt, dt);
-    const leanT = ph.dropin ? 0 : ph.mode === 'ride' ? clamp(this.steer * spd * 0.068, -0.36, 0.36) * (1 - man * 0.5) : g ? g.balance * 0.35 : 0;
+    const leanT = ph.dropin ? 0 : ph.mode === 'ride' ? clamp(ph.steerS * spd * 0.068, -0.36, 0.36) * (1 - man * 0.5) : g ? g.balance * 0.35 : 0;
     const lean = this.leanS.update(leanT, dt);
     const look = this.lookS.update(ph.fakie ? -1 : 1, dt);
     const lookF = (look + 1) / 2;
@@ -786,7 +844,8 @@ export class Skater {
     P.aR.raise += life * (0.35 * Math.sin(t * 1.9 + 2.1) + 0.2 * Math.sin(t * 3.3 + 1)); P.aR.fwd += life * 0.4 * Math.sin(t * 1.3 + 0.2);
     if (trans > 0.3) open = 1;
 
-    // ---- drop-in: a beat with the tail on the coping (weight on the back foot, looking down the wall), then the chest
+    // ---- drop-in: a beat with the tail on the coping and the nose up (weight on the back foot over the deck, front foot
+    // resting on the raised front bolts, looking down the wall), then the front foot drives the nose down and the chest
     // goes forward over the front truck into a deep crouch, hands to the knees, held all the way through the transition
     const dI = ph.dropin, sinceDrop = ph.time - ph.dropinEndT;
     const dropOn = !!dI || (ph.mode === 'ride' && (sinceDrop < 0.25 || (sinceDrop < 2 && ph.up.y < 0.93)));
@@ -795,13 +854,13 @@ export class Skater {
       const lead = dI ? dI.lead : ph.fakie ? -1 : 1;
       const lean = dI ? (dI.phase === 'pivot' ? sm(dI.pk * 1.4) : 0) : 1;
       P.hipH = lerp(P.hipH, lerp(0.76, 0.5, lean), dw);
-      hipShift += dw * lead * lerp(-0.05, 0.08, lean);
+      hipShift += dw * lead * lerp(-0.12, 0.08, lean);
       P.pYaw += dw * lead * 0.32 * lean; P.cYaw += dw * lead * 0.22 * lean;
       // while the board tips the back goes nearly level out over the front truck (s12/s13); once the board is on the
       // steep wall the chest stays only a little ahead of perpendicular to it, so he never dives head first
       const noseW = _v.set(1, 0, 0).applyQuaternion(this.root.quaternion);
       const tilt = Math.asin(clamp(-noseW.y * lead, -1, 1)); // leading end below level (rad)
-      const bend = lerp(0.34, clamp(1.45 - tilt, 0.38, dI ? 1.0 : 0.72), lean);
+      const bend = lerp(0.34, softClamp(1.45 - tilt, 0.38, dI ? 1.0 : 0.72, 0.22), lean);
       P.pPitch = lerp(P.pPitch, bend * 0.6, dw);
       P.cPitch = lerp(P.cPitch, bend * 0.4, dw);
       P.hPitch = lerp(P.hPitch, lerp(0.42, 0.05, lean), dw);
@@ -810,7 +869,7 @@ export class Skater {
       const L = arm(lerp(lerp(0.35, 0.3, lean), 0.7, desc), lerp(lerp(0.4, 0.95, lean), 0.6, desc), lerp(lerp(0.5, 0.78, lean), 0.5, desc));
       const R = arm(lerp(lerp(0.3, 0.28, lean), 0.65, desc), lerp(lerp(0.2, 0.8, lean), 0.3, desc), lerp(lerp(0.45, 0.72, lean), 0.45, desc));
       for (const [a, b] of [[P.aL, L], [P.aR, R]] as [ArmP, ArmP][]) { a.raise = lerp(a.raise, b.raise, dw); a.fwd = lerp(a.fwd, b.fwd, dw); a.elbow = lerp(a.elbow, b.elbow, dw); a.hang = lerp(a.hang, 0, dw); }
-      if (dI && dI.phase !== 'pivot') backX = lerp(backX, st.tail + 0.04, dw); // back foot on the tail, over the coping
+      if (dI) backX = lerp(backX, st.tail + 0.04, dw * (1 - lean)); // back foot on the tail over the coping, onto the bolts as he leans in
     }
 
     // ---- wind-up crouch before the pop
@@ -823,10 +882,10 @@ export class Skater {
       frontX = lerp(frontX, st.front - 0.02, crouch);
     }
 
-    // ---- push: turn to face the nose, deep front knee, forward lean, the body sinks with each kick
+    // ---- push: turn to face the nose, deep front knee, forward lean, the body sinks with each kick (on the physics' push clock)
     const pt = ph.pushT;
     if (push > 0.001) {
-      const sink = pt >= 0 ? win(pt, 0.05, 0.26, 0.42, 0.74) : 0;
+      const sink = pt >= 0 ? win(pt, 0.02, PUSH.T0 + 0.1, PUSH.T0 + PUSH.T - 0.02, PUSH.DUR) : 0;
       P.pYaw += push * 1.15;
       P.pPitch += push * 0.32; P.cPitch += push * 0.2;
       P.hPitch -= push * 0.12;
@@ -834,7 +893,7 @@ export class Skater {
       hipToFront = push * 0.85;
       P.hipZ += push * 0.03;
       this.fPole.lerp(_v.set(1, 0.15, 0.3), push); // the front knee bends forward over the front bolts
-      const sw = pt >= 0 ? Math.sin((2 * Math.PI * pt) / 0.78) * push : 0;
+      const sw = pt >= 0 ? Math.sin((2 * Math.PI * pt) / (PUSH.DUR + PUSH.COOL)) * push : 0;
       P.aL.fwd += 0.6 * sw; P.aR.fwd -= 0.6 * sw; P.aL.raise += 0.12 * push; P.aR.raise += 0.12 * push;
       P.aL.hang *= 1 - push * 0.6; P.aR.hang *= 1 - push * 0.6;
       frontYaw = lerp(frontYaw, 1.2, push);
@@ -857,7 +916,7 @@ export class Skater {
     // ---- kickturn: bent knees, weight back, the shoulders turn first
     if (ph.kickturn.t >= 0) {
       const k = clamp(ph.kickturn.t / KICKTURN_T, 0, 1);
-      const kw = sm(k / 0.15) * (1 - sm((k - 0.85) / 0.15));
+      const kw = sm(k / 0.28) * (1 - sm((k - 0.72) / 0.28)); // >= 0.12 s edges: no hip pop at either end
       const d = ph.kickturn.dir;
       P.hipH -= 0.09 * kw; hipShift -= 0.07 * kw; P.pRoll += 0.12 * kw;
       P.cYaw += d * 0.55 * Math.sin(Math.PI * Math.min(1, k * 1.5));
@@ -892,12 +951,13 @@ export class Skater {
       } else if (ph.popped && ph.popT >= 0) {
         // explicit curves over the predicted air time: pop (back leg snaps straight) -> tuck at the peak -> reach for the ground
         const tp = ph.time - ph.popT, T = ph.airPredT;
-        const tExt = 0.07, tT1 = Math.max(0.16, 0.48 * T), tE0 = Math.max(tT1 + 0.04, 0.6 * T), tE1 = Math.max(tE0 + 0.06, T - 0.02);
+        // extension and tuck no faster than ~0.1 s each: quicker curves read as a jolt on a fast display
+        const tExt = 0.14, tT1 = Math.max(tExt + 0.12, 0.48 * T), tE0 = Math.max(tT1 + 0.04, 0.6 * T), tE1 = Math.max(tE0 + 0.06, T - 0.02);
         // hips above the deck: the body still rises ~0.25 m at the peak while the board comes up into the tuck
-        const Htuck = ph.flip ? 0.6 : 0.64;
+        const Htuck = ph.flip ? 0.6 : 0.64, Hext = 0.78;
         let h: number;
-        if (tp < tExt) h = lerp(this.popH, 0.92, easeOut(tp / tExt));
-        else if (tp < tT1) h = lerp(0.92, Htuck, sm((tp - tExt) / (tT1 - tExt)));
+        if (tp < tExt) h = lerp(this.popH, Hext, sm(tp / tExt));
+        else if (tp < tT1) h = lerp(Hext, Htuck, sm((tp - tExt) / (tT1 - tExt)));
         else if (tp < tE0) h = Htuck;
         else h = lerp(Htuck, 0.75, sm((tp - tE0) / (tE1 - tE0)));
         P.hipH = h;
@@ -907,6 +967,10 @@ export class Skater {
         P.pPitch = 0.06 + 0.3 * kTuck + 0.14 * kExt + 0.06 * kPop;
         P.cPitch = 0.03 + 0.16 * kTuck + 0.06 * kExt;
         P.hPitch = 0.05 + 0.3 * kTuck + 0.05 * kExt;
+        // trunk and head follow those curves through a short spring: no jolt where the pop, tuck and hold phases join
+        const S = this.airS;
+        P.hipH = S.hip.update(P.hipH, dt); P.pPitch = S.p.update(P.pPitch, dt);
+        P.cPitch = S.c.update(P.cPitch, dt); P.hPitch = S.h.update(P.hPitch, dt);
         // arms swing up with the pop and stay out wide for balance
         const up = sm(tp / 0.1);
         const L = arm(1.25 - 0.25 * kTuck - 0.35 * kExt, 0.35, 0.4), R = arm(1.2 - 0.25 * kTuck - 0.35 * kExt, -0.2, 0.4);
@@ -962,8 +1026,10 @@ export class Skater {
             }
             bAbs.set(st.tail - 0.08, 0.5, -0.03);
             bPitch += 0.35 * bSplit;
-            // the body rises over the board so both legs can reach, chest over the board, eyes on the board
-            P.hipH += 0.07 * Math.max(fSplit, bSplit); P.pPitch += 0.08 * fSplit; P.hPitch += 0.22 * fSplit;
+            // the body rises over the board so both legs can reach, chest over the board, eyes on the board (slower than
+            // the feet: the trunk and head carry more mass)
+            const kBody = sm((ft - (tFl - 0.03)) / 0.14) * (1 - sm((ft - (tC - 0.15)) / 0.15));
+            P.hipH += 0.07 * kBody; P.pPitch += 0.08 * kBody; P.hPitch += 0.22 * kBody;
             P.aL.raise += 0.1 * fSplit; P.aR.raise += 0.1 * fSplit;
           }
         }
@@ -980,7 +1046,9 @@ export class Skater {
     const tl = ph.time - ph.landT;
     if (ph.mode === 'ride' && tl >= 0 && tl < 0.7) {
       const depth = clamp(0.14 + 0.055 * ph.landImpact, 0.2, 0.36);
-      const a = tl < 0.07 ? sm(tl / 0.07) : tl < 0.13 ? 1 : 1 - easeOut3((tl - 0.13) / 0.45);
+      // the hips carry on down at the landing speed and slow to a stop (no jolt as the board stops dead)
+      const tA = clamp((2 * depth) / Math.max(1, ph.landImpact), 0.09, 0.2);
+      const a = tl < tA ? easeOut(tl / tA) : tl < tA + 0.04 ? 1 : 1 - sm((tl - tA - 0.04) / 0.5);
       P.hipH -= depth * a;
       P.pPitch += 0.38 * a * (depth / 0.28); P.cPitch += 0.12 * a;
       P.hPitch -= 0.12 * a;
@@ -1000,10 +1068,11 @@ export class Skater {
     }
 
     // ---- cap the bend: the torso never folds flat at the waist (~35 deg on transitions)
-    const cap = lerp(onTrans ? 0.61 : 0.82, 1.0, this.dropS.x);
+    const cap = lerp(lerp(0.82, 0.61, trans), 1.0, this.dropS.x);
     P.hipH = Math.max(P.hipH, 0.42);
-    const bend = P.pPitch + P.cPitch;
-    if (bend > cap) { const k = cap / bend; P.pPitch *= k; P.cPitch *= k; }
+    // soft limit: the bend eases into the cap over its last 0.12 rad instead of stopping dead in one frame
+    const bend = P.pPitch + P.cPitch, c0 = cap - 0.12;
+    if (bend > c0) { const k = (c0 + 0.12 * Math.tanh((bend - c0) / 0.12)) / bend; P.pPitch *= k; P.cPitch *= k; }
 
     // ---- gaze along the direction of travel (over the leading shoulder), within what a neck can turn
     const vr = _v.copy(ph.vel).applyQuaternion(_q.copy(this.root.quaternion).invert());
@@ -1014,7 +1083,9 @@ export class Skater {
       gaze = clamp(gaze, -1.65, 1.65);
     }
     const gz = this.gazeS.update(gaze, dt);
-    P.hYaw = clamp(gz - P.pYaw - P.cYaw, -1.35, 1.35) + this.glanceYaw;
+    // neck limit +-1.35, eased in over its last 0.2 rad so the head never stops dead in one frame
+    const hy = gz - P.pYaw - P.cYaw, hyA = Math.abs(hy);
+    P.hYaw = (hyA <= 1.15 ? hy : Math.sign(hy) * (1.15 + 0.2 * Math.tanh((hyA - 1.15) / 0.2))) + this.glanceYaw;
 
     P.curl = 1 - this.openS.update(open, dt);
     P.hipX = lerp((frontX + backX) / 2 - 0.015, frontX - 0.03, hipToFront) + hipShift;
@@ -1039,36 +1110,36 @@ export class Skater {
     P.bF.copy(bf); P.bU.copy(bu); P.bP.set(-0.15, 0.1, 1).lerp(_v.set(0.25, -0.2, 1), bSplit);
     P.fK = 1 - fSplit; P.bK = 1 - bSplit;
 
-    // push: the back foot reaches ahead, plants beside the front truck, sweeps back along the ground, returns to the tail
+    // push: the back foot reaches ahead and plants beside the front truck at PUSH.T0 (the physics drives from then on),
+    // sweeps back along the ground through the stroke, lifts at its end and returns to the tail
     if (pt >= 0 && push > 0.02) {
       if (pt < this.pushPrevT) { this.pushPlant = null; this.pushRet = -1; }
       this.pushPrevT = pt;
       P.bK = 1 - push;
+      const T0 = PUSH.T0, tLift = PUSH.T0 + PUSH.T;
       const plant = new Vector3(frontX + 0.05, 0, 0.21);
       const deckAnkle = P.bA.clone();
-      if (pt < 0.24) {
-        const k = sm(pt / 0.24);
+      if (pt < T0) {
+        const k = sm(pt / T0);
         const p = deckAnkle.clone().lerp(_v.copy(plant).setY(ankleH), k);
-        p.y += Math.sin(k * Math.PI) * 0.09;
+        p.y += Math.sin(k * Math.PI) * 0.07;
         P.bA.copy(p); this.pushPlant = null; this.pushRet = -1;
         P.bF.lerp(new Vector3(1, 0, 0.15).normalize(), k).normalize();
         P.bU.lerp(Y, k).normalize();
-        P.bP.set(0.6, 0.1, 0.8);
       } else {
         if (!this.pushPlant) this.pushPlant = this.root.localToWorld(plant.clone());
         if (this.pushRet < 0) {
           // the planted foot stays put on the ground; lift it once the stroke is done or it is far behind
           const rel = this.toRoot(this.pushPlant.clone());
-          if (pt >= 0.54 || rel.x < -0.6) { this.pushRet = pt; this.pushFrom.copy(rel).setY(ankleH); }
+          if (pt >= tLift || rel.x < -0.6) { this.pushRet = pt; this.pushFrom.copy(rel).setY(ankleH); }
         }
         if (this.pushRet < 0) {
           const p = this.toRoot(this.pushPlant.clone());
-          const k = sm((pt - 0.24) / 0.3);
+          const k = sm((pt - T0) / 0.3);
           p.y = ankleH + k * 0.012;
           P.bA.copy(p);
           P.bF.set(1, 0, 0.2).normalize().applyAxisAngle(Z, -k * 0.35);
           P.bU.copy(Y);
-          P.bP.set(0.4, 0.05, 1);
         } else {
           const k = sm((pt - this.pushRet) / 0.24);
           const p = _v.copy(this.pushFrom).lerp(deckAnkle, k); p.y += Math.sin(k * Math.PI) * 0.13;
@@ -1077,6 +1148,11 @@ export class Skater {
           P.bU.copy(Y).lerp(bu, k).normalize();
         }
       }
+      // back knee pole on the same clock, continuous: forward while reaching, planted pole through the stroke, riding pole
+      const retT = this.pushRet >= 0 ? this.pushRet : tLift;
+      const wReach = win(pt, 0, 0.05, T0 - 0.01, T0 + 0.08), wPlant = win(pt, T0 - 0.03, T0 + 0.06, retT, retT + 0.16);
+      P.bP.set(-0.15, 0.1, 1).normalize().lerp(_v.set(0.6, 0.1, 0.8).normalize(), wReach * push)
+        .lerp(_v.set(0.4, 0.05, 1).normalize(), wPlant * push).normalize();
     } else { this.pushPlant = null; this.pushRet = -1; this.pushPrevT = 0; }
     // foot brake: the back foot drags behind on the ground
     if (brake > 0.01) {
@@ -1247,7 +1323,7 @@ export class Skater {
     return _v.set(0, 0, 1).applyQuaternion(q).y;
   }
 
-  private startBail(ph: SkatePhysics) {
+  private startBail(ph: PhysView) {
     const b = ph.bail!;
     this.bailKind = b.kind;
     this.takeSnapshot(0.2);
@@ -1257,14 +1333,19 @@ export class Skater {
     const spec = FALLS[b.kind];
     let clip = spec.clip, start = spec.start, rate = spec.rate, end = spec.end;
     if (!this.clips.has(clip)) { clip = 'bail_back'; start = 0.6; rate = 1.3; end = 2.25; }
+    this.fast = ph.assist.fastRecover;
+    if (this.fast) rate = Math.max(rate * 1.5, (end - start) / FAST_FALL);
     this.play(clip, { rate, start });
     this.fallEnd = Math.min(end, this.clips.get(clip)?.duration ?? end);
     this.setExpr('grimace');
     this.idleT = 0; this.fid.kind = '';
+    this.plan = null; this.walk = null;
+    this.stepDur = this.fast ? 0.3 : 0.45;
   }
 
   private startLie() {
     this.phase = 'lie'; this.phaseT = 0;
+    if (this.fast) { this.lieDur = 0; this.shakeW = 0; return; } // only until the body has stopped sliding
     const back = this.hipsFwdY() > 0.3;
     if (back && this.clips.has('lie_shake')) {
       // lying on the back: shake it off (the clip's start matches the fall's end)
@@ -1278,16 +1359,61 @@ export class Skater {
     }
   }
 
-  private startGetup() {
-    const g = this.hipsFwdY() > 0.3 ? GETUPS.back : GETUPS.front;
-    this.takeSnapshot(0.45);
+  private startGetup(ph: PhysView) {
+    const set = this.fast ? GETUPS_FAST : GETUPS;
+    const g = this.hipsFwdY() > 0.3 ? set.back : set.front;
+    this.takeSnapshot(this.fast ? 0.3 : 0.45);
     this.alignClip(g.clip, g.start);
     this.play(g.clip, { rate: g.rate, start: g.start });
     this.getupEnd = g.end;
     this.phase = 'getup'; this.phaseT = 0; this.shakeW = 0;
+    // where he will stand: the clip's end hips. Not room to stand there (a wall, a slope): get up a little further over.
+    this.root.updateMatrixWorld(true);
+    const eh = this.sampleHips(g.clip, g.end);
+    const end = eh.p.applyMatrix4(this.corr);
+    this.root.localToWorld(end);
+    const ef = new Vector3(0, 0, 1).applyQuaternion(this.root.quaternion.clone().multiply(new Quaternion().setFromRotationMatrix(this.corr)).multiply(eh.q));
+    const endYaw = Math.atan2(ef.x, ef.z);
+    const gh = groundAt(ph.world, end.x, end.z, this.root.position.y, 0.4, 0.8);
+    let stand = gh ? gh.point : end.setY(this.root.position.y);
+    if (!standable(ph.world, stand, 0.96)) {
+      const s = findStandSpot(ph.world, stand, 1.2, 0.96) ?? (standable(ph.world, stand) ? null : findStandSpot(ph.world, stand, 1.2));
+      if (s) {
+        const d = s.clone().sub(stand).setY(0).applyQuaternion(this.root.quaternion.clone().invert());
+        this.corr.premultiply(new Matrix4().makeTranslation(d.x, 0, d.z));
+        stand = s;
+      }
+    }
+    if (ph.bail) this.tryPlan(ph, stand, endYaw, this.fast);
   }
 
-  private startWalk(ph: SkatePhysics) {
+  /**
+   * Decide where the board goes back down and his walk to it (src/player/recovery.ts). It stays where it lies if he can
+   * walk to it on flat ground; otherwise it hops over to open flat ground near him (quick recovery: right in front of
+   * him). Waits for a board that is still moving unless forced.
+   */
+  private tryPlan(ph: PhysView, stand: Vector3, yaw: number, force: boolean) {
+    const bb = ph.bail?.board;
+    if (!bb) return false;
+    const moving = !bb.asleep || bb.gliding;
+    if (moving && !force) return false;
+    const rest = { pos: new Vector3(), fwd: new Vector3(), up: new Vector3() };
+    bb.ridePose(rest.pos, rest.fwd, rest.up);
+    const usable = !bb.gliding && (!moving || (bb.v.length() < 0.3 && bb.w.length() < 2));
+    const plan = planRecovery(ph.world, stand, usable ? rest : null,
+      this.fast ? { maxWalk: 1.2, face: yaw, prefer: rest.fwd, tight: true } : { maxWalk: 5, prefer: rest.fwd });
+    if (plan.relocate) bb.moveTo(plan.ride, plan.fwd, plan.up, this.fast ? 0.42 : 0.6);
+    else if (moving) bb.asleep = true;
+    this.plan = plan;
+    return true;
+  }
+
+  private applyPlan() {
+    const w = this.walk!, p = this.plan!;
+    w.target.copy(p.target); w.faceYaw = p.faceYaw; w.ridePos.copy(p.ride); w.rideFwd.copy(p.fwd);
+  }
+
+  private startWalk(ph: PhysView) {
     // stand the walker where the hips are, facing the way the body faces
     const hb = this.hips;
     const hp = hb.getWorldPosition(new Vector3());
@@ -1296,17 +1422,23 @@ export class Skater {
     f.normalize();
     const yaw = Math.atan2(f.x, f.z);
     const gh = ph.world.raycast(_v.copy(hp).add(_v2.set(0, 0.5, 0)), _v3.set(0, -1, 0), 3);
+    // never stand up on a wall or inside anything: the nearest spot with walkable ground and room, or the planned start
+    let s = new Vector3(hp.x, gh ? gh.point.y : this.root.position.y, hp.z);
+    if (!standable(ph.world, s)) s = findStandSpot(ph.world, s, 3) ?? s;
+    const pl = this.plan;
+    if (pl && s.distanceTo(pl.stand) > 0.2 && !walkPath(ph.world, s, pl.target).ok) s = pl.stand.clone();
     this.takeSnapshot(0.4);
-    this.rebase(new Vector3(hp.x, gh ? gh.point.y : this.root.position.y, hp.z), new Quaternion().setFromAxisAngle(Y, yaw));
+    this.rebase(s, new Quaternion().setFromAxisAngle(Y, yaw));
     this.corr.identity();
-    this.walk = { target: new Vector3(), faceYaw: yaw, speed: 0, yaw, ridePos: new Vector3(), rideFwd: new Vector3(), wait: 0 };
-    this.planWalk(ph);
+    this.walk = { target: new Vector3(), faceYaw: yaw, speed: 0, yaw, ridePos: new Vector3(), rideFwd: new Vector3(), wait: 0, blocked: 0 };
+    if (!this.plan) this.tryPlan(ph, s, yaw, this.fast);
+    if (this.plan) this.applyPlan(); else this.planWalk(ph);
     if (!this.play('walk', { loop: true, rate: 0.4 })) this.play('idle', { loop: true });
     this.phase = 'walk'; this.phaseT = 0;
   }
 
   /** stand on the heel side of the board, facing across it */
-  private planWalk(ph: SkatePhysics) {
+  private planWalk(ph: PhysView) {
     const w = this.walk!;
     const bb = ph.bail?.board;
     const up = new Vector3(0, 1, 0);
@@ -1317,27 +1449,39 @@ export class Skater {
     w.faceYaw = Math.atan2(-heel.x, -heel.z);
   }
 
-  private walkStep(dt: number, ph: SkatePhysics) {
+  private walkStep(dt: number, ph: PhysView) {
     const w = this.walk!;
     const bb = ph.bail?.board;
-    const waiting = !!bb && !bb.asleep && w.wait < 3;
-    if (waiting) { w.wait += dt; this.planWalk(ph); }
+    if (!this.plan) {
+      // the board is still moving: watch it for a moment, then plan anyway
+      w.wait += dt;
+      if (this.tryPlan(ph, this.root.position, w.yaw, w.wait > 1)) this.applyPlan(); else this.planWalk(ph);
+    } else if (w.blocked > 0.4) {
+      // something is in the way after all: plan again from here
+      w.blocked = 0; this.plan = null;
+      if (this.tryPlan(ph, this.root.position, w.yaw, true)) this.applyPlan();
+    }
+    const waiting = !this.plan || !!bb?.gliding;
+    const fast = this.fast ? 1.7 : 1;
     const p = this.root.position;
     const to = _v.set(w.target.x - p.x, 0, w.target.z - p.z);
     const dist = to.length();
     const near = dist < 0.4;
     const want = near ? w.faceYaw : Math.atan2(to.x, to.z);
     const dy = wrapA(want - w.yaw);
-    w.yaw += clamp(dy, -3.2 * dt, 3.2 * dt);
+    w.yaw += clamp(dy, -3.2 * fast * dt, 3.2 * fast * dt);
     if (waiting) w.speed = Math.max(0, w.speed - 3 * dt);
     else if (!near) {
       const align = Math.max(0, Math.cos(dy));
-      w.speed += clamp(WALK_SPEED * align * align * sm(dist / 0.8) - w.speed, -3 * dt, 2.5 * dt);
-      p.x += Math.sin(w.yaw) * w.speed * dt; p.z += Math.cos(w.yaw) * w.speed * dt;
+      w.speed += clamp(WALK_SPEED * fast * align * align * sm(dist / 0.8) - w.speed, -3 * fast * dt, 2.5 * fast * dt);
+      // only onto walkable ground (the planned path is; this is the safety net)
+      const nx = p.x + Math.sin(w.yaw) * w.speed * dt, nz = p.z + Math.cos(w.yaw) * w.speed * dt;
+      const g = groundAt(ph.world, nx, nz, p.y, STEP_UP + 0.25, STEP_DOWN + 0.3);
+      if (g && levelness(ph.world, g) >= WALK_NY) { p.x = nx; p.z = nz; w.blocked = 0; } else { w.speed = 0; w.blocked += dt; }
     } else {
       // last steps: shuffle onto the spot while turning to face the board
       w.speed = Math.max(0, w.speed - 3 * dt);
-      if (dist > 1e-4) p.addScaledVector(to.divideScalar(dist), Math.min(dist, Math.max(0.3, w.speed) * dt));
+      if (dist > 1e-4) p.addScaledVector(to.divideScalar(dist), Math.min(dist, Math.max(0.3 * fast, w.speed) * dt));
     }
     const gh = ph.world.raycast(_v2.set(p.x, p.y + 0.6, p.z), _v3.set(0, -1, 0), 2);
     if (gh) p.y += (gh.point.y - p.y) * (1 - Math.exp(-14 * dt));
@@ -1347,10 +1491,10 @@ export class Skater {
     if (arrived || this.phaseT > 9) this.startStepOn(ph);
   }
 
-  private startStepOn(ph: SkatePhysics) {
+  private startStepOn(ph: PhysView) {
     const w = this.walk!;
     const bb = ph.bail?.board;
-    if (bb) bb.ridePose(w.ridePos, w.rideFwd, _v);
+    if (bb && !this.plan) bb.ridePose(w.ridePos, w.rideFwd, _v);
     // an upside-down board gets flipped over first (the board hops over in game.syncBoard), then he steps on
     this.stepDelay = bb && !bb.wheelsDown ? 0.32 : 0;
     this.onRecovered?.(w.ridePos.clone(), w.rideFwd.clone());
@@ -1365,7 +1509,7 @@ export class Skater {
     this.gazeS.set(1.4);
   }
 
-  private updateClipPhase(dt: number, ph: SkatePhysics) {
+  private updateClipPhase(dt: number, ph: PhysView) {
     const a = this.action;
     switch (this.phase) {
       case 'bail':
@@ -1375,7 +1519,9 @@ export class Skater {
         }
         break;
       case 'lie':
-        if (this.phaseT > this.lieDur) this.startGetup();
+        // the body may still slide down a slope or shuffle over to a spot where he can stand: get up once it is still
+        if (ph.bail) this.root.position.copy(ph.bail.body);
+        if (this.phaseT > this.lieDur && (!ph.bail || (ph.bail.still > (this.fast ? 0.12 : 0.2) && !ph.bail.standAt) || this.phaseT > this.lieDur + 1.5)) this.startGetup(ph);
         break;
       case 'getup':
         if (!a || a.time >= this.getupEnd - 0.02) this.startWalk(ph);
@@ -1384,7 +1530,7 @@ export class Skater {
         this.walkStep(dt, ph);
         break;
       case 'stepon':
-        if (this.phaseT > this.stepDelay) this.procW = Math.min(1, this.procW + dt / 0.5);
+        if (this.phaseT > this.stepDelay) this.procW = Math.min(1, this.procW + dt / (this.stepDur + 0.05));
         if (this.procW >= 1) { this.phase = 'ride'; this.mixer.stopAllAction(); this.action = null; this.snap = null; }
         break;
     }
@@ -1453,7 +1599,7 @@ export class Skater {
   }
 
   // ------------------------------------------------------------------------------------- face + cloth
-  private updateFace(dt: number, ph: SkatePhysics) {
+  private updateFace(dt: number, ph: PhysView) {
     this.grinT = Math.max(0, this.grinT - dt);
     this.exprHold = Math.max(0, this.exprHold - dt);
     let want: Expr = 'neutral';
@@ -1469,7 +1615,7 @@ export class Skater {
     }
   }
 
-  private updateCloth(dt: number, ph: SkatePhysics) {
+  private updateCloth(dt: number, ph: PhysView) {
     const u = this.clothU;
     const v = ph.vel;
     const s = v.length();

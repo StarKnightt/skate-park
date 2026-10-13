@@ -6,7 +6,7 @@ import {
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
-import { toonMaterial } from '../render/materials';
+import { shared, toonMaterial } from '../render/materials';
 import { rng } from '../core/util';
 import { BOARDWALK_BENCH_X, BOARDWALK_LAMP_X, EDGE_PALMS, KIOSK } from './park';
 import { People } from './people';
@@ -471,6 +471,15 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
   // ------------------------------------------------------------------ the snack kiosk's shop behind its service window
   const kiosk = buildKioskShop();
   group.add(kiosk.mesh);
+  // the lit shop spills warm light onto the counter, stools, ground, awning, roof edge and the wall around the window
+  // (the line source sits out over the counter, where that light bounces off the counter, the awning and the ground)
+  {
+    const { win, z1 } = KIOSK, yc = (win.y0 + win.y1) / 2 + 0.22;
+    shared.uSpillA.value.set(win.x0 + 0.4, yc, z1 + 1.3, 5.5);
+    shared.uSpillB.value.set(win.x1 - 0.4, yc, z1 + 1.3, 0);
+    shared.uSpillPlane.value.set(0, 0, 1, z1);
+  }
+  const spillC = new Color('#ffc58c');
 
   // ------------------------------------------------------------------ people (people.glb from the character pipeline; optional)
   const people = new People(terrainHeight);
@@ -485,6 +494,8 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
       people.update(dt);
       // the shop lights are on all day; at sunset and blue hour they glow like the lit windows
       kiosk.mat.emissiveIntensity = 0.45 + windows.emissiveIntensity * 1.05;
+      const sp = Math.min(1, Math.max(0, (windows.emissiveIntensity / 1.3 - 0.25) / 0.75));
+      shared.uSpillColor.value.copy(spillC).multiplyScalar(2.2 * sp);
     },
   };
 }

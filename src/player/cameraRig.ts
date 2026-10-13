@@ -2,6 +2,7 @@ import { PerspectiveCamera, Vector3 } from 'three';
 import type { CollisionWorld, Hit } from '../world/collision';
 import type { GrindLine } from '../world/park';
 import { clamp, damp, dampAngle, lerp, smoothstep, wrapAngle, SpringV3, Spring } from '../core/util';
+import { settings } from '../core/settings';
 
 /** What the rig reads from the skate physics each frame. */
 export interface CamSubject {
@@ -42,7 +43,11 @@ export class CameraRig {
   yaw = Math.PI; // camera position angle around the target (0 = camera on +Z side)
   pitch = 0.2; // current elevation of the camera above the look target
   dist = 4.2;
+  /** player look offsets, applied directly (no smoothing); yaw = autoYaw (heading follow, damped) + userYaw */
   userYaw = 0; userPitch = 0;
+  autoYaw = Math.PI;
+  /** the pointer is locked (mouse look): recentering is opt-in and only after a long pause */
+  locked = false;
   idleT = 0;
   target = new SpringV3(10);
   fovS = new Spring(58, 3);
@@ -70,6 +75,10 @@ export class CameraRig {
   private pos = new Vector3();
   private wBowl = 0; private bowlRef: Bowl | null = null; private carveW = 0; private dropT = -99;
   private pendDl = 0; private pendPrev = 0;
+  private guardS = new Spring(0, 30);
+  private recY = new Spring(0, 1.2); private recP = new Spring(0, 1.2);
+  private spS = new Spring(0, 1.6);
+  private wallPush = new Vector3(); private groundLift = 0;
   /** last frame's internals, for capture diagnostics */
   info = { side: 0, pend: 0, swing: 0, avoid: 0, wantD: 0, d: 0, clear: 0, floor: 0, yT: 0, elev: 0, bowl: false, bw: 0, carve: 0, drop: 0, base: 0, goal: 0 };
 
@@ -101,17 +110,42 @@ export class CameraRig {
   snap(targetPos: Vector3, heading: number) {
     this.target.set(targetPos);
     this.heading = heading;
-    this.yaw = heading + Math.PI;
+    this.yaw = this.autoYaw = heading + Math.PI;
     this.userYaw = 0; this.userPitch = 0;
+    this.lookPend.y = this.lookPend.p = 0;
     this.snapNext = true;
   }
 
-  addOrbit(dx: number, dy: number) {
-    this.userYaw -= dx * 0.006;
-    this.userPitch = clamp(this.userPitch + dy * 0.004, -0.25, 0.9);
+  /** player look (radians, added to userYaw / userPitch): yaw > 0 swings the camera left round the skater, pitch > 0
+   *  raises it. Applied from the same frame on, spread over a few ms so 50-125 Hz input events don't step a fast display. */
+  look(yaw: number, pitch: number) {
+    if (!yaw && !pitch) return;
+    this.lookPend.y += yaw; this.lookPend.p += pitch;
     this.idleT = 0;
+    this.recY.v = this.recP.v = 0;
+    this.recentering = false;
   }
-  recenter() { this.userYaw = 0; this.userPitch = 0; }
+  private lookPend = { y: 0, p: 0 };
+  private applyLook(dt: number) {
+    const lp = this.lookPend;
+    if (!lp.y && !lp.p) return;
+    // raw locked mouse: ~12 ms; drag / touch / stick (coarser, ~50-60 Hz events): ~30 ms
+    const k = 1 - Math.exp(-dt / (this.locked ? 0.012 : 0.03));
+    const dy = Math.abs(lp.y) < 1e-5 ? lp.y : lp.y * k, dp = Math.abs(lp.p) < 1e-5 ? lp.p : lp.p * k;
+    lp.y -= dy; lp.p -= dp;
+    this.userYaw = wrapAngle(this.userYaw + dy);
+    const p = this.userPitch + dp;
+    this.userPitch = clamp(p, -0.25, 0.9);
+    if (this.userPitch !== p) lp.p = 0;
+  }
+  addOrbit(dx: number, dy: number) { this.look(-dx * 0.006, dy * 0.004); }
+  /** ease the look offsets back to behind the skater */
+  recenter() { this.recentering = true; this.recY.v = this.recP.v = 0; }
+  private recentering = false;
+  private easeBack(omega: number, dt: number) {
+    this.recY.x = this.userYaw; this.userYaw = this.recY.update(0, dt, omega);
+    this.recP.x = this.userPitch; this.userPitch = this.recP.update(0, dt, omega);
+  }
 
   update(dt: number, focus: Vector3, s: CamSubject) {
     const cam = this.cam;
@@ -121,6 +155,7 @@ export class CameraRig {
       return;
     }
     this.time += dt; this.frameN++;
+    this.applyLook(dt);
     const snap = this.snapNext;
     this.snapNext = false;
     const portrait = cam.aspect < 1;
@@ -153,7 +188,13 @@ export class CameraRig {
       this.heading = dampAngle(this.heading, want, reversed ? 0.35 : air ? 1.2 : 2.6, dt);
     }
     this.idleT += dt;
-    if (this.idleT > 2.5 && hv > 1.5) {
+    if (this.recentering) {
+      this.easeBack(6, dt);
+      if (Math.abs(this.userYaw) + Math.abs(this.userPitch) < 1e-3) this.recentering = false;
+    } else if (this.locked) {
+      // mouse look holds the view; optionally ease back behind him after a long pause while rolling
+      if (settings.autoRecenter && this.idleT > 3 && hv > 1.5) this.easeBack(1.2, dt); else this.recY.v = this.recP.v = 0;
+    } else if (this.idleT > 2.5 && hv > 1.5) {
       this.userYaw *= Math.exp(-0.8 * dt);
       this.userPitch *= Math.exp(-0.8 * dt);
     }
@@ -267,7 +308,9 @@ export class CameraRig {
     let yawT = base + swing + this.userYaw;
 
     // ---- distance: keep the skater about a third of the frame height (a quarter in portrait)
-    const sp = clamp(s.speed / 10, 0, 1);
+    // smoothed speed: FOV and distance must not pump with each push
+    if (snap) this.spS.set(s.speed); else this.spS.update(s.speed, dt);
+    const sp = clamp(this.spS.x / 10, 0, 1);
     this.fovS.update((portrait ? 64 : 56) + sp * 8, dt);
     if (Math.abs(cam.fov - this.fovS.x) > 0.01) { cam.fov = this.fovS.x; cam.updateProjectionMatrix(); }
     const tH = Math.tan((cam.fov * Math.PI) / 360);
@@ -340,13 +383,16 @@ export class CameraRig {
     // escape an obstruction quickly, ease back behind the skater slowly
     this.avoid = snap ? avoidT : damp(this.avoid, avoidT, Math.abs(avoidT) < Math.abs(this.avoid) ? 1.5 : 4, dt);
     const yawGoal = yawT + this.avoid;
-    const yaw0 = this.yaw;
-    this.yaw = snap ? yawGoal : dampAngle(this.yaw, yawGoal, 5, dt);
+    // the heading follow is damped; the player's look offset goes on top as is
+    const autoGoal = yawGoal - this.userYaw, a0 = this.autoYaw;
+    this.autoYaw = snap ? autoGoal : dampAngle(this.autoYaw, autoGoal, 5, dt);
     if (!snap && this.wBowl > 0.01) {
       // in a bowl, coming round from ahead of him after a stall is a steady swing, not a whip
-      const mx = lerp(40, 2.4, this.wBowl) * dt, dy = wrapAngle(this.yaw - yaw0);
-      if (Math.abs(dy) > mx) this.yaw = yaw0 + Math.sign(dy) * mx;
+      const mx = lerp(40, 2.4, this.wBowl) * dt, dy = wrapAngle(this.autoYaw - a0);
+      if (Math.abs(dy) > mx) this.autoYaw = a0 + Math.sign(dy) * mx;
     }
+    this.autoYaw = wrapAngle(this.autoYaw);
+    this.yaw = this.autoYaw + this.userYaw;
 
     const ce = Math.cos(elev), se = Math.sin(elev);
     const dir = _c.set(Math.sin(this.yaw) * ce, se, Math.cos(this.yaw) * ce);
@@ -361,17 +407,21 @@ export class CameraRig {
     inf.clear = clear; inf.floor = fl; inf.yT = yT; inf.elev = elev; inf.bowl = !!bowl;
     inf.bw = this.wBowl; inf.carve = this.carveW; inf.drop = drop; inf.base = base; inf.goal = yawGoal;
 
-    // keep a margin from walls beside the camera
+    // keep a margin from walls beside the camera and stay above the local ground (both eased: no snaps)
     const rx = Math.cos(this.yaw), rz = -Math.sin(this.yaw);
+    const push = _f.set(0, 0, 0);
     for (const sg of [1, -1]) {
       _d.set(rx * sg, 0, rz * sg);
       const h = this.ray(this.pos, _d, 1.3);
-      if (h && Math.abs(h.normal.y) < 0.5) this.pos.addScaledVector(_d, h.distance - 1.3);
+      if (h && Math.abs(h.normal.y) < 0.5) push.addScaledVector(_d, h.distance - 1.3);
     }
-    // never below the local ground
+    if (snap) this.wallPush.copy(push); else this.wallPush.lerp(push, 1 - Math.exp(-12 * dt));
+    this.pos.add(this.wallPush);
     _a.set(this.pos.x, Math.max(this.pos.y, L.y) + 0.5, this.pos.z);
     const g = this.ray(_a, DOWN, _a.y - this.pos.y + 3);
-    if (g && this.pos.y < g.point.y + 0.3) this.pos.y = g.point.y + 0.3;
+    const lift = g ? Math.max(0, g.point.y + 0.3 - this.pos.y) : 0;
+    this.groundLift = snap ? lift : Math.max(damp(this.groundLift, lift, 12, dt), lift - 0.2);
+    this.pos.y += this.groundLift;
     if (this.shake > 0) {
       this.shake = Math.max(0, this.shake - dt * 2.2);
       const k = this.shake * this.shake * 0.06;
@@ -382,25 +432,28 @@ export class CameraRig {
     if (!orbit) {
       // composition: skater centre just below the middle of the frame
       cam.rotateX(Math.atan((portrait ? 0.11 : 0.15) * tH));
-      this.frameGuard(s, focus, tH, down);
-    }
+      this.frameGuard(s, focus, tH, down, dt, snap);
+    } else this.guardS.set(0);
   }
 
-  /** keep the board (with a little ground under it) and the head inside the frame */
-  private frameGuard(s: CamSubject, focus: Vector3, tH: number, down: boolean) {
+  /** keep the board (with a little ground under it) and the head inside the frame: an eased extra pitch */
+  private frameGuard(s: CamSubject, focus: Vector3, tH: number, down: boolean, dt = 0, snap = true) {
     const cam = this.cam;
     cam.updateMatrixWorld();
     const inv = cam.matrixWorldInverse.copy(cam.matrixWorld).invert();
     const lo = Math.atan(0.8 * tH), hi = Math.atan(0.9 * tH);
+    let want = 0;
     const vb = _a.copy(s.pos).applyMatrix4(inv);
-    if (vb.z > -0.3) return;
-    const ab = Math.atan2(vb.y, -vb.z);
-    if (ab < -lo) { cam.rotateX(ab + lo); return; }
-    if (down) return;
-    const vh = _b.copy(focus).addScaledVector(s.up, 0.95).applyMatrix4(inv);
-    if (vh.z > -0.3) return;
-    const ah = Math.atan2(vh.y, -vh.z);
-    if (ah > hi) cam.rotateX(Math.min(ah - hi, ab + lo));
+    if (vb.z <= -0.3) {
+      const ab = Math.atan2(vb.y, -vb.z);
+      if (ab < -lo) want = ab + lo;
+      else if (!down) {
+        const vh = _b.copy(focus).addScaledVector(s.up, 0.95).applyMatrix4(inv);
+        if (vh.z <= -0.3) { const ah = Math.atan2(vh.y, -vh.z); if (ah > hi) want = Math.min(ah - hi, ab + lo); }
+      }
+    }
+    if (snap) this.guardS.set(want); else this.guardS.update(want, dt);
+    if (Math.abs(this.guardS.x) > 1e-6) cam.rotateX(this.guardS.x);
   }
 
   /** first hit along a ray, passing through invisible barriers */

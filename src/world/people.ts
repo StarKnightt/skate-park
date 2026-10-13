@@ -1,11 +1,11 @@
 import {
-  AnimationAction, AnimationClip, AnimationMixer, Box3, BoxGeometry, BufferAttribute, BufferGeometry, CanvasTexture, Color, CylinderGeometry, Group, LOD,
+  AnimationAction, AnimationClip, AnimationMixer, Box3, BoxGeometry, BufferAttribute, BufferGeometry, CanvasTexture, Color, Group, LOD,
   Mesh, MeshLambertMaterial, Object3D, SkinnedMesh, Sphere, SRGBColorSpace, Texture, Vector3,
 } from 'three';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as skeletonClone } from 'three/examples/jsm/utils/SkeletonUtils.js';
-import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { toonMaterial } from '../render/materials';
+import { boardProp } from '../player/board';
 
 /** Part colours of our skater pipeline (tools/character parts, sRGB) used to recognise each part in people.glb. */
 const PARTS: Record<string, string> = {
@@ -58,27 +58,6 @@ export const PEOPLE_SPOTS: Spot[] = [
 ];
 
 const lin = (h: string) => new Color(h);
-
-function boardProp(): BufferGeometry {
-  const parts: BufferGeometry[] = [];
-  const paint = (g: BufferGeometry, hexc: string) => {
-    const gg = g.index ? g.toNonIndexed() : g;
-    if (gg.getAttribute('uv')) gg.deleteAttribute('uv');
-    const c = lin(hexc), n = gg.getAttribute('position').count, a = new Float32Array(n * 3);
-    for (let i = 0; i < n; i++) { a[i * 3] = c.r; a[i * 3 + 1] = c.g; a[i * 3 + 2] = c.b; }
-    gg.setAttribute('color', new BufferAttribute(a, 3));
-    parts.push(gg);
-  };
-  // deck along +Z, wheels on the ground (y = 0)
-  paint(new BoxGeometry(0.205, 0.014, 0.62).translate(0, 0.098, 0), '#2b2b2b');
-  for (const s of [-1, 1]) {
-    paint(new CylinderGeometry(0.1025, 0.1025, 0.014, 14, 1, false, 0, Math.PI).rotateY(s > 0 ? 0 : Math.PI).translate(0, 0.098, s * 0.31), '#2b2b2b');
-    paint(new BoxGeometry(0.16, 0.035, 0.05).translate(0, 0.072, s * 0.21), '#b8bec6');
-    for (const x of [-0.085, 0.085]) paint(new CylinderGeometry(0.027, 0.027, 0.032, 10).rotateZ(Math.PI / 2).translate(x, 0.027, s * 0.21), '#f1e7cf');
-  }
-  paint(new BoxGeometry(0.19, 0.004, 0.6).translate(0, 0.091, 0), '#d9573f');
-  return mergeGeometries(parts);
-}
 
 /**
  * Distance levels of a person: switch distance (m), share of body triangles kept, max relative error, share of face
@@ -398,8 +377,6 @@ export class People {
     const clips = new Map<string, AnimationClip>();
     for (const c of gltf.animations) clips.set(c.name, c);
     const fallback = clips.get('stand_idle') ?? gltf.animations[0];
-    const boardGeo = boardProp();
-    const boardMat = toonMaterial({ vertexColors: true, spec: 0.3, bands: 0.4, rim: 0.3, name: 'boardProp' });
     PEOPLE_SPOTS.forEach((spot, i) => {
       const model = skeletonClone(gltf.scene);
       const look = this.look(i + 3, spot.look);
@@ -448,8 +425,7 @@ export class People {
       }
       this.group.add(holder);
       if (spot.board) {
-        const bm = new Mesh(boardGeo, boardMat);
-        bm.castShadow = true; bm.receiveShadow = true;
+        const bm = boardProp();
         bm.position.set(...spot.board.at);
         bm.rotation.y = spot.board.yaw;
         if (spot.board.kind === 'lean') { bm.rotation.order = 'YXZ'; bm.rotation.x = -1.32; bm.position.y += 0.31; }
