@@ -28,6 +28,16 @@ const context = await browser.newContext({
   ...(mobile ? { isMobile: true, hasTouch: true, userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1' } : {}),
 });
 const page = await context.newPage();
+if (flag('nohmr')) {
+  // inert Vite HMR socket: another agent's save can't reload the page mid-capture
+  await page.addInitScript(() => {
+    const Real = window.WebSocket;
+    window.WebSocket = function (url, protocols) {
+      if (String(protocols).includes('vite-hmr')) return { readyState: 0, send() {}, close() {}, addEventListener() {}, removeEventListener() {} };
+      return new Real(url, protocols);
+    };
+  });
+}
 const logs = [];
 page.on('console', (m) => { if (['error', 'warning'].includes(m.type())) logs.push(`[${m.type()}] ${m.text()}`); });
 page.on('pageerror', (e) => logs.push('[pageerror] ' + e.message));
@@ -65,7 +75,9 @@ try {
 } catch (e) {
   logs.push('[harness] ' + (e?.stack ?? e));
 }
-fs.writeFileSync(path.join(out, 'console.log'), logs.join('\n'));
+const logPath = opt('log', path.join(out, 'console.log'));
+fs.mkdirSync(path.dirname(logPath), { recursive: true });
+fs.writeFileSync(logPath, logs.join('\n'));
 console.log('console messages:', logs.length);
 for (const l of logs.slice(0, 30)) console.log(l);
 await browser.close();
