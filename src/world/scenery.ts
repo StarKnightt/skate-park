@@ -69,6 +69,17 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
       col[i * 3] = c.r * j; col[i * 3 + 1] = c.g * j; col[i * 3 + 2] = c.b * j;
     }
     g.setAttribute('color', new BufferAttribute(col, 3));
+    // no terrain under the park pad (it would show through the bowl openings)
+    const idx = g.index!.array;
+    const keep: number[] = [];
+    for (let t = 0; t < idx.length; t += 3) {
+      let cx = 0, cz = 0;
+      for (let k = 0; k < 3; k++) { cx += p.getX(idx[t + k]); cz += p.getZ(idx[t + k]); }
+      cx /= 3; cz /= 3;
+      if (Math.abs(cx) < 36.5 && cz > -21.5 && cz < 24) continue;
+      keep.push(idx[t], idx[t + 1], idx[t + 2]);
+    }
+    g.setIndex(keep);
     g.computeVertexNormals();
     const m = new Mesh(g, toonMaterial({ vertexColors: true, detail: 'sand', bands: 0.2, wrap: 0.45, rim: 0.2, name: 'sand' }));
     m.receiveShadow = true;

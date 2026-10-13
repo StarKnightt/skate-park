@@ -1,4 +1,4 @@
-import { BufferGeometry, DoubleSide, Ray, Triangle, Vector3 } from 'three';
+import { BufferGeometry, DoubleSide, FrontSide, Ray, Triangle, Vector3 } from 'three';
 import { MeshBVH } from 'three-mesh-bvh';
 import type { GrindLine } from './park';
 
@@ -18,7 +18,7 @@ export class CollisionWorld {
   private ray = new Ray();
 
   constructor(public geometry: BufferGeometry, public surfaces: number[], public grindLines: GrindLine[]) {
-    this.bvh = new MeshBVH(geometry, { maxLeafSize: 8 });
+    this.bvh = new MeshBVH(geometry, { targetLeafSize: 8 } as any);
     this.pos = geometry.getAttribute('position').array as Float32Array;
     this.nor = geometry.getAttribute('normal').array as Float32Array;
     this.idx = geometry.index!.array;
@@ -37,18 +37,13 @@ export class CollisionWorld {
     return out.normalize();
   }
 
-  raycast(origin: Vector3, dir: Vector3, maxDist: number): Hit | null {
+  /** front-face raycast (every collision triangle faces the open side) */
+  raycast(origin: Vector3, dir: Vector3, maxDist: number, both = false): Hit | null {
     this.ray.origin.copy(origin);
     this.ray.direction.copy(dir);
-    const h = this.bvh.raycastFirst(this.ray, DoubleSide, 0, maxDist);
+    const h = this.bvh.raycastFirst(this.ray, both ? DoubleSide : FrontSide, 0, maxDist);
     if (!h || h.distance > maxDist || h.faceIndex === undefined || h.faceIndex === null) return null;
     const n = this.smoothNormal(h.faceIndex, h.point, new Vector3());
-    // face the normal against the ray (double sided geometry)
-    if (n.dot(dir) > 0) {
-      const fn = new Vector3();
-      _tri.getNormal(fn);
-      if (fn.dot(dir) > 0) n.negate();
-    }
     return { point: h.point.clone(), normal: n, distance: h.distance, surface: this.surfaces[this.idx[h.faceIndex * 3]] ?? 0, faceIndex: h.faceIndex };
   }
 

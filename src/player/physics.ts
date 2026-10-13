@@ -149,6 +149,10 @@ export class SkatePhysics {
       this.toAir(false); return;
     }
     const dh = _v.subVectors(hit.point, this.pos).dot(this.up);
+    if (dh < -0.06 && ang < 0.12) {
+      // the ground dropped away with no change in slope (stairs, ledge edge, drop-off): fly
+      this.toAir(false); return;
+    }
     if (dh > 0.07 && !this.manual.active) {
       // rolled into a curb / step
       this.onCurb(dh); if (this.mode !== 'ride') return;
@@ -372,11 +376,19 @@ export class SkatePhysics {
     // landing prediction + assist: rotate the board towards the predicted landing normal
     if (Math.floor(this.airTime * 120) % 3 === 0 || !this.predicted) this.predictLanding();
     const bUp = _v.set(0, 1, 0).applyQuaternion(this.boardQ);
-    if (this.predicted) {
+    if (this.predicted && this.vert) {
+      // keyframed vert orientation, blended onto the re-entry surface over the last 0.4 s
+      const k = clamp(1 - this.predicted.tti / 0.4, 0, 1);
+      const err = bUp.angleTo(this.predicted.normal);
+      if (k > 0 && err > 1e-3 && err < 2.0) {
+        _q.setFromUnitVectors(bUp, _v2.copy(bUp).lerp(this.predicted.normal, k).normalize());
+        this.boardQ.premultiply(_q);
+      }
+    } else if (this.predicted) {
       const target = this.predicted.normal;
       const err = bUp.angleTo(target);
       if (err > 1e-3 && err < 2.0) {
-        const rate = this.vert ? (this.predicted.tti < 0.35 ? err / Math.max(0.05, this.predicted.tti) : 0) : err / Math.max(0.12, this.predicted.tti) * 0.9;
+        const rate = err / Math.max(0.12, this.predicted.tti) * 0.9;
         const a = Math.min(err, rate * dt);
         _q.setFromUnitVectors(bUp, _v2.copy(bUp).lerp(target, a / err).normalize());
         this.boardQ.premultiply(_q);
@@ -476,7 +488,8 @@ export class SkatePhysics {
     this.landImpulse = clamp(impact / 6, 0.25, 1.2);
     if (quality === 'wobble') this.wobble = 0.9;
     this.flip = null;
-    this.emit('land', { quality, impact, airTime, spin, popped: this.popped, flip: f, fakie: this.fakie, vert: wasVert, surface: hit.surface });
+    this.emit('land', { quality, impact, airTime, spin, popped: this.popped, flip: f, fakie: this.fakie, vert: wasVert, surface: hit.surface,
+      upErr: Math.round(upErr * deg), yawErr: Math.round(yawErr * deg) });
     // landing straight into a manual
     this.surface = hit.surface;
   }
@@ -630,8 +643,12 @@ export class SkatePhysics {
     this.mode = 'air';
     this.popped = popped;
     this.airTime = 0; this.airYaw = 0; this.spinVel = 0;
-    // board back to an upright orientation, keep heading
+    // board back to an upright orientation; slides turn out to ride away forward (or fakie)
     const fwdH = _v.copy(this.fwd).setY(0);
+    if (g.style === 'boardslide') {
+      const t = new Vector3().copy(this.vel).setY(0);
+      if (t.lengthSq() > 1e-4) { t.normalize(); fwdH.copy(t).multiplyScalar(fwdH.dot(t) >= 0 ? 1 : -1); if (fwdH.lengthSq() < 1e-4) fwdH.copy(t); }
+    }
     if (fwdH.lengthSq() < 1e-4) fwdH.set(0, 0, 1);
     this.boardQ.copy(this.basisQuat(fwdH.normalize(), Y));
     this.fwd.copy(fwdH); this.up.copy(Y);

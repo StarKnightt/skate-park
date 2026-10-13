@@ -17,6 +17,7 @@ export class CameraRig {
   private pos = new Vector3();
   override: null | { pos: Vector3; look: Vector3 } = null;
   orbitMode: null | { t: number; speed: number; dist: number; height: number } = null;
+  distOverride: number | null = null;
 
   constructor(public cam: PerspectiveCamera, private world: CollisionWorld) {}
 
@@ -56,7 +57,7 @@ export class CameraRig {
     this.yaw = dampAngle(this.yaw, baseYaw + this.userYaw, 6, dt);
     const tgtPitch = 0.2 + this.userPitch + (mode === 'air' ? 0.06 : 0) + clamp(steepness * 0.25, 0, 0.25);
     this.pitch += (tgtPitch - this.pitch) * (1 - Math.exp(-4 * dt));
-    const wantDist = (this.orbitMode ? this.orbitMode.dist : 3.5 + clamp(speed / 9, 0, 1) * 1.3) + (mode === 'air' ? 0.4 : 0);
+    const wantDist = this.distOverride ?? ((this.orbitMode ? this.orbitMode.dist : 3.5 + clamp(speed / 9, 0, 1) * 1.3) + (mode === 'air' ? 0.4 : 0));
     this.dist += (wantDist - this.dist) * (1 - Math.exp(-2.5 * dt));
     // smoothed focus (lag a little behind the skater for weight)
     const f = this.tmp.copy(focus);

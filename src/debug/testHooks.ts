@@ -62,7 +62,9 @@ export function installTestHooks(g: Game) {
     },
     free() { g.rig.override = null; g.rig.orbitMode = null; },
     orbit(speed = 0.6, dist = 3.2, height = 0.2) { g.rig.orbitMode = { t: 0, speed, dist, height }; },
-    camYaw(rad: number, pitch = 0) { g.rig.userYaw = rad; g.rig.userPitch = pitch; },
+    camYaw(rad: number, pitch = 0) { g.rig.userYaw = rad; g.rig.userPitch = pitch; g.rig.idleT = -1e9; },
+    camDist(d: number | null) { g.rig.distOverride = d; },
+    snapCam() { g.rig.snap(g.physics.pos, Math.atan2(g.physics.vel.x || g.physics.fwd.x, g.physics.vel.z || g.physics.fwd.z)); },
     hud(on: boolean) { (document.querySelector('.hud') as HTMLElement).style.display = on ? '' : 'none'; },
     touch(on: boolean) { g.touch.show(on); },
     state() {
@@ -74,6 +76,7 @@ export function installTestHooks(g: Game) {
         t: +g.simTime.toFixed(3), time: PRESETS[g.tod.index].name, quality: g.quality,
       };
     },
+    events() { const e = g.eventLog.slice(); g.eventLog.length = 0; return e; },
     feetError() {
       // distance from each sole to the deck top (for glued-feet checks)
       const sk = g.skater;

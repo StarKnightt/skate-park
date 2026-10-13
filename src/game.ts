@@ -1,6 +1,6 @@
 import {
   Clock, Color, Fog, Group, HemisphereLight, Mesh, PCFShadowMap, PerspectiveCamera, PlaneGeometry, Quaternion, Scene,
-  SRGBColorSpace, Texture, TextureLoader, Vector3, WebGLRenderer, NoToneMapping, MathUtils,
+  SRGBColorSpace, Texture, TextureLoader, Vector3, WebGLRenderer, NoToneMapping, MathUtils, DoubleSide,
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
@@ -102,11 +102,12 @@ export class Game {
     const b = park.builder;
     this.world = new CollisionWorld(b.collisionGeometry(), b.cSurf, park.grindLines);
     const mats = {
-      concrete: toonMaterial({ vertexColors: true, color: 0xeee5d9, detail: 'concrete', bands: 0.22, wrap: 0.4, rim: 0.12, name: 'concrete' }),
-      wall: toonMaterial({ vertexColors: true, color: 0xe9ddce, detail: 'wall', bands: 0.25, wrap: 0.4, rim: 0.12, name: 'wall' }),
-      paint: toonMaterial({ vertexColors: true, detail: 'paint', bands: 0.3, wrap: 0.4, rim: 0.2, name: 'paint' }),
-      wood: toonMaterial({ color: 0xffffff, detail: 'wood', bands: 0.2, wrap: 0.4, rim: 0.1, name: 'wood' }),
+      concrete: toonMaterial({ vertexColors: true, color: 0xf2e6d6, detail: 'concrete', bands: 0.12, wrap: 0.75, rim: 0.12, name: 'concrete' }),
+      wall: toonMaterial({ vertexColors: true, color: 0xeddccb, detail: 'wall', bands: 0.2, wrap: 0.5, rim: 0.12, name: 'wall' }),
+      paint: toonMaterial({ vertexColors: true, detail: 'paint', bands: 0.3, wrap: 0.5, rim: 0.2, name: 'paint' }),
+      wood: toonMaterial({ color: 0xffffff, detail: 'wood', bands: 0.15, wrap: 0.75, rim: 0.1, name: 'wood' }),
     };
+    for (const m of Object.values(mats)) m.shadowSide = DoubleSide;
     const parkGroup = new Group();
     for (const [k, m] of Object.entries(mats)) { const mesh = meshFromBuilder(b, k, m); if (mesh) parkGroup.add(mesh); }
     const metal = new Mesh(mergeTubes(park.tubes), toonMaterial({ color: 0xc3c8d0, spec: 1.1, shininess: 55, bands: 0.55, rim: 0.7, name: 'metal' }));
@@ -267,10 +268,16 @@ export class Game {
     }
   }
 
+  eventLog: { t: number; type: string; [k: string]: any }[] = [];
   private processEvents() {
     const ph = this.physics;
     for (const e of ph.events) {
       this.tricks.event(e);
+      if (DEBUG) {
+        const { flip, ...rest } = e as any;
+        this.eventLog.push({ t: +this.simTime.toFixed(2), ...rest, ...(flip ? { flip: flip.name ?? flip.kind ?? flip } : {}) });
+        if (this.eventLog.length > 400) this.eventLog.shift();
+      }
       switch (e.type) {
         case 'pop': this.audio.pop(e.charge ?? 0.5); break;
         case 'land':
@@ -332,7 +339,6 @@ export class Game {
     this.sky.mesh.position.copy(this.camera.position);
     this.clouds.group.position.copy(this.camera.position);
     this.ocean.mesh.position.x = Math.round(this.camera.position.x / 50) * 50;
-    this.ocean.mesh.position.z = Math.round(this.camera.position.z / 50) * 50;
     this.post.grade.uniforms.get('uTime')!.value = this.simTime;
   }
 

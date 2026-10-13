@@ -230,7 +230,7 @@ export function buildPark(): ParkData {
     tubes.push(edgeIron(V(x0, h, z0), V(x1, h, z0)), edgeIron(V(x0, h, z1), V(x1, h, z1)));
   };
   ledge('long ledge', -10, 0, -12.6, -12.0, 0.45, [0.98, 0.74, 0.22]);
-  ledge('red curb', 3, 12, 6.0, 6.5, 0.38, [0.86, 0.32, 0.27]);
+  ledge('red curb', 18, 27, 8.0, 8.5, 0.38, [0.86, 0.32, 0.27]);
   ledge('manual pad', -9, -5, 5.0, 6.6, 0.16, [0.25, 0.55, 0.78]);
   {
     const rail = [V(4, 0.36, -12.3), V(10, 0.36, -12.3)];
@@ -283,8 +283,8 @@ export function buildPark(): ParkData {
     builder: b, grindLines: grind, lamps, murals, tubes,
     spawn: { pos: V(9, 0, 3), heading: Math.PI },
     landmarks: {
-      bowl: { pos: V(-24, 2.6, 13), look: V(-24, -1.2, 0) },
-      pocket: { pos: V(-14, 2.4, 22), look: V(-24, -0.5, 15) },
+      bowl: { pos: V(-15.5, 1.7, 7.5), look: V(-27, -1.6, -2) },
+      pocket: { pos: V(-17, 1.6, 20.5), look: V(-27, -1.0, 13) },
       halfpipe: { pos: V(24, 4.5, 6), look: V(24, 1.2, -9) },
       stairs: { pos: V(12, 2.2, 6), look: V(7, 0.6, 13) },
       funbox: { pos: V(7, 2.2, 6), look: V(0, 0.3, -1.5) },

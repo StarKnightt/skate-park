@@ -209,8 +209,10 @@ export class Ocean {
           #include <colorspace_fragment>
         }`,
     });
-    const g = new PlaneGeometry(5000, 5000, 120, 120);
+    // the ocean starts north of the beach (never under the park: the bowls are deeper than sea level)
+    const g = new PlaneGeometry(6000, 3200, 140, 90);
     g.rotateX(-Math.PI / 2);
+    g.translate(0, 0, -50 - 1600);
     this.mesh = new Mesh(g, this.mat);
     this.mesh.position.y = level;
     this.mesh.receiveShadow = false;

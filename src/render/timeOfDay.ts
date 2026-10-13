@@ -28,8 +28,8 @@ export const PRESETS: EnvState[] = [
   {
     name: 'Golden hour',
     sunDir: dir(34, 9), lightDir: dir(34, 11),
-    lightColor: C('#ffc690'), lightIntensity: 2.7,
-    hemiSky: C('#b4bdf5'), hemiGround: C('#f0b08c'), hemiIntensity: 1.25,
+    lightColor: C('#ffc48a'), lightIntensity: 3.2,
+    hemiSky: C('#a9b0ee'), hemiGround: C('#f2b48e'), hemiIntensity: 1.02,
     zenith: C('#7f94d4'), mid: C('#eca9b3'), horizon: C('#ffbf82'),
     glow: C('#ffd08e'), glowStrength: 1.0,
     cloudLit: C('#ffe0b8'), cloudShade: C('#c49cc0'),

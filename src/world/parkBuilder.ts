@@ -173,7 +173,7 @@ export function transitionProfile(H: number, R: number, segs = 22) {
   for (let i = 0; i < nv; i++) pts.push({ d: 0, y: -vert * (i / nv), beta: Math.PI / 2 });
   for (let i = 0; i <= segs; i++) {
     const b = (Math.PI / 2) * (1 - i / segs);
-    pts.push({ d: R - R * Math.sin(b), y: -vert - (R - R * Math.cos(b)), beta: b });
+    pts.push({ d: R - R * Math.sin(b), y: -vert - R * Math.cos(b), beta: b });
   }
   return { pts, W: R, topAngle: Math.PI / 2 };
 }

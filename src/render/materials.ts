@@ -170,6 +170,21 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
             // skate marks (wheel scuffs)
             float sc = vnoise(vWorldPos.xz * vec2(0.6, 7.0) + vnoise(vWorldPos.xz * 0.3) * 5.0);
             diffuseColor.rgb *= 1.0 - smoothstep(0.82, 0.95, sc) * 0.07;
+          }
+          // sunken bowls: cooler deep end (fake occlusion) + a band of pool tiles under the coping
+          if (vWorldPos.y < -0.015) {
+            float depth = clamp(-vWorldPos.y / 2.3, 0.0, 1.0);
+            diffuseColor.rgb *= mix(vec3(1.0), vec3(0.80, 0.82, 0.92), smoothstep(0.1, 1.0, depth) * 0.75);
+            if (vWorldPos.y > -0.19 && abs(vWorldNrm.y) < 0.6) {
+              vec2 tc = vec2((vWorldPos.x + vWorldPos.z) * 9.0, vWorldPos.y * 9.0);
+              vec2 cell = floor(tc);
+              vec2 fp = fract(tc);
+              float grout = step(min(fp.x, fp.y), 0.08);
+              float hv = h12(cell);
+              vec3 tile = mix(vec3(0.16, 0.50, 0.66), vec3(0.24, 0.62, 0.72), hv);
+              if (cell.y > -1.5) tile = mix(vec3(0.93, 0.93, 0.88), tile, 0.15);
+              diffuseColor.rgb = mix(tile, vec3(0.85, 0.83, 0.8), grout);
+            }
           }` : ''}
         }`;
     } else if (detail === 'paint') {
