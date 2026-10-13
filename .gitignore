@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.agent-notes/
+*.log
+# raw Mixamo / Blender sources must never be committed (only the baked, optimised GLB ships)
+*.fbx
+*.FBX
+*.blend
+*.blend1
+public/textures/src/
+tools/**/__pycache__/
+.vite/
