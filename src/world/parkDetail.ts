@@ -4,7 +4,8 @@ import {
 } from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { toonMaterial } from '../render/materials';
-import type { EdgeStrip, ParkData, PathPt, RGB } from './park';
+import { FoliageBuilder, foliageMaterial, Leaf } from './foliage';
+import type { EdgeStrip, ParkData, PathPt, Plant, RGB } from './park';
 
 const UP = new Vector3(0, 1, 0);
 const smooth = (a: number, b: number, x: number) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
@@ -308,7 +309,18 @@ function tagAtlas() {
   return tex;
 }
 
-// ------------------------------------------------------------------ planter plants
+// ------------------------------------------------------------------ planter plants (grass + agave here; shrubs are leaf-clump cards)
+/** shrubs (kind 0: broad or fine leaves) and flowering shrubs (kind 2: bougainvillea pink or lantana orange) */
+function planterBush(f: FoliageBuilder, p: Plant, rnd: () => number) {
+  const s = p.s;
+  const cells = p.kind === 2 ? [rnd() < 0.7 ? Leaf.Pink : Leaf.Orange] : [rnd() < 0.72 ? Leaf.Broad : Leaf.Fine];
+  const k = 0.94 + rnd() * 0.12;
+  f.bush({
+    x: p.pos.x, y: p.pos.y, z: p.pos.z, rx: (0.36 + 0.12 * rnd()) * s, rz: (0.32 + 0.1 * rnd()) * s, ry: (0.3 + 0.1 * rnd()) * s,
+    cells, tint: [k * (0.97 + rnd() * 0.06), k, k * (0.92 + rnd() * 0.1)], seed: p.pos.x * 13.1 + p.pos.z * 7.3, sink: 0.28,
+  });
+}
+
 function plantGeo(kind: number, s: number, rnd: () => number): BufferGeometry[] {
   const out: BufferGeometry[] = [];
   const colorize = (g: BufferGeometry, top: RGB, bot: RGB, jit = 0.1) => {
@@ -327,31 +339,7 @@ function plantGeo(kind: number, s: number, rnd: () => number): BufferGeometry[] 
     gg.setAttribute('color', new BufferAttribute(col, 3));
     return gg;
   };
-  const blobby = (r: number, cx: number, cy: number, cz: number, top: RGB, bot: RGB, sq = 0.8) => {
-    const g = new IcosahedronGeometry(r, 1);
-    const p = g.getAttribute('position');
-    for (let i = 0; i < p.count; i++) {
-      const k = 1 + (hash1(p.getX(i) * 13.1 + p.getZ(i) * 7.7 + cx * 3.0) - 0.5) * 0.35;
-      p.setXYZ(i, p.getX(i) * k + cx, p.getY(i) * k * sq + cy, p.getZ(i) * k + cz);
-    }
-    return colorize(g, top, bot, 0.14);
-  };
-  const greens: [RGB, RGB][] = [[lin('#7fae55'), lin('#3f6a2c')], [lin('#8fbf5e'), lin('#4c7a33')], [lin('#6e9f4b'), lin('#36592a')]];
-  if (kind === 0 || kind === 2) {
-    const [top, bot] = greens[Math.floor(rnd() * greens.length)];
-    const nb = 2 + Math.floor(rnd() * 2);
-    for (let i = 0; i < nb; i++) {
-      const r = (0.26 + rnd() * 0.14) * s;
-      out.push(blobby(r, (rnd() - 0.5) * 0.4 * s, r * 0.75, (rnd() - 0.5) * 0.3 * s, top, bot));
-    }
-    if (kind === 2) {
-      const fc = [lin('#d6457a'), lin('#e86aa6'), lin('#f08a4b'), lin('#c94fb0')][Math.floor(rnd() * 4)];
-      for (let i = 0; i < 9; i++) {
-        const a = rnd() * Math.PI * 2, rr = (0.15 + rnd() * 0.22) * s;
-        out.push(blobby(0.055 * s, Math.cos(a) * rr, (0.42 + rnd() * 0.22) * s, Math.sin(a) * rr, fc, fc, 1));
-      }
-    }
-  } else if (kind === 1) {
+  if (kind === 1) {
     // ornamental grass: arching blades (double sided)
     const base = lin('#5f7a3a'), tipC = lin('#d9c67e');
     const pos: number[] = [], col: number[] = [];
@@ -466,12 +454,17 @@ export function buildParkDetail(park: ParkData): Group {
   if (d.plants.length) {
     const rnd = mulberry(5);
     const parts: BufferGeometry[] = [];
+    const leaves = new FoliageBuilder();
     for (const p of d.plants) {
       const ry = rnd() * Math.PI * 2;
+      if (p.kind === 0 || p.kind === 2) { planterBush(leaves, p, rnd); continue; }
       for (const geo of plantGeo(p.kind, p.s, rnd)) { geo.rotateY(ry); geo.translate(p.pos.x, p.pos.y, p.pos.z); parts.push(geo); }
     }
-    add(mergeGeometries(parts.map((q) => { for (const k of Object.keys(q.attributes)) if (!['position', 'normal', 'color'].includes(k)) q.deleteAttribute(k); return q.index ? q.toNonIndexed() : q; })),
-      toonMaterial({ vertexColors: true, side: DoubleSide, bands: 0.45, wrap: 0.6, rim: 0.45, name: 'planterPlants' }));
+    if (parts.length) {
+      add(mergeGeometries(parts.map((q) => { for (const k of Object.keys(q.attributes)) if (!['position', 'normal', 'color'].includes(k)) q.deleteAttribute(k); return q.index ? q.toNonIndexed() : q; })),
+        toonMaterial({ vertexColors: true, side: DoubleSide, bands: 0.45, wrap: 0.6, rim: 0.45, name: 'planterPlants' }));
+    }
+    if (!leaves.empty) add(leaves.geometry(), foliageMaterial()).name = 'planterBushes';
   }
   if (d.sails.length) {
     const s = new Soup();

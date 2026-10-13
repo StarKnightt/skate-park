@@ -1,5 +1,5 @@
 import {
-  BufferAttribute, BufferGeometry, CanvasTexture, CylinderGeometry, Group, Matrix4, Mesh, Quaternion, RepeatWrapping,
+  BufferAttribute, BufferGeometry, CanvasTexture, CylinderGeometry, Group, Matrix4, Mesh, Quaternion,
   SRGBColorSpace, Texture, Vector3, BoxGeometry, SphereGeometry,
 } from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
@@ -81,22 +81,54 @@ function deckGeometry() {
   return g;
 }
 
+/**
+ * Grip tape over the whole deck (0.8 mm texels): charcoal grit with glints and worn patches where the feet stand, and the
+ * filed edge all round (pale wood + light grit), so the grip side reads as a board, not a black cut-out, when it faces you.
+ */
 function gripTexture() {
-  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const W = 256, H = 1024;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
   const x = c.getContext('2d')!;
-  x.fillStyle = '#2b2a2e'; x.fillRect(0, 0, 256, 256);
-  for (let i = 0; i < 9000; i++) {
-    const v = 30 + Math.random() * 40;
-    x.fillStyle = `rgb(${v},${v},${v + 4})`;
-    x.fillRect(Math.random() * 256, Math.random() * 256, 1, 1);
+  const img = x.createImageData(W, H);
+  const d = img.data;
+  let s = 20250117;
+  const rnd = () => (s = (Math.imul(s, 1103515245) + 12345) >>> 0) / 4294967296;
+  const G = 8, gw = W / G + 2, gh = H / G + 2;
+  const lat = new Float32Array(gw * gh);
+  for (let i = 0; i < lat.length; i++) lat[i] = rnd();
+  const mottle = (i: number, j: number) => {
+    const fx = i / G, fy = j / G, x0 = Math.floor(fx), y0 = Math.floor(fy), tx = fx - x0, ty = fy - y0;
+    const a = lat[y0 * gw + x0], b = lat[y0 * gw + x0 + 1], c0 = lat[(y0 + 1) * gw + x0], c1 = lat[(y0 + 1) * gw + x0 + 1];
+    return (a + (b - a) * tx) * (1 - ty) + (c0 + (c1 - c0) * tx) * ty;
+  };
+  const wearAt = (z: number, xx: number) => {
+    const spot = (z0: number, sz: number, sx: number) => Math.exp(-(((z - z0) / sz) ** 2) - ((xx / sx) ** 2));
+    return 0.8 * spot(0.17, 0.075, 0.075) + 0.8 * spot(-0.2, 0.07, 0.07) + 0.5 * spot(-0.33, 0.05, 0.06) + 0.35 * spot(0.31, 0.05, 0.06);
+  };
+  for (let j = 0; j < H; j++) {
+    const v = 1 - (j + 0.5) / H; // CanvasTexture.flipY: canvas row 0 is v = 1
+    const z = (v - 0.5) * DECK_L;
+    const hw = halfWidth(z);
+    for (let i = 0; i < W; i++) {
+      const xx = ((i + 0.5) / W - 0.5) * DECK_W;
+      const edge = hw - Math.abs(xx); // metres inside the deck outline
+      let g = 96 + (rnd() - 0.5) * 56 + (mottle(i, j) - 0.5) * 22 + wearAt(z, xx) * 22;
+      if (rnd() < 0.02) g += 55 + rnd() * 50; // grit glints
+      let r = g, gg = g, b = g + 5;
+      if (edge < 0.0035) { r = 232 + rnd() * 14; gg = 204 + rnd() * 12; b = 160 + rnd() * 12; } // rounded wood edge
+      else if (edge < 0.006) { const k = 160 + rnd() * 34; r = k; gg = k; b = k + 4; } // filed grip edge
+      const o = (j * W + i) * 4;
+      d[o] = r; d[o + 1] = gg; d[o + 2] = b; d[o + 3] = 255;
+    }
   }
-  const t = new CanvasTexture(c); t.wrapS = t.wrapT = RepeatWrapping; t.repeat.set(1, 4); t.colorSpace = SRGBColorSpace;
+  x.putImageData(img, 0, 0);
+  const t = new CanvasTexture(c); t.colorSpace = SRGBColorSpace; t.anisotropy = 8;
   return t;
 }
 function plyTexture() {
   const c = document.createElement('canvas'); c.width = 4; c.height = 64;
   const x = c.getContext('2d')!;
-  const cols = ['#e9c38d', '#c4874f', '#f1d6a6', '#3d7f86', '#f1d6a6', '#c4874f', '#e9c38d'];
+  const cols = ['#f3dcb0', '#d7a56f', '#f7e6c4', '#3f8c93', '#f7e6c4', '#d7a56f', '#f3dcb0'];
   cols.forEach((col, i) => { x.fillStyle = col; x.fillRect(0, (i * 64) / cols.length, 4, 64 / cols.length + 1); });
   const t = new CanvasTexture(c); t.colorSpace = SRGBColorSpace;
   return t;
@@ -113,9 +145,9 @@ export class BoardView {
   plainM = new Matrix4();
   constructor(deckTex: Texture) {
     deckTex.colorSpace = SRGBColorSpace;
-    const gripM = toonMaterial({ map: gripTexture(), bands: 0.3, rim: 0.15, name: 'grip' });
+    const gripM = toonMaterial({ map: gripTexture(), bands: 0.15, wrap: 0.5, rim: 0.6, spec: 0.12, shininess: 12, name: 'grip' });
     const bottomM = toonMaterial({ map: deckTex, bands: 0.3, rim: 0.3, name: 'deckBottom' });
-    const plyM = toonMaterial({ map: plyTexture(), bands: 0.2, name: 'ply' });
+    const plyM = toonMaterial({ map: plyTexture(), bands: 0.2, wrap: 0.5, rim: 0.5, name: 'ply' });
     const deckMesh = new Mesh(deckGeometry(), [gripM, bottomM, plyM]);
     deckMesh.castShadow = true;
     this.deckMesh = deckMesh;

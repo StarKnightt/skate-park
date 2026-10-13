@@ -8,8 +8,9 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { toonMaterial } from '../render/materials';
 import { rng } from '../core/util';
-import { BOARDWALK_BENCH_X, BOARDWALK_LAMP_X, EDGE_PALMS } from './park';
+import { BOARDWALK_BENCH_X, BOARDWALK_LAMP_X, EDGE_PALMS, KIOSK } from './park';
 import { People } from './people';
+import { FoliageBuilder, foliageMaterial, Leaf } from './foliage';
 
 const R = rng(1234);
 const V = (x: number, y: number, z: number) => new Vector3(x, y, z);
@@ -254,7 +255,8 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
   group.add(new Mesh(mergeGeometries(headParts), lampHeads));
 
   // ------------------------------------------------------------------ beach + town houses
-  const H = { walls: [] as BufferGeometry[], roofs: [] as BufferGeometry[], trims: [] as BufferGeometry[], wins: [] as BufferGeometry[], fabric: [] as BufferGeometry[], plants: [] as BufferGeometry[], paths: [] as BufferGeometry[] };
+  const leaves = new FoliageBuilder();
+  const H = { walls: [] as BufferGeometry[], roofs: [] as BufferGeometry[], trims: [] as BufferGeometry[], wins: [] as BufferGeometry[], fabric: [] as BufferGeometry[], paths: [] as BufferGeometry[], leaves };
   buildHouses(H);
   const wallMesh = new Mesh(mergeGeometries(H.walls), vc({ detail: 'wall', name: 'houseWalls' }));
   const roofMesh = new Mesh(mergeGeometries(H.roofs), vc({ spec: 0.15, shininess: 18, name: 'roofs' }));
@@ -431,7 +433,7 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
 
   // ------------------------------------------------------------------ town scrub, dune grass, house plants
   {
-    const parts: BufferGeometry[] = [...H.plants];
+    const parts: BufferGeometry[] = [];
     const nearHouse = (x: number, z: number, pad: number) => HOUSES.some((h) => Math.abs(x - h.x) < 4.2 * h.s + pad && Math.abs(z - h.z) < 3.4 * h.s + pad + (h.z > 0 ? 2.2 : 0));
     let placed = 0;
     for (let k = 0; k < 900 && placed < 260; k++) {
@@ -440,7 +442,7 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
       const n = fbm2(x * 0.045, z * 0.045) + 0.35 * vn2(x * 0.13 + 7, z * 0.13);
       if (n < 0.58 && R() > 0.2) continue;
       const y = terrainHeight(x, z);
-      if (R() < 0.45) parts.push(bush(x, y, z, 0.35 + R() * 0.75));
+      if (R() < 0.45) bush(leaves, x, y, z, 0.35 + R() * 0.75);
       else parts.push(tuft(x, y, z, 0.3 + R() * 0.35));
       placed++;
     }
@@ -453,6 +455,10 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
       vc({ side: DoubleSide, bands: 0.45, wrap: 0.6, rim: 0.45, name: 'shrubs' }));
     shrubs.castShadow = true; shrubs.receiveShadow = true;
     group.add(shrubs);
+    const bushes = new Mesh(leaves.geometry(), foliageMaterial());
+    bushes.name = 'townBushes';
+    bushes.castShadow = true; bushes.receiveShadow = true;
+    group.add(bushes);
   }
 
   // ------------------------------------------------------------------ palms
@@ -461,6 +467,10 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
   // ------------------------------------------------------------------ seagulls
   const gulls = buildGulls();
   group.add(gulls.mesh);
+
+  // ------------------------------------------------------------------ the snack kiosk's shop behind its service window
+  const kiosk = buildKioskShop();
+  group.add(kiosk.mesh);
 
   // ------------------------------------------------------------------ people (people.glb from the character pipeline; optional)
   const people = new People(terrainHeight);
@@ -473,6 +483,8 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
       gulls.update(t);
       lamp.rotation.y = t * 1.2;
       people.update(dt);
+      // the shop lights are on all day; at sunset and blue hour they glow like the lit windows
+      kiosk.mat.emissiveIntensity = 0.45 + windows.emissiveIntensity * 1.05;
     },
   };
 }
@@ -522,18 +534,20 @@ function shade(g: BufferGeometry, top: Color, bot: Color, jit = 0.12) {
   g.setAttribute('color', new BufferAttribute(col, 3));
   return g;
 }
-const BUSH_COLS: [string, string][] = [['#8f9e5a', '#55633a'], ['#a3a26a', '#666a3e'], ['#7e9a5a', '#4a5f36'], ['#9aa86e', '#5c6e44']];
-function bush(x: number, y: number, z: number, s: number) {
-  const [t, b] = BUSH_COLS[Math.floor(R() * BUSH_COLS.length)];
-  const parts: BufferGeometry[] = [];
+/** scrub tints on the painted leaves: sage, dry olive, green, grey-green */
+const BUSH_TINTS: [number, number, number][] = [[1.2, 1.06, 1.02], [1.32, 1.12, 0.84], [1.02, 1.04, 0.95], [1.16, 1.1, 1.08]];
+/** the shared RNG advanced exactly as the old blob shrubs did, so every later random placement stays where it was */
+const skipBlob = () => { for (let t = 0; t < 80; t++) R(); };
+/** low scrub: one to three overlapping mounds of fine-leaved (olive, sage) clumps */
+function bush(f: FoliageBuilder, x: number, y: number, z: number, s: number) {
+  const tint = BUSH_TINTS[Math.floor(R() * BUSH_TINTS.length)];
   const nb = 1 + Math.floor(R() * 3);
   for (let k = 0; k < nb; k++) {
     const r = s * (0.55 + R() * 0.45);
-    const g = blobGeo(r, 0.62, x + z + k);
-    g.translate(x + (R() - 0.5) * s, y + r * 0.45, z + (R() - 0.5) * s);
-    parts.push(shade(g, new Color(t), new Color(b)));
+    const ox = (R() - 0.5) * s, oz = (R() - 0.5) * s;
+    skipBlob();
+    f.bush({ x: x + ox, y, z: z + oz, rx: r, rz: r * 0.92, ry: r * 0.62, cells: h2(x + k, z) < 0.75 ? [Leaf.Fine] : [Leaf.Broad], tint, seed: x * 3.1 + z * 1.7 + k, sink: 0.27 });
   }
-  return mergeGeometries(parts);
 }
 /** spiky grass clump (both windings so it reads from any side) */
 function tuft(x: number, y: number, z: number, s: number, dune = false) {
@@ -557,7 +571,7 @@ function tuft(x: number, y: number, z: number, s: number, dune = false) {
 }
 
 // ------------------------------------------------------------------ houses: roofs that sit on the walls, porches, steps, railings, framed windows
-function buildHouses(out: { walls: BufferGeometry[]; roofs: BufferGeometry[]; trims: BufferGeometry[]; wins: BufferGeometry[]; fabric: BufferGeometry[]; plants: BufferGeometry[]; paths: BufferGeometry[] }) {
+function buildHouses(out: { walls: BufferGeometry[]; roofs: BufferGeometry[]; trims: BufferGeometry[]; wins: BufferGeometry[]; fabric: BufferGeometry[]; paths: BufferGeometry[]; leaves: FoliageBuilder }) {
   const wallCols = ['#9fd8c6', '#f4a68c', '#f7d98b', '#a8c8f0', '#d5b8e8', '#f2c0c8', '#bfe3a6', '#f3e1b9', '#9cc9d9'];
   const roofCols = ['#c4664e', '#5f7fa8', '#d98b55', '#7a6aa8', '#bf5a5a', '#4f8a8a', '#c9873f', '#8a5a44'];
   const doorCols = ['#2f6f7a', '#e05a47', '#3a5f9e', '#f2b134', '#6a4c93', '#2a9d8f'];
@@ -610,9 +624,9 @@ function buildHouses(out: { walls: BufferGeometry[]; roofs: BufferGeometry[]; tr
     };
     const pot = (lx: number, ly: number, lz: number) => {
       put(out.trims, at(new CylinderGeometry(0.2, 0.15, 0.34, 10), lx, ly + 0.17, lz), potC);
-      const b = blobGeo(0.3, 0.8, i * 13 + lx);
-      b.translate(lx, ly + 0.5, lz);
-      out.plants.push(shade(b, new Color('#86b257'), new Color('#3e6a2c')).applyMatrix4(T));
+      skipBlob();
+      const wp = V(lx, ly, lz).applyMatrix4(T);
+      out.leaves.bush({ x: wp.x, y: wp.y + 0.3, z: wp.z, rx: 0.3, ry: 0.27, cells: [i % 3 ? Leaf.Broad : Leaf.Pink], seed: wp.x + wp.z * 3.7, sink: 0.25 });
     };
     const board = (lx: number, ly: number, lz: number, tilt: number, yaw: number, c: string) => {
       const sb = new SphereGeometry(1, 12, 6); sb.scale(0.27, 1.05, 0.05); sb.rotateX(tilt); sb.rotateY(yaw); sb.translate(lx, ly, lz);
@@ -715,7 +729,7 @@ function buildHouses(out: { walls: BufferGeometry[]; roofs: BufferGeometry[]; tr
       const s0 = V(0, 0, -d / 2 - pd - nS * 0.3).applyMatrix4(T), s1 = V(0, 0, fz - 0.4).applyMatrix4(T);
       out.paths.push(ribbon([[s0.x, s0.z], [s1.x, s1.z], [s1.x, 34.2]], 1.2, new Color('#e9d6ae')));
       // a couple of shrubs by the porch, a step at the back door
-      for (const sx of [-w / 2 - 0.4, w / 2 + 0.5]) { const b = bush(sx, g0, -d / 2 - 0.6, 0.55); out.plants.push(b.applyMatrix4(T)); }
+      for (const sx of [-w / 2 - 0.4, w / 2 + 0.5]) { const wp = V(sx, 0, -d / 2 - 0.6).applyMatrix4(T); bush(out.leaves, wp.x, g0, wp.z, 0.55); }
       put(out.trims, bmm(w * 0.3 - 0.6, g0 - 0.1, d / 2, w * 0.3 + 0.6, (g0 + y0) / 2, d / 2 + 0.42), '#e9e1d2');
     } else {
       // ---- beach house: sea-side deck with railing and stairs to the sand; back landing + stairs towards the boardwalk; awning; boards
@@ -984,6 +998,195 @@ function buildFootprints() {
   const mesh = new Mesh(g, m);
   mesh.receiveShadow = true;
   return mesh;
+}
+
+// ------------------------------------------------------------------ snack kiosk shop: shelves of goods, a picture menu, a lit drinks fridge
+/**
+ * Atlas (1024 x 1024, canvas y down): goods shelves (0..256), picture menu board (256..384), fridge glass (x 0..384,
+ * y 384..1024); the rest is white for the vertex-coloured parts. Colour blocks and simple shapes only, never letters.
+ */
+function kioskAtlas() {
+  const S = 1024, c = document.createElement('canvas'); c.width = c.height = S;
+  const x = c.getContext('2d')!;
+  const rnd = rng(2203);
+  const pal = ['#e8463a', '#f4a261', '#ffd23f', '#2a9d8f', '#3a86ff', '#ff70a6', '#8ac926', '#6a4c93', '#f08a4b', '#1f6f8b', '#fbf8f2', '#d6457a'];
+  const pick = () => pal[Math.floor(rnd() * pal.length)];
+  const rr = (x0: number, y0: number, w: number, h: number, r: number) => { x.beginPath(); x.roundRect(x0, y0, w, h, r); };
+  x.fillStyle = '#ffffff'; x.fillRect(0, 0, S, S);
+  // ---- shelves of goods (three boards; the board lines match the shelf geometry)
+  const sg = x.createLinearGradient(0, 0, 0, 256);
+  sg.addColorStop(0, '#f6ead2'); sg.addColorStop(1, '#e6d5b8');
+  x.fillStyle = sg; x.fillRect(0, 0, S, 256);
+  for (const top of [6, 92, 178]) {
+    let px = 6;
+    while (px < S - 30) {
+      const kind = rnd(), w = kind < 0.35 ? 16 + rnd() * 10 : 26 + rnd() * 26, hgt = kind < 0.35 ? 46 + rnd() * 22 : 34 + rnd() * 34;
+      const y1 = top + 76, y0 = y1 - hgt, col = pick();
+      x.fillStyle = 'rgba(70,50,30,0.25)'; x.fillRect(px + 3, y0 + 4, w, hgt - 4);
+      if (kind < 0.35) {
+        // bottle: body, shoulder, cap, label band
+        x.fillStyle = col; rr(px, y0 + hgt * 0.3, w, hgt * 0.7, 4); x.fill();
+        x.beginPath(); x.moveTo(px + 2, y0 + hgt * 0.32); x.lineTo(px + w * 0.35, y0 + hgt * 0.1); x.lineTo(px + w * 0.65, y0 + hgt * 0.1); x.lineTo(px + w - 2, y0 + hgt * 0.32); x.fill();
+        x.fillStyle = '#f4efe6'; x.fillRect(px + w * 0.3, y0, w * 0.4, hgt * 0.12);
+        x.fillStyle = 'rgba(255,255,255,0.75)'; x.fillRect(px, y0 + hgt * 0.55, w, hgt * 0.18);
+        x.fillStyle = 'rgba(255,255,255,0.35)'; x.fillRect(px + 3, y0 + hgt * 0.34, 3, hgt * 0.6);
+      } else if (kind < 0.7) {
+        // snack bag: pillowy pack with a crimped top and a round window
+        x.fillStyle = col; rr(px, y0, w, hgt, 7); x.fill();
+        x.fillStyle = 'rgba(0,0,0,0.18)'; for (let k = 0; k < w; k += 5) x.fillRect(px + k, y0, 3, 5);
+        x.fillStyle = pick(); x.beginPath(); x.arc(px + w / 2, y0 + hgt * 0.55, Math.min(w, hgt) * 0.26, 0, Math.PI * 2); x.fill();
+        x.fillStyle = 'rgba(255,255,255,0.3)'; x.fillRect(px + 4, y0 + 8, 4, hgt - 16);
+      } else {
+        // box: two-tone with a stripe
+        x.fillStyle = col; x.fillRect(px, y0, w, hgt);
+        x.fillStyle = pick(); x.fillRect(px, y0 + hgt * 0.38, w, hgt * 0.22);
+        x.fillStyle = 'rgba(255,255,255,0.5)'; x.fillRect(px, y0, w, 4);
+      }
+      px += w + 3 + rnd() * 5;
+    }
+    // the board edge and its shadow
+    x.fillStyle = '#fdf8ee'; x.fillRect(0, top + 76, S, 7);
+    x.fillStyle = 'rgba(80,60,40,0.3)'; x.fillRect(0, top + 83, S, 4);
+  }
+  // ---- picture menu board: dark slate, six tiles with white pictograms and price bars
+  x.fillStyle = '#2b333d'; x.fillRect(0, 256, S, 128);
+  for (let k = 0; k < 16; k++) { x.fillStyle = k % 2 ? '#fbf3e4' : '#2f8f86'; x.fillRect(k * 64, 256, 64, 12); }
+  const tiles = ['#e8463a', '#ffd23f', '#3a86ff', '#ff70a6', '#8ac926', '#f4a261'];
+  tiles.forEach((tc, k) => {
+    const tx = 16 + k * 168, ty = 280;
+    x.fillStyle = tc; rr(tx, ty, 92, 92, 12); x.fill();
+    x.fillStyle = '#fffaf0'; x.strokeStyle = '#fffaf0'; x.lineWidth = 6; x.lineCap = 'round';
+    const cx = tx + 46, cy = ty + 46;
+    x.beginPath();
+    if (k === 0) { x.moveTo(cx - 18, cy - 4); x.lineTo(cx, cy + 34); x.lineTo(cx + 18, cy - 4); x.fill(); x.beginPath(); x.arc(cx, cy - 12, 19, 0, Math.PI * 2); x.fill(); }
+    else if (k === 1) { x.moveTo(cx - 20, cy - 22); x.lineTo(cx + 20, cy - 22); x.lineTo(cx + 14, cy + 32); x.lineTo(cx - 14, cy + 32); x.fill(); x.beginPath(); x.moveTo(cx + 4, cy - 22); x.lineTo(cx + 14, cy - 40); x.stroke(); }
+    else if (k === 2) { rr(cx - 14, cy - 34, 28, 50, 12); x.fill(); x.fillRect(cx - 4, cy + 14, 8, 22); }
+    else if (k === 3) { x.moveTo(cx - 22, cy - 6); x.lineTo(cx + 22, cy - 6); x.lineTo(cx + 16, cy + 32); x.lineTo(cx - 16, cy + 32); x.fill(); for (let q = -2; q <= 2; q++) { x.fillRect(cx + q * 8 - 3, cy - 34 + Math.abs(q) * 4, 6, 30); } }
+    else if (k === 4) { x.ellipse(cx, cy + 6, 34, 15, 0, 0, Math.PI * 2); x.fill(); x.fillStyle = tc; rr(cx - 30, cy - 4, 60, 12, 6); x.fill(); x.fillStyle = '#fffaf0'; }
+    else { rr(cx - 18, cy - 14, 34, 40, 6); x.fill(); x.beginPath(); x.arc(cx + 18, cy + 4, 10, -1.4, 1.4); x.stroke(); for (const q of [-8, 4]) { x.beginPath(); x.moveTo(cx + q, cy - 22); x.quadraticCurveTo(cx + q + 8, cy - 32, cx + q, cy - 42); x.stroke(); } }
+    // price bars, no figures
+    x.fillStyle = 'rgba(255,250,240,0.85)'; rr(tx + 104, ty + 22, 44, 10, 5); x.fill();
+    x.fillStyle = 'rgba(255,250,240,0.5)'; rr(tx + 104, ty + 44, 30, 8, 4); x.fill(); rr(tx + 104, ty + 62, 38, 8, 4); x.fill();
+  });
+  // ---- drinks fridge seen through its glass door
+  const fx = 0, fy = 384, fw = 384, fh = 640;
+  const fg = x.createLinearGradient(0, fy, 0, fy + fh);
+  fg.addColorStop(0, '#dfe9ee'); fg.addColorStop(0.08, '#9fb3bf'); fg.addColorStop(1, '#3a4a57');
+  x.fillStyle = fg; x.fillRect(fx, fy, fw, fh);
+  for (let row = 0; row < 5; row++) {
+    const sy = fy + 70 + row * 118;
+    let bx = fx + 22;
+    while (bx < fx + fw - 40) {
+      const can = rnd() < 0.3, w = can ? 30 : 24 + rnd() * 8, hgt = can ? 52 : 84 + rnd() * 18, col = pick();
+      const y0 = sy + 100 - hgt;
+      x.fillStyle = col; rr(bx, y0 + (can ? 0 : hgt * 0.28), w, hgt * (can ? 1 : 0.72), 5); x.fill();
+      if (!can) { x.fillRect(bx + w * 0.3, y0 + 6, w * 0.4, hgt * 0.3); x.fillStyle = '#f4efe6'; x.fillRect(bx + w * 0.28, y0, w * 0.44, 8); }
+      else { x.fillStyle = '#c9d1d8'; x.fillRect(bx, y0, w, 6); }
+      x.fillStyle = 'rgba(255,255,255,0.7)'; x.fillRect(bx, y0 + hgt * 0.55, w, hgt * 0.16);
+      x.fillStyle = 'rgba(255,255,255,0.45)'; x.fillRect(bx + 4, y0 + hgt * 0.3, 4, hgt * 0.62);
+      bx += w + 6 + rnd() * 4;
+    }
+    x.fillStyle = 'rgba(240,248,252,0.9)'; x.fillRect(fx + 12, sy + 100, fw - 24, 6);
+  }
+  // glass sheen + white frame with a handle
+  x.fillStyle = 'rgba(255,255,255,0.14)';
+  x.beginPath(); x.moveTo(fx + 40, fy + fh); x.lineTo(fx + 150, fy); x.lineTo(fx + 210, fy); x.lineTo(fx + 100, fy + fh); x.fill();
+  x.strokeStyle = '#eef2f4'; x.lineWidth = 24; x.strokeRect(fx + 12, fy + 12, fw - 24, fh - 24);
+  x.fillStyle = '#b9c3ca'; x.fillRect(fx + fw - 44, fy + 220, 10, 160);
+  const t = new CanvasTexture(c);
+  t.colorSpace = SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+
+/** canvas pixel rectangle of the kiosk atlas -> uv rectangle (u0, v0 bottom, u1, v1 top) */
+const kuv = (x0: number, y0: number, x1: number, y1: number): [number, number, number, number] => [x0 / 1024, 1 - y1 / 1024, x1 / 1024, 1 - y0 / 1024];
+
+/**
+ * The shallow shop behind the kiosk's service window: back wall with shelves, a picture menu, a glass-door drinks
+ * fridge, an inner counter with a few things on it and a light strip. One draw; its light is emitted as lit albedo
+ * (warm, stronger on the menu, the fridge and the strip) so the shop reads as lit from inside at any time of day.
+ */
+function buildKioskShop() {
+  const { win, z1 } = KIOSK;
+  const X0 = win.x0 - 0.35, X1 = win.x1 + 0.35, Zb = z1 - 1.05, Yc = 2.62;
+  const P: number[] = [], N: number[] = [], C: number[] = [], U: number[] = [], G: number[] = [], I: number[] = [];
+  const WHITE: [number, number, number, number] = kuv(700, 700, 900, 900);
+  const quad = (a: Vector3, b: Vector3, c: Vector3, d: Vector3, n: Vector3, col: string, uv: [number, number, number, number] = WHITE, glow = 0) => {
+    const base = P.length / 3, cc = new Color(col);
+    const uvs = [[uv[0], uv[1]], [uv[2], uv[1]], [uv[2], uv[3]], [uv[0], uv[3]]];
+    // the ceiling light falls off towards the floor
+    [a, b, c, d].forEach((p, k) => {
+      const f = glow > 0 ? 1 : 0.7 + 0.3 * smooth(0, 2.3, p.y);
+      P.push(p.x, p.y, p.z); N.push(n.x, n.y, n.z); C.push(cc.r * f, cc.g * f, cc.b * f); U.push(uvs[k][0], uvs[k][1]); G.push(glow);
+    });
+    const front = new Vector3().subVectors(b, a).cross(new Vector3().subVectors(c, a)).dot(n) > 0;
+    I.push(...(front ? [base, base + 1, base + 2, base, base + 2, base + 3] : [base, base + 2, base + 1, base, base + 3, base + 2]));
+  };
+  /** wall-aligned rectangle on the plane z (facing +z) */
+  const zr = (x0: number, y0: number, x1: number, y1: number, z: number, col: string, uv?: [number, number, number, number], glow = 0) =>
+    quad(V(x0, y0, z), V(x1, y0, z), V(x1, y1, z), V(x0, y1, z), V(0, 0, 1), col, uv, glow);
+  const box = (x0: number, y0: number, z0: number, x1: number, y1: number, z1b: number, col: string, glow = 0) => {
+    zr(x0, y0, x1, y1, z1b, col, undefined, glow);
+    quad(V(x0, y1, z0), V(x1, y1, z0), V(x1, y1, z1b), V(x0, y1, z1b), V(0, 1, 0), col, undefined, glow);
+    quad(V(x0, y0, z1b), V(x0, y0, z0), V(x0, y1, z0), V(x0, y1, z1b), V(-1, 0, 0), col, undefined, glow);
+    quad(V(x1, y0, z0), V(x1, y0, z1b), V(x1, y1, z1b), V(x1, y1, z0), V(1, 0, 0), col, undefined, glow);
+    quad(V(x1, y0, z0), V(x0, y0, z0), V(x0, y1, z0), V(x1, y1, z0), V(0, 0, -1), col, undefined, glow);
+  };
+  const wall = '#f1e3c8', fridgeX = X1 - 1.3;
+  // shell: back wall (plain bands around the shelves and the menu), side walls, ceiling with a light strip, floor
+  zr(X0, 0, X1, 0.88, Zb, wall);
+  zr(X0, 0.88, fridgeX, 1.6, Zb, wall, kuv(0, 0, 1024, 256));
+  zr(X0, 1.6, fridgeX, 1.66, Zb, wall);
+  zr(X0 + 0.25, 1.66, fridgeX - 0.15, 2.06, Zb, wall, kuv(0, 256, 1024, 384), 0.9);
+  zr(X0, 1.66, X0 + 0.25, 2.06, Zb, wall); zr(fridgeX - 0.15, 1.66, X1, 2.06, Zb, wall);
+  zr(X0, 2.06, X1, Yc, Zb, wall);
+  quad(V(X0, 0, z1), V(X0, 0, Zb), V(X0, Yc, Zb), V(X0, Yc, z1), V(1, 0, 0), '#ead9bb');
+  quad(V(X1, 0, Zb), V(X1, 0, z1), V(X1, Yc, z1), V(X1, Yc, Zb), V(-1, 0, 0), '#ead9bb');
+  quad(V(X0, Yc, Zb), V(X1, Yc, Zb), V(X1, Yc, z1), V(X0, Yc, z1), V(0, -1, 0), '#f6efe2');
+  quad(V(X0 + 0.4, Yc - 0.01, Zb + 0.35), V(X1 - 0.4, Yc - 0.01, Zb + 0.35), V(X1 - 0.4, Yc - 0.01, Zb + 0.5), V(X0 + 0.4, Yc - 0.01, Zb + 0.5), V(0, -1, 0), '#fff6e2', undefined, 3.0);
+  quad(V(X0, 0.01, z1), V(X1, 0.01, z1), V(X1, 0.01, Zb), V(X0, 0.01, Zb), V(0, 1, 0), '#8a7d70');
+  // shelf boards in front of the painted shelves (their edges line up with the painted board lines)
+  for (const y of [1.36, 1.12, 0.88]) box(X0, y - 0.03, Zb, fridgeX, y, Zb + 0.2, '#fbf6ec');
+  // drinks fridge: white cabinet, lit glass door
+  box(fridgeX, 0, Zb + 0.02, X1 - 0.05, 2.08, Zb + 0.7, '#eef2f4');
+  zr(fridgeX + 0.08, 0.14, X1 - 0.13, 1.98, Zb + 0.705, '#ffffff', kuv(0, 384, 384, 1024), 1.8);
+  // inner counter (steel) behind the outer one, a till, a sweet jar, a napkin box, a cup stack
+  box(X0, 0, z1 - 0.52, X1, 0.86, z1 - 0.04, '#d8dde1');
+  box(X0, 0.86, z1 - 0.52, X1, 0.9, z1 - 0.02, '#c3cad0');
+  box(win.x0 + 0.35, 0.9, z1 - 0.4, win.x0 + 0.75, 1.08, z1 - 0.12, '#3b4a57');
+  box(win.x0 + 0.42, 1.08, z1 - 0.36, win.x0 + 0.68, 1.2, z1 - 0.3, '#2a9d8f', 0.6);
+  {
+    const jx = win.x1 - 1.1, jz = z1 - 0.25;
+    const jar = new CylinderGeometry(0.1, 0.1, 0.24, 10).translate(jx, 1.02, jz), jp = jar.getAttribute('position'), jn = jar.getAttribute('normal'), ji = jar.index!.array;
+    const base = P.length / 3, jc = new Color('#cfe3ea');
+    for (let i = 0; i < jp.count; i++) { P.push(jp.getX(i), jp.getY(i), jp.getZ(i)); N.push(jn.getX(i), jn.getY(i), jn.getZ(i)); C.push(jc.r, jc.g, jc.b); U.push(WHITE[0], WHITE[1]); G.push(0.3); }
+    for (let i = 0; i < ji.length; i++) I.push(base + ji[i]);
+    for (let k = 0; k < 9; k++) { const a = k * 2.3, r = 0.05; box(jx + Math.cos(a) * r - 0.02, 0.94 + (k % 3) * 0.06, jz + Math.sin(a) * r - 0.02, jx + Math.cos(a) * r + 0.02, 0.98 + (k % 3) * 0.06, jz + Math.sin(a) * r + 0.02, ['#e8463a', '#ffd23f', '#ff70a6', '#8ac926'][k % 4], 0.5); }
+  }
+  box(win.x1 - 0.55, 0.9, z1 - 0.3, win.x1 - 0.38, 1.04, z1 - 0.18, '#fbf8f2');
+  for (let k = 0; k < 4; k++) box(win.x0 + 1.3 + k * 0.02, 0.9 + k * 0.07, z1 - 0.3, win.x0 + 1.42 - k * 0.02, 0.97 + k * 0.07, z1 - 0.2, k % 2 ? '#f4efe6' : '#e05a47');
+  const g = new BufferGeometry();
+  g.setAttribute('position', new Float32BufferAttribute(P, 3));
+  g.setAttribute('normal', new Float32BufferAttribute(N, 3));
+  g.setAttribute('color', new Float32BufferAttribute(C, 3));
+  g.setAttribute('uv', new Float32BufferAttribute(U, 2));
+  g.setAttribute('glow', new Float32BufferAttribute(G, 1));
+  g.setIndex(I);
+  g.computeBoundingSphere();
+  const mat = toonMaterial({ vertexColors: true, map: kioskAtlas(), emissive: 0xffd6a0, emissiveIntensity: 0.6, bands: 0.2, wrap: 0.5, rim: 0, lamps: false, name: 'kioskShop' });
+  patch(mat, 'kioskShop', (sh) => {
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', `#include <common>
+      attribute float glow; varying float vGlow;`).replace('#include <begin_vertex>', `#include <begin_vertex>
+      vGlow = glow;`);
+    sh.fragmentShader = sh.fragmentShader.replace('#include <common>', `#include <common>
+      varying float vGlow;`).replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+      totalEmissiveRadiance *= diffuseColor.rgb * (1.0 + vGlow);`);
+  });
+  const mesh = new Mesh(g, mat);
+  mesh.name = 'kioskShop';
+  mesh.receiveShadow = true;
+  return { mesh, mat };
 }
 
 // ------------------------------------------------------------------ palms: ringed matte trunks, arching feathered fronds with independent tips, dead-frond skirts

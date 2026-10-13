@@ -15,6 +15,7 @@ from mathutils import Vector, Matrix
 cfg = json.load(open(sys.argv[sys.argv.index("--") + 1:][0]))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "character"))
 import cloth_masks
+import hand_rig
 SKEL = json.load(open(cfg.get("skeleton") or os.path.join(os.path.dirname(cfg["parts_dir"]), "bryce_skeleton.json")))["bones"]
 LOG = []
 
@@ -86,6 +87,45 @@ nt.links.new(tex.outputs[0], bsdf2.inputs["Base Color"])
 bsdf2.inputs["Roughness"].default_value = 0.8
 
 S_FACE, YC_FACE = 0.26, 1.640
+HANDS = {S: hand_rig.Hand(SKEL, S) for S in "LR"}
+ARM_SIDE = {"armL": "L", "armR": "R"}
+
+
+def gltf_co(o):
+    """world positions of a mesh's vertices in glTF axes (blender (x, y, z) -> glTF (x, z, -y))"""
+    co = np.empty(len(o.data.vertices) * 3)
+    o.data.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    mw = np.array(o.matrix_world)
+    co = co @ mw[:3, :3].T + mw[:3, 3]
+    return np.stack([co[:, 0], co[:, 2], -co[:, 1]], 1)
+
+
+def decimate_arm(o, S, arm_tris):
+    """The hand arrives already relaxed and decimated to its own budget (sdf_skater.hand_budget); thin only the
+    arm above the wrist. Hand vertices get a tiny (never zero) decimate weight: the edge-length penalty keeps
+    every collapse on the arm (zero weights take Blender's selection path, which crashed in 5.1)."""
+    g = gltf_co(o)
+    hv = HANDS[S].in_hand(g)
+    cf = np.array([sum(hv[v] for v in poly.vertices) >= 2 for poly in o.data.polygons])
+    vg = o.vertex_groups.new(name="_decimate")
+    vg.add(np.nonzero(~hv)[0].tolist(), 1.0, "REPLACE")
+    vg.add(np.nonzero(hv)[0].tolist(), 1e-4, "REPLACE")
+    n, nh = len(cf), int(cf.sum())
+    select_only([o])
+    mod = o.modifiers.new("dec", "DECIMATE")
+    mod.ratio = min(1.0, (nh + arm_tris) / max(1, n))
+    mod.use_collapse_triangulate = True
+    mod.vertex_group = "_decimate"
+    mod.vertex_group_factor = 1.0
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+    if o.vertex_groups.get("_decimate"):
+        o.vertex_groups.remove(o.vertex_groups["_decimate"])
+    hv = HANDS[S].in_hand(gltf_co(o))
+    nh2 = sum(1 for poly in o.data.polygons if sum(hv[v] for v in poly.vertices) >= 2)
+    log("  decimate", o.name, "hand", nh, "->", nh2, "arm", n - nh, "->", len(o.data.polygons) - nh2)
+
+
 objs = []
 for p in parts:
     path = os.path.join(cfg["parts_dir"], p["name"] + ".obj")
@@ -97,12 +137,15 @@ for p in parts:
     # bake the importer's axis conversion into the vertices (local == world for weighting / transfer)
     select_only([o])
     bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-    # light relax then decimate to target
-    mod = o.modifiers.new("smooth", "SMOOTH"); mod.factor = 0.5; mod.iterations = 2
-    bpy.ops.object.modifier_apply(modifier=mod.name)
-    ratio = min(1.0, p["target_tris"] / max(1, len(me.polygons)))
-    mod = o.modifiers.new("dec", "DECIMATE"); mod.ratio = ratio; mod.use_collapse_triangulate = True
-    bpy.ops.object.modifier_apply(modifier=mod.name)
+    # light relax then decimate to target (the fine-voxel arms were relaxed + decimated in sdf_skater.py)
+    if p.get("hand_tris"):
+        decimate_arm(o, ARM_SIDE[p["name"]], p["target_tris"])
+    else:
+        mod = o.modifiers.new("smooth", "SMOOTH"); mod.factor = 0.5; mod.iterations = 2
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+        ratio = min(1.0, p["target_tris"] / max(1, len(me.polygons)))
+        mod = o.modifiers.new("dec", "DECIMATE"); mod.ratio = ratio; mod.use_collapse_triangulate = True
+        bpy.ops.object.modifier_apply(modifier=mod.name)
     for poly in me.polygons:
         poly.use_smooth = True
     # colour attribute (linear float)
@@ -222,12 +265,40 @@ def neck_blend(o):
                 g.add([v.index], w * f, "ADD")
 
 
+def hand_weights(o, S):
+    """Fingers and thumb: analytic weights from hand_rig (each phalanx follows its own bone, blending only across
+    its knuckle; webs share the two neighbouring fingers), faded in from the wrist over the bone-heat weights."""
+    blend, W = HANDS[S].weights(gltf_co(o))
+    groups = {name: (o.vertex_groups.get(name) or o.vertex_groups.new(name=name)) for name in W}
+    names = {g.index: g.name for g in o.vertex_groups}
+    idx = {g.name: g.index for g in o.vertex_groups}
+    n = 0
+    for v in o.data.vertices:
+        b = float(blend[v.index])
+        if b <= 1e-4:
+            continue
+        new = {names[g.group]: g.weight * (1.0 - b) for g in v.groups}
+        for name, w in W.items():
+            new[name] = new.get(name, 0.0) + b * float(w[v.index])
+        for g in list(v.groups):
+            o.vertex_groups[g.group].remove([v.index])
+        top = sorted(new.items(), key=lambda kv: -kv[1])[:4]
+        tot = sum(w for _, w in top) or 1.0
+        for name, w in top:
+            if w / tot > 1e-3:
+                o.vertex_groups[idx[name]].add([v.index], w / tot, "REPLACE")
+        n += 1
+    log("hand weights", o.name, "verts", n)
+
+
 H = "mixamorig:Head"
 for o in objs:
     if o.name in ("cap", "hair"):
         rigid_to(o, H)
     elif o.name == "head":
         neck_blend(o)
+    elif o.name in ARM_SIDE:
+        hand_weights(o, ARM_SIDE[o.name])
 
 bpy.data.objects.remove(proxy, do_unlink=True)
 arm.data.pose_position = "POSE"
@@ -251,14 +322,35 @@ am.object = arm
 log("body tris", len(body.data.polygons), "verts", len(body.data.vertices), "vgroups", len(body.vertex_groups))
 # weight sanity check at known body locations (blender coords: x, -z_gltf, y_gltf)
 _names = {g.index: g.name for g in body.vertex_groups}
+_co = gltf_co(body)
+_bl = np.stack([_co[:, 0], -_co[:, 2], _co[:, 1]], 1)
+
+
+def _top(tgt):
+    best = body.data.vertices[int(np.argmin(np.linalg.norm(_bl - np.asarray(tgt), axis=1)))]
+    return sorted([(_names[g.group].replace("mixamorig:", ""), round(g.weight, 2)) for g in best.groups], key=lambda x: -x[1])[:3]
+
+
 for tgt, want in [((0.6, 0.0, 1.42), "ForeArm"), ((0.35, 0.0, 1.42), "Arm"), ((0.14, 0.0, 0.3), "Leg"), ((0.0, 0.0, 1.65), "Head"),
                   ((0.0, 0.0, 1.2), "Spine"), ((0.11, 0.0, 0.7), "UpLeg"), ((0.845, 0.011, 1.4065), "LeftHandMiddle"),
                   ((-0.845, 0.011, 1.4065), "RightHandMiddle"), ((0.8375, -0.0185, 1.4015), "LeftHandIndex"),
                   ((0.777, -0.0455, 1.365), "LeftHandThumb"), ((0.0, -0.02, 1.52), "Neck")]:
-    t = Vector(tgt)
-    best = min(body.data.vertices, key=lambda v: ((body.matrix_world @ v.co) - t).length)
-    ws = sorted([(_names[g.group].replace("mixamorig:", ""), round(g.weight, 2)) for g in best.groups], key=lambda x: -x[1])[:3]
+    ws = _top(tgt)
     log("weights", tgt, want, ws, "OK" if ws and want in ws[0][0] else "SUSPICIOUS")
+# every phalanx of both hands: the skin nearest the middle of a bone must follow that bone alone
+for S in "LR":
+    hh = HANDS[S]
+    for f in hand_rig.FINGERS + ("Thumb",):
+        J = hh.joints[f]
+        for j in ((2, 3) if f == "Thumb" else (1, 2, 3)):
+            mid = (J[j - 1] + J[j]) / 2
+            want = hh.n + "Hand" + f + str(j)
+            ws = _top((mid[0], -mid[2], mid[1]))
+            log("weights finger", want, ws, "OK" if ws and ws[0][0] == want and ws[0][1] >= 0.9 else "SUSPICIOUS")
+    # knuckle blends (informative): skin over each middle joint shares the two phalanges
+    for f in hand_rig.FINGERS:
+        k = hh.joints[f][1] + hh.hy * 0.008
+        log("weights knuckle", hh.n + f + "2", _top((k[0], -k[2], k[1])))
 
 # ------------------------------------------------------------------ animations
 def action_fcurves(act):

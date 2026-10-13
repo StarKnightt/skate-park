@@ -1,6 +1,6 @@
 import {
   Color, DoubleSide, FrontSide, MeshLambertMaterial, RepeatWrapping, SRGBColorSpace, Texture, TextureLoader, Vector3, Vector4,
-  Side, LinearMipmapLinearFilter, ShaderChunk,
+  Side, LinearMipmapLinearFilter, ShaderChunk, Matrix4,
 } from 'three';
 
 /** max street lamps with a light pool (shader array size) */
@@ -38,6 +38,11 @@ export const shared = {
   uSkySun: { value: new Color(0.6, 0.5, 0.4) },
   uSkyAnti: { value: new Color(0.4, 0.45, 0.6) },
   uGroundBounce: { value: new Color(0.3, 0.25, 0.2) },
+  /** the skater's own shadow map (heroShadow.ts): world -> (u, v, depth along the light) and
+   *  (texel size m, penumbra width per metre behind the caster, map size or 0 = off, box half size m) */
+  uHeroMap: { value: null as Texture | null },
+  uHeroMat: { value: new Matrix4() },
+  uHeroInfo: { value: new Vector4(0, 0, 0, 1) },
 };
 
 export interface ToonOpts {
@@ -59,6 +64,8 @@ export interface ToonOpts {
   alphaTest?: number;
   fog?: boolean;
   name?: string;
+  /** hair sheen + outline on the hair part of the character vertex colours (default: the skater and people bodies) */
+  hair?: boolean;
 }
 
 const NOISE = /* glsl */ `
@@ -73,26 +80,119 @@ float fbm(vec2 p){ float a = 0.5, s = 0.0; for(int i=0;i<4;i++){ s += a*vnoise(p
  * kernels stay acne-free at a grazing golden-hour sun without a large constant bias (which would detach contact shadows).
  */
 const SUN_SHADOW_RPDB = /* glsl */ `
+#if defined( USE_SHADOWMAP ) && defined( SHADOWMAP_TYPE_PCF ) && ( NUM_SUN_LIGHT_SHADOWS > 0 || NUM_SPOT_LIGHT_SHADOWS > 0 )
+  // Smooth separable tent PCF of radius R texels (1 <= R <= 3). The tent weight of every texel is folded into 3x3
+  // bilinear compare taps (two texels per tap and axis), so the filter slides smoothly with the sub-texel position and
+  // prints no pattern into the penumbra (a kernel rotated per screen pixel shows its rotation as a regular dot grid).
+  // Each tap compares against the receiver plane at its own offset (dzduv; zero for no plane bias).
+  float tentPCF( sampler2DShadow map, vec2 uv, float z, vec2 dzduv, float slope, vec2 size, float R ) {
+    vec2 p = uv * size - 0.5, b = floor( p ), f = p - b, r = vec2( R );
+    vec2 w0 = max( r - 2.0 - f, 0.0 ), w1 = max( r - 1.0 - f, 0.0 ), w2 = max( r - f, 0.0 );
+    vec2 w3 = max( r - 1.0 + f, 0.0 ), w4 = max( r - 2.0 + f, 0.0 ), w5 = max( r - 3.0 + f, 0.0 );
+    vec2 g0 = w0 + w1, g1 = w2 + w3, g2 = w4 + w5;
+    vec2 t0 = ( b - 1.5 + w1 / max( g0, 1e-5 ) ) / size;
+    vec2 t1 = ( b + 0.5 + w3 / max( g1, 1e-5 ) ) / size;
+    vec2 t2 = ( b + 2.5 + w5 / max( g2, 1e-5 ) ) / size;
+    #define TT( X, Y, WX, WY ) ( WX ) * ( WY ) * textureLod( map, vec3( X, Y, z + clamp( dot( dzduv, vec2( X, Y ) - uv ), -0.02, 0.02 ) - slope ), 0.0 )
+    float s = TT( t0.x, t0.y, g0.x, g0.y ) + TT( t1.x, t0.y, g1.x, g0.y ) + TT( t2.x, t0.y, g2.x, g0.y )
+      + TT( t0.x, t1.y, g0.x, g1.y ) + TT( t1.x, t1.y, g1.x, g1.y ) + TT( t2.x, t1.y, g2.x, g1.y )
+      + TT( t0.x, t2.y, g0.x, g2.y ) + TT( t1.x, t2.y, g1.x, g2.y ) + TT( t2.x, t2.y, g2.x, g2.y );
+    #undef TT
+    return s / max( ( g0.x + g1.x + g2.x ) * ( g0.y + g1.y + g2.y ), 1e-5 );
+  }
+#endif
+#if defined( USE_SHADOWMAP ) && NUM_SPOT_LIGHT_SHADOWS > 0 && defined( SHADOWMAP_TYPE_PCF )
+  float toonSpotShadow( sampler2DShadow shadowMap, vec2 shadowMapSize, float shadowIntensity, float shadowBias, float shadowRadius, vec4 shadowCoord ) {
+    float shadow = 1.0;
+    shadowCoord.xyz /= shadowCoord.w;
+    shadowCoord.z += shadowBias;
+    bool inFrustum = shadowCoord.x >= 0.0 && shadowCoord.x <= 1.0 && shadowCoord.y >= 0.0 && shadowCoord.y <= 1.0;
+    if ( inFrustum && shadowCoord.z <= 1.0 )
+      shadow = tentPCF( shadowMap, shadowCoord.xy, shadowCoord.z, vec2( 0.0 ), 0.0, shadowMapSize, clamp( shadowRadius * 0.866, 1.0, 3.0 ) );
+    return mix( 1.0, shadow, shadowIntensity );
+  }
+  #define SPOT_SHADOW_FN toonSpotShadow
+#else
+  #define SPOT_SHADOW_FN getShadow
+#endif
 #if defined( USE_SHADOWMAP ) && NUM_SUN_LIGHT_SHADOWS > 0 && defined( SHADOWMAP_TYPE_PCF )
+  uniform sampler2D uHeroMap;
+  uniform mat4 uHeroMat;
+  uniform vec4 uHeroInfo;
+  // one mip level of the skater map, reconstructed with a cubic B-spline from four bilinear taps (no bilinear diamonds)
+  vec4 heroBspline( vec2 uv, float lod ) {
+    float n = uHeroInfo.z * exp2( -lod );
+    vec2 p = uv * n - 0.5, i = floor( p ), f = p - i, f2 = f * f, f3 = f2 * f;
+    vec2 w0 = ( 1.0 - 3.0 * f + 3.0 * f2 - f3 ) / 6.0, w1 = ( 4.0 - 6.0 * f2 + 3.0 * f3 ) / 6.0;
+    vec2 w2 = ( 1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3 ) / 6.0, w3 = f3 / 6.0;
+    vec2 g0 = w0 + w1, g1 = w2 + w3;
+    vec2 t0 = ( i - 0.5 + w1 / g0 ) / n, t1 = ( i + 1.5 + w3 / g1 ) / n;
+    return g0.x * g0.y * textureLod( uHeroMap, t0, lod ) + g1.x * g0.y * textureLod( uHeroMap, vec2( t1.x, t0.y ), lod )
+      + g0.x * g1.y * textureLod( uHeroMap, vec2( t0.x, t1.y ), lod ) + g1.x * g1.y * textureLod( uHeroMap, t1, lod );
+  }
+  // near the caster: a 4x4 texel tent PCF on the raw map, each texel compared against the receiver plane
+  float heroFine( vec2 uv, float t, vec2 dtduv, float bias ) {
+    float n = uHeroInfo.z;
+    vec2 p = uv * n - 0.5, b = floor( p );
+    float occ = 0.0, ws = 0.0;
+    for ( int j = -1; j <= 2; j ++ ) {
+      for ( int i = -1; i <= 2; i ++ ) {
+        vec2 k = b + vec2( float( i ), float( j ) ), dk = k - p;
+        float w = max( 1.5 - abs( dk.x ), 0.0 ) * max( 1.5 - abs( dk.y ), 0.0 );
+        vec4 s = texelFetch( uHeroMap, ivec2( clamp( k, vec2( 0.0 ), vec2( n - 1.0 ) ) ), 0 );
+        float tz = t + clamp( dot( dtduv, dk / n ), -0.05, 0.05 ) - bias;
+        occ += w * step( 0.5, s.x ) * step( s.y, tz );
+        ws += w;
+      }
+    }
+    return 1.0 - occ / ws;
+  }
+  // The skater's shadow: the penumbra grows with the distance between him and the receiver (a sun-sized light), so it
+  // is crisp where he touches a surface and softens along a long ground shadow. lOff ignores occluders that close
+  // along the light (self-shadow of a limb on itself).
+  float heroShadow( vec3 wp, vec3 wn, float lOff ) {
+    float n = uHeroInfo.z;
+    if ( n < 1.0 ) return 1.0;
+    float tx = uHeroInfo.x;
+    vec3 h = ( uHeroMat * vec4( wp + wn * ( 1.5 * tx ) + uSunDir * lOff, 1.0 ) ).xyz;
+    if ( h.x <= 0.0 || h.x >= 1.0 || h.y <= 0.0 || h.y >= 1.0 ) return 1.0;
+    float maxLod = log2( n );
+    // blocker search: coverage and mean depth of the casters within the widest penumbra this receiver could have
+    float ls = clamp( log2( max( uHeroInfo.y * ( h.z + uHeroInfo.w ), tx ) / ( 1.65 * tx ) ) + 1.0, 2.0, maxLod - 1.0 );
+    vec4 s = textureLod( uHeroMap, h.xy, ls );
+    if ( s.x < 1e-3 ) return 1.0;
+    float w = uHeroInfo.y * max( h.z - s.y / s.x, 0.0 );
+    // mip level whose (B-spline) footprint spans that penumbra; 1.65 texels is the width of level 0
+    float L = clamp( log2( max( w, 1e-5 ) / ( 1.65 * tx ) ), -1.0, maxLod - 2.0 );
+    float vis = 1.0;
+    if ( L < 1.0 ) {
+      mat3 M3 = mat3( uHeroMat );
+      vec3 dx = M3 * gDPdx, dy = M3 * gDPdy;
+      float det = dx.x * dy.y - dx.y * dy.x;
+      vec2 dtduv = abs( det ) > 1e-14 ? vec2( dy.y * dx.z - dx.y * dy.z, dx.x * dy.z - dy.x * dx.z ) / det : vec2( 0.0 );
+      vis = heroFine( h.xy, h.z, dtduv, 0.004 );
+    }
+    if ( L > 0.0 ) {
+      float l0 = floor( L );
+      vec4 m = mix( heroBspline( h.xy, l0 ), heroBspline( h.xy, l0 + 1.0 ), L - l0 );
+      float cv = clamp( m.x, 0.0, 1.0 ) * smoothstep( -0.02, 0.05, h.z - m.y / max( m.x, 1e-4 ) );
+      vis = mix( vis, 1.0 - cv, clamp( L, 0.0, 1.0 ) );
+    }
+    return vis;
+  }
   float sunShadowPCF( sampler2DShadow shadowMap, vec2 shadowMapSize, float shadowIntensity, float shadowBias, float shadowRadius, vec3 sc, vec2 dzduv, float tight ) {
     float shadow = 1.0;
     sc.z += shadowBias;
     bool inFrustum = sc.x >= 0.0 && sc.x <= 1.0 && sc.y >= 0.0 && sc.y <= 1.0;
     if ( inFrustum && sc.z <= 1.0 ) {
       vec2 texelSize = vec2( 1.0 ) / shadowMapSize;
-      // the hardware 2x2 compare reaches one atlas texel (the atlas is two cascades wide)
+      // the hardware 2x2 compare reaches a texel either way of a tap
       float slopeTexel = abs( dzduv.x ) * texelSize.x * 0.5 + abs( dzduv.y ) * texelSize.y;
       float wide = 0.0, fine = 0.0;
       if ( tight < 1.0 ) {
-        // wide soft kernel for the ground and walls: 5 taps, rotated per pixel
-        float radius = shadowRadius * texelSize.x;
-        float phi = interleavedGradientNoise( gl_FragCoord.xy ) * PI2;
-        for ( int k = 0; k < 5; k ++ ) {
-          vec2 o = vogelDiskSample( k, 5, phi ) * radius;
-          float zr = sc.z + clamp( dot( dzduv, o ), -0.02, 0.02 ) - slopeTexel;
-          wide += textureLod( shadowMap, vec3( sc.xy + o, zr ), 0.0 );
-        }
-        wide *= 0.2;
+        // ground and walls: smooth tent, as soft overall as the preset radius
+        wide = tentPCF( shadowMap, sc.xy, sc.z, dzduv, abs( dzduv.x ) * texelSize.x + abs( dzduv.y ) * texelSize.y,
+          shadowMapSize, clamp( shadowRadius * 0.866, 1.0, 3.0 ) );
       }
       if ( tight > 0.0 ) {
         // small curved shapes: a tight 3x3 tent on a fixed grid, smooth with no per-pixel rotation (a rotated kernel
@@ -172,7 +272,14 @@ const SUN_SHADOW_RPDB = /* glsl */ `
         #endif
       }
     }
+    // the skater is not in the cascades while his own map is on: his shadow (on himself too) comes from there
+    float hero = heroShadow( wp, wn, 0.004 + 0.056 * small );
+    #ifdef TOON_RIM
+      // (his own head or torso right behind the rim point does not count, as with the cascades)
+      if ( gCurv > 0.5 ) rimVis = min( rimVis, heroShadow( wp + uSunDir * 0.12, wn, 0.25 ) );
+    #endif
     gRimVis = min( gRimVis, mix( 1.0, rimVis, sunLightShadow.shadowIntensity ) );
+    shadow *= mix( 1.0, hero, sunLightShadow.shadowIntensity );
     return min( shadow, mix( 1.0, bendLit, sunLightShadow.shadowIntensity ) );
   }
   #define SUN_SHADOW_FN getSunShadowRPDB
@@ -180,7 +287,9 @@ const SUN_SHADOW_RPDB = /* glsl */ `
   #define SUN_SHADOW_FN getSunShadow
 #endif
 `;
-const LIGHTS_BEGIN = ShaderChunk.lights_fragment_begin.replace(/getSunShadow\(/g, 'SUN_SHADOW_FN(');
+const LIGHTS_BEGIN = ShaderChunk.lights_fragment_begin.replace(/getSunShadow\(/g, 'SUN_SHADOW_FN(')
+  .replace(/getShadow\( spotShadowMap/g, 'SPOT_SHADOW_FN( spotShadowMap');
+if (!LIGHTS_BEGIN.includes('SPOT_SHADOW_FN')) console.warn('toon: spot shadow filter hook not found');
 
 let detailTex: Texture | null = null;
 let woodTex: Texture | null = null;
@@ -437,7 +546,8 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
   m.name = o.name ?? 'toon';
   const bands = o.bands ?? 0.25, wrap = o.wrap ?? 0.35, rim = o.rim ?? 0.4, spec = o.spec ?? 0, shin = o.shininess ?? 40;
   const detail = o.detail === 'mural' && !o.map ? null : o.detail ?? null;
-  const key = `toon2-${bands}-${wrap}-${rim}-${spec}-${shin}-${detail}-${o.wind ? 1 : 0}-${o.lamps !== false ? 1 : 0}`;
+  const hair = !!o.vertexColors && (o.hair ?? (o.name === 'skaterVC' || o.name === 'personVC'));
+  const key = `toon2-${bands}-${wrap}-${rim}-${spec}-${shin}-${detail}-${o.wind ? 1 : 0}-${o.lamps !== false ? 1 : 0}-${hair ? 1 : 0}`;
   const seed = seedOf(m.name);
   m.customProgramCacheKey = () => key;
   m.onBeforeCompile = (sh) => {
@@ -448,11 +558,28 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
     sh.uniforms.uSpec = { value: spec };
     sh.uniforms.uShin = { value: shin };
     sh.uniforms.uSeed = { value: seed };
-    let vs = sh.vertexShader;
+    let vs = (hair ? '#define TOON_HAIR\n' : '') + sh.vertexShader;
     vs = vs.replace('#include <common>', `#include <common>
       varying vec3 vWorldPos; varying vec3 vWorldNrm;
       uniform float uTime; uniform float uWind;
+      ${hair ? 'varying float vHair; varying vec3 vHairP; varying vec3 vHairN;' : ''}
       ${o.wind ? 'attribute vec3 windData;' : ''}`);
+    if (hair) {
+      // hair = the hair part of the character colours (#492e1c); people without a cap wear the cap in their hair colour,
+      // so a dark, not bluish cap counts too. Runs after any per-person recolour of vColor (inserted right after the include).
+      vs = vs.replace('#include <color_vertex>', `#include <color_vertex>
+        vHair = 0.0;
+        #ifdef USE_COLOR
+        {
+          vec3 dh = color.rgb - vec3(0.0667, 0.0275, 0.0118), dc = color.rgb - vec3(0.7843, 0.4353, 0.0431);
+          float lum = dot(vColor.rgb, vec3(0.2126, 0.7152, 0.0722));
+          float capHair = (1.0 - smoothstep(0.05, 0.08, lum)) * (1.0 - smoothstep(0.15, 0.3, (vColor.b - vColor.r) / max(vColor.b, 1e-3)));
+          vHair = max(step(dot(dh, dh), 0.0004), step(dot(dc, dc), 0.0004) * capHair);
+        }
+        #endif
+        // rest pose, in metres: the strand pattern stays on the head however he moves
+        vHairP = position * length(modelMatrix[0].xyz); vHairN = normal;`);
+    }
     if (o.wind) {
       // windData: x = phase, y = bend weight (0 at the base), z = flutter weight (leaf tips)
       vs = vs.replace('#include <begin_vertex>', `#include <begin_vertex>
@@ -481,9 +608,11 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
       }`);
     sh.vertexShader = vs;
 
-    let fs = (rim > 0 ? '#define TOON_RIM\n' : '') + sh.fragmentShader;
+    let fs = (rim > 0 ? '#define TOON_RIM\n' : '') + (hair ? '#define TOON_HAIR\n' : '') + sh.fragmentShader;
     fs = fs.replace('#include <common>', `#include <common>
       varying vec3 vWorldPos; varying vec3 vWorldNrm;
+      ${hair ? 'varying float vHair; varying vec3 vHairP; varying vec3 vHairN;' : ''}
+      float gHair; float gStrand;
       uniform float uTime, uBands, uWrap, uRim, uSpec, uShin, uLampIntensity, uRimStrength, uSeed;
       uniform vec3 uLampColor, uRimColor, uWarmth;
       uniform vec3 uLampPos[${MAX_LAMPS}];
@@ -533,6 +662,17 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
           reflectedLight.directSpecular += directLight.color * sp * uSpec * step(0.0, d) * 0.5;
         }
         if (gSheen > 0.0) reflectedLight.directSpecular += directLight.color * pow(nh, 22.0) * smoothstep(0.0, 0.3, d) * gSheen;
+        #ifdef TOON_HAIR
+        if (gHair > 0.0) {
+          // strands run down the head: a highlight band across them (Kajiya-Kay) rather than a plastic spot
+          vec3 upV = normalize((viewMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
+          vec3 tg = upV - geometryNormal * dot(geometryNormal, upV);
+          float tl = length(tg);
+          float th = tl > 1e-3 ? dot(tg / tl, normalize(directLight.direction + geometryViewDir)) : 0.0;
+          float band = mix(pow(nh, 40.0), pow(max(1.0 - th * th, 0.0), 40.0), smoothstep(0.2, 0.6, tl));
+          reflectedLight.directSpecular += directLight.color * band * smoothstep(-0.1, 0.35, d) * 0.05 * gHair * gStrand;
+        }
+        #endif
       }
       void RE_IndirectDiffuse_Toon( const in vec3 irradiance, const in vec3 geometryPosition, const in vec3 geometryNormal, const in vec3 geometryViewDir, const in vec3 geometryClearcoatNormal, const in LambertMaterial material, inout ReflectedLight reflectedLight ) {
         vec3 nW = inverseTransformDirection( geometryNormal, viewMatrix );
@@ -561,7 +701,19 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
       gDNdx = dFdx(gN); gDNdy = dFdy(gN);
       gFp = max(max(length(gDPdx), length(gDPdy)), 1e-5);
       gCurv = length(abs(gDNdx) + abs(gDNdy)) / gFp;
-      gSkyVis = 1.0; gGround = 1.0; gBounce = vec3(0.0); gSheen = 0.0; gRimVis = 1.0;
+      gSkyVis = 1.0; gGround = 1.0; gBounce = vec3(0.0); gSheen = 0.0; gRimVis = 1.0; gHair = 0.0;
+      gStrand = 1.0;
+      #ifdef TOON_HAIR
+        gHair = vHair;
+        if (gHair > 0.0) {
+          // strands hang along the rest pose's up axis: fine strands and broader clumps, each faded before it can alias
+          vec3 an = abs(normalize(vHairN)); an /= an.x + an.y + an.z;
+          vec3 q = vHairP;
+          float st = vnoise(vec2(q.x * 95.0 + q.z * 11.0, q.y * 7.0)) * an.z + vnoise(vec2(q.z * 95.0 + q.x * 11.0, q.y * 7.0)) * an.x + vnoise(q.xz * 60.0) * an.y;
+          float cl = vnoise(vec2(q.x * 30.0 + q.z * 4.0, q.y * 3.0) + 7.0) * an.z + vnoise(vec2(q.z * 30.0 + q.x * 4.0, q.y * 3.0) + 7.0) * an.x + vnoise(q.xz * 22.0 + 7.0) * an.y;
+          gStrand = (0.55 + 0.9 * mix(0.5, st, aaFade(0.012))) * (0.6 + 0.8 * mix(0.5, cl, aaFade(0.035)));
+        }
+      #endif
       ${detailCode}
       diffuseColor.rgb *= uWarmth;`);
     // specular (Lambert drops it), a faint cool sky rim, and the street lamp pools
@@ -579,7 +731,23 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
           float back = smoothstep(0.0, 0.8, dot(-vW, uSunDir));
           float lit = smoothstep(-0.7, 0.1, dot(nW, uSunDir));
           float r = edge * edge * back * lit * smoothstep(0.5, 3.0, gCurv) * uRim * uRimStrength * gRimVis;
-          outgoingLight += uSunColor * uRimColor * r * (0.4 + 0.6 * diffuseColor.rgb) * 0.65;
+          // backlit hair glows through its outer strands whatever its colour
+          outgoingLight += uSunColor * uRimColor * r * mix(0.4 + 0.6 * diffuseColor.rgb, vec3(0.75), gHair) * 0.65;
+        }
+        #endif
+        #ifdef TOON_HAIR
+        if (gHair > 0.0) {
+          // dark hair shows mostly what it reflects: a soft sheen of the sky, stronger towards the silhouette, so it
+          // keeps its shape and a lighter edge from every side (also from above, where the backlight rim never reaches)
+          // (light that went through the outer strands picks up their colour, so brown hair stays brown)
+          // the darker the hair, the more of what we see of it is this sheen
+          float nv = saturate(dot(nW, vW));
+          float dark = 1.9 - 0.9 * smoothstep(0.012, 0.035, dot(diffuseColor.rgb, vec3(0.2126, 0.7152, 0.0722)));
+          float fh = (0.045 + 0.4 * pow(1.0 - nv, 3.0)) * dark;
+          vec3 tint = diffuseColor.rgb / max(max(diffuseColor.r, max(diffuseColor.g, diffuseColor.b)), 1e-4);
+          vec3 sr = skyAmbient(reflect(-vW, nW));
+          sr = mix(sr, vec3(dot(sr, vec3(0.2126, 0.7152, 0.0722))) * tint, 0.45);
+          outgoingLight += sr * RECIPROCAL_PI * fh * gSkyVis * gHair * gStrand;
         }
         #endif
         ${o.lamps !== false ? `

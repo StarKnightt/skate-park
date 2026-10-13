@@ -50,6 +50,8 @@ const UP = V(0, 1, 0);
 /** boardwalk lamp posts (z = -27.0) and benches (z = -26.6), shared with the scenery */
 export const BOARDWALK_LAMP_X = [-66, -49.5, -33, -16.5, 0, 16.5, 33, 49.5, 66];
 export const BOARDWALK_BENCH_X = [-30, -12, 14, 30];
+/** beach snack kiosk (south edge): footprint, height and the service window in its town-side wall (z = z1) */
+export const KIOSK = { x0: 19.5, x1: 30.5, z0: 24.9, z1: 29.3, h: 3.2, win: { x0: 22.5, x1: 27.5, y0: 1.0, y1: 2.15 } };
 /** palms planted in the park-edge planters: x, base y, z, height */
 export const EDGE_PALMS: [number, number, number, number][] = [
   [-39.1, 0.72, -19.5, 8.6], [-39.0, 0.72, 8.2, 9.8], [-39.1, 0.72, 21.0, 8.2], [39.1, 0.72, -19.8, 9.4], [39.0, 0.72, 2.2, 8.0],
@@ -154,12 +156,12 @@ export function buildPark(): ParkData {
   };
   /** vertical wall p0 -> p1 from y0 to y1: subdivided visual with grime, exact collision quad */
   const panel = (key: string, p0: Vector3, p1: Vector3, y0: number, y1: number, n: Vector3, base: RGB = C_WALL,
-    o: { grime?: number; collide?: boolean; seams?: number; ties?: boolean } = {}) => {
+    o: { grime?: number; collide?: boolean; seams?: number; ties?: boolean; ground?: number } = {}) => {
     const dx = p1.x - p0.x, dz = p1.z - p0.z, len = Math.hypot(dx, dz), H = y1 - y0;
     if (len < 1e-4 || H < 1e-4) return;
     const nu = Math.max(1, Math.ceil(len / 0.8)), nv = H < 0.7 ? 2 : H < 1.6 ? 4 : 6;
     b.grid(key, nu, nv, (u, v, out) => out.set(p0.x + dx * u, y0 + H * Math.pow(v, 1.6), p0.z + dz * u), (_u, _v, out) => out.copy(n),
-      { vcolor: grime(base, y0, o.grime ?? 1, p0.x * 0.37 + p0.z), collide: false });
+      { vcolor: grime(base, o.ground ?? y0, o.grime ?? 1, p0.x * 0.37 + p0.z), collide: false });
     if (o.collide !== false) b.quad(null, V(p0.x, y0, p0.z), V(p1.x, y0, p1.z), V(p1.x, y1, p1.z), V(p0.x, y1, p0.z), { visual: false }, n);
     if (o.seams) seams(p0, p1, y0, y1, n, base, o.seams, !!o.ties);
   };
@@ -266,9 +268,10 @@ export function buildPark(): ParkData {
   bowl('pocket bowl', -24, 15, 6, 4.5, 3.6, 1.4, 1.9);
 
   // ------------------------------------------------------------------ quarter pipe with deck
+  /** `open` leaves out the side wall at that end (a hip continues the transition there) */
   const qp = (name: string, ax: number, az: number, bx: number, bz: number, mx: number, mz: number, baseY: number,
-    H: number, R: number, deck: number, groundY = 0) => {
-    const prof = transitionProfile(H, R, 24);
+    H: number, R: number, deck: number, groundY = 0, open?: 'A' | 'B', segs = 24) => {
+    const prof = transitionProfile(H, R, segs);
     const A = V(ax, 0, az), B = V(bx, 0, bz), m = V(mx, 0, mz);
     const len = A.distanceTo(B);
     const nu = Math.max(2, Math.ceil(len / 1.5));
@@ -291,6 +294,7 @@ export function buildPark(): ParkData {
     // side walls following the profile (exact collision outline + ruled visual grid with grime)
     const t = B.clone().sub(A).normalize();
     for (const [E, sgn] of [[A, -1], [B, 1]] as [Vector3, number][]) {
+      if ((open === 'A' && E === A) || (open === 'B' && E === B)) continue;
       const outline: Vector3[] = [];
       for (let j = nv; j >= 0; j--) { const q = prof.pts[j]; outline.push(E.clone().addScaledVector(m, q.d).setY(topY + q.y)); }
       outline.push(E.clone().add(back).setY(topY));
@@ -418,17 +422,45 @@ export function buildPark(): ParkData {
   }
 
   // ------------------------------------------------------------------ north quarter pipe + bank sharing a deck (backs onto the boardwalk)
-  qp('north quarter', -12, -20.3, -3, -20.3, 0, 1, 0, 1.2, 1.8, 1.5);
+  qp('north quarter', -12, -20.3, -3, -20.3, 0, 1, 0, 1.2, 1.8, 1.5, 0, 'B', 48);
+  // (the hip below must use this quarter pipe's height, radius and profile segments: its first column is the QP's edge)
   {
-    const x0 = -1.5, x1 = 6, zTop = -20.3, h = 1.2;
-    bank('north bank', V(x0, 0, zTop), V(x1, 0, zTop), V(0, 0, 1), h, 30, { cope: true });
-    // deck spanning the gap, its front face in the gap, back wall
-    b.quad('concrete', V(-3, h, zTop), V(x1, h, zTop), V(x1, h, -21.8), V(-3, h, -21.8), { color: C_PLAZA }, UP);
-    panel('wall', V(-3, 0, zTop), V(x0, 0, zTop), 0, h, V(0, 0, 1));
-    panel('wall', V(x1, 0, -21.8), V(-3, 0, -21.8), 0, h, V(0, 0, -1), C_WALL, { seams: 3 });
+    // the quarter pipe flows into the 30 deg bank through a moulded hip (x -3 .. 0): every row of the grid blends
+    // the transition profile into the bank line with a smoothstep across x, so both seams are tangent-continuous; the
+    // same triangles and normals are the collision surface. Wide and finely cut: a steeper twist faces the low sun at a
+    // grazing angle, where coarse triangles shade one by one
+    const xh = -3, x0 = 0, x1 = 6, zTop = -20.3, h = 1.2, Rq = 1.8;
+    const prof = transitionProfile(h, Rq, 48), nv = prof.pts.length - 1, bmax = prof.topAngle;
+    const run = h / Math.tan((30 * Math.PI) / 180);
+    const cols: number[] = [];
+    for (let i = 0; i <= 30; i++) cols.push(xh + ((x0 - xh) * i) / 30);
+    for (let i = 1; i <= 4; i++) cols.push(x0 + ((x1 - x0) * i) / 4);
+    const wOf = (x: number) => { const t = Math.min(1, Math.max(0, (x - xh) / (x0 - xh))); return { w: t * t * (3 - 2 * t), dw: 6 * t * (1 - t) / (x0 - xh) }; };
+    const at = (u: number, v: number, o: Vector3, n?: Vector3) => {
+      const x = cols[Math.round(u * (cols.length - 1))], j = Math.round(v * nv), s = j / nv;
+      const q = prof.pts[j], { w, dw } = wOf(x);
+      const yB = -h * s, dB = run * s;
+      o.set(x, h + q.y + (yB - q.y) * w, zTop + q.d + (dB - q.d) * w);
+      if (n) {
+        // d/dx and d/ds of (y, d); normal = (dx * ys - yx * ds, ds, -ys)
+        const yx = (yB - q.y) * dw, dx = (dB - q.d) * dw;
+        const ys = -Rq * Math.sin(q.beta) * bmax * (1 - w) - h * w, ds = Rq * Math.cos(q.beta) * bmax * (1 - w) + run * w;
+        n.set(dx * ys - yx * ds, ds, -ys).normalize();
+      }
+      return o;
+    };
+    const ao = mul(C_RAMP, 0.6);
+    b.grid('concrete', cols.length - 1, nv, (u, v, o) => at(u, v, o), (u, v, o) => { at(u, v, new Vector3(), o); }, { color: C_RAMP, vcolor: (p) => (p.y > h - 0.004 ? ao : C_RAMP) });
+    // the bank's far side wall
+    b.polygon('wall', [V(x1, 0, zTop + run), V(x1, h, zTop), V(x1, 0, zTop)], V(1, 0, 0), { vcolor: grime(C_WALL, 0, 0.8) });
+    // one coping from the quarter pipe over the hip to the end of the bank
+    coping(V(xh, h, zTop), V(x1, h, zTop), V(0, 0, 1));
+    const qline = grind.find((l) => l.name === 'north quarter coping')!;
+    qline.pts[1].setX(x1);
+    // deck behind the hip and the bank, back wall
+    b.quad('concrete', V(xh, h, zTop), V(x1, h, zTop), V(x1, h, -21.8), V(xh, h, -21.8), { color: C_PLAZA }, UP);
+    panel('wall', V(x1, 0, -21.8), V(xh, 0, -21.8), 0, h, V(0, 0, -1), C_WALL, { seams: 3 });
     panel('wall', V(x1, 0, zTop), V(x1, 0, -21.8), 0, h, V(1, 0, 0));
-    grind.push({ name: 'north deck ledge', kind: 'ledge', pts: [V(-3, h, zTop), V(x0, h, zTop)], closed: false, inward: [V(0, 0, 1), V(0, 0, 1)], metal: true });
-    wax(V(-3, h, zTop), V(x0, h, zTop), V(0, 0, -1), V(0, 0, 1), C_WALL);
     tag(V(-8.6, 0.62, -21.8), V(0, 0, -1), 1.4, 0.75, 4, 0.05);
     tag(V(2.4, 0.6, -21.8), V(0, 0, -1), 1.2, 0.68, 7, -0.03, 0.75);
   }
@@ -599,17 +631,25 @@ export function buildPark(): ParkData {
   }
   {
     // patchwork kiosk: beach snack kiosk; its park-facing wall carries the patchwork mural
-    const x0 = 19.5, x1 = 30.5, z0 = 24.9, z1 = 29.3, h = 3.2;
+    const { x0, x1, z0, z1, h, win } = KIOSK;
     panel('wall', V(x0, 0, z0), V(x1, 0, z0), 0, h, V(0, 0, -1), C_WALL, { grime: 0.7 });
     panel('wall', V(x0, 0, z1), V(x0, 0, z0), 0, h, V(-1, 0, 0), C_KIOSK, { grime: 0.8, seams: 2.2 });
     panel('wall', V(x1, 0, z0), V(x1, 0, z1), 0, h, V(1, 0, 0), C_KIOSK, { grime: 0.8, seams: 2.2 });
-    panel('wall', V(x1, 0, z1), V(x0, 0, z1), 0, h, V(0, 0, 1), C_KIOSK, { grime: 0.8, seams: 3.7 });
+    // town side: the wall around the service window (the shallow lit shop inside is built with the scenery)
+    const ko = { grime: 0.8, seams: 3.7, collide: false, ground: 0 };
+    panel('wall', V(x1, 0, z1), V(win.x1, 0, z1), 0, h, V(0, 0, 1), C_KIOSK, ko);
+    panel('wall', V(win.x0, 0, z1), V(x0, 0, z1), 0, h, V(0, 0, 1), C_KIOSK, ko);
+    panel('wall', V(win.x1, 0, z1), V(win.x0, 0, z1), 0, win.y0, V(0, 0, 1), C_KIOSK, ko);
+    panel('wall', V(win.x1, 0, z1), V(win.x0, 0, z1), win.y1, h, V(0, 0, 1), C_KIOSK, ko);
+    b.quad(null, V(x1, 0, z1), V(x0, 0, z1), V(x0, h, z1), V(x1, h, z1), { visual: false }, V(0, 0, 1));
+    // window reveal: the wall has a thickness at the opening
+    for (const x of [win.x0 - 0.08, win.x1]) prop(boxGeo(x, win.y0 - 0.02, z1 - 0.14, x + 0.08, win.y1, z1 + 0.025, hex('#f4efe6')));
     murals.push({ key: 'mural_patchwork', center: V(25, h / 2 + 0.05, z0 - 0.012), normal: V(0, 0, -1), w: 10 - 0.3, h: h - 0.35, tex: 'mural_patchwork' });
     roofSlab(x0 - 0.35, z0 - 0.35, x1 + 0.35, z1 + 0.8, h, 0.24, hex('#e05a47'));
     plinth(x0, z0, x1, z1);
-    // serving hatch, counter, striped awning, stools on the town side
-    prop(boxGeo(22.5, 1.0, z1 - 0.02, 27.5, 2.15, z1 + 0.03, hex('#2c3440'))); prop(boxGeo(22.35, 0.9, z1, 27.65, 0.98, z1 + 0.38, hex('#f4efe6')));
-    prop(boxGeo(22.35, 2.15, z1, 27.65, 2.25, z1 + 0.05, hex('#f4efe6')));
+    // counter, window head, striped awning, stools on the town side
+    prop(boxGeo(22.35, 0.9, z1, 27.65, 0.98, z1 + 0.38, hex('#f4efe6')));
+    prop(boxGeo(22.35, 2.15, z1 - 0.14, 27.65, 2.25, z1 + 0.05, hex('#f4efe6')));
     for (let k = 0; k < 7; k++) {
       const x = 22.25 + k * 0.92;
       det.sails.push({ c: [V(x, 2.62, z1 + 0.02), V(x + 0.92, 2.62, z1 + 0.02), V(x + 0.92, 2.2, z1 + 1.15), V(x, 2.2, z1 + 1.15)], color: k % 2 ? hex('#fbf3e4') : hex('#2f8f86'), sag: 0.02 });

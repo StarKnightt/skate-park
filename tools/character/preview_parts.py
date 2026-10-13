@@ -43,15 +43,16 @@ def hex_rgb(h):
     return np.array([int(h[i:i + 2], 16) for i in (0, 2, 4)], float)
 
 
-def render(parts_dir, view, out):
-    yaw, pitch, c, hh, w, h = VIEWS[view]
+def render(parts_dir, view, out, light=None):
+    yaw, pitch, c, hh, w, h = VIEWS[view][:6]
     meta = json.load(open(os.path.join(parts_dir, "parts.json")))
     a, b = np.radians(yaw), np.radians(pitch)
     # camera basis: forward looks at -Z of the character when yaw = 0 (camera in front, character faces +Z)
     fwd = np.array([-np.sin(a) * np.cos(b), -np.sin(b), -np.cos(a) * np.cos(b)])
     right = np.cross(fwd, [0, 1, 0]); right /= np.linalg.norm(right)
     up = np.cross(right, fwd)
-    light = np.array([0.45, 0.75, 0.55]); light /= np.linalg.norm(light)
+    light = np.array(light if light is not None else (VIEWS[view][6] if len(VIEWS[view]) > 6 else [0.45, 0.75, 0.55]), float)
+    light /= np.linalg.norm(light)
     ss = 2
     W, H = w * ss, h * ss
     scale = H / (2 * hh)

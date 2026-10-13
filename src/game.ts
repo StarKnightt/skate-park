@@ -13,6 +13,7 @@ import { loadSharedTextures, shared, toonMaterial, LAMP } from './render/materia
 import { Sky, CloudLayer, Ocean, glowPoints } from './render/environment';
 import { TimeOfDay, PRESETS, EnvState } from './render/timeOfDay';
 import { Post } from './render/post';
+import { HeroShadow } from './render/heroShadow';
 import { SkatePhysics, SkateInput, emptyInput } from './player/physics';
 import { BoardView } from './player/board';
 import { Skater } from './player/skater';
@@ -54,6 +55,8 @@ export class Game {
   lampSpot = new SpotLight(0xffffff, 0, LAMP.range, LAMP.angle, LAMP.penumbra, 2);
   lampIdx = -1;
   lampGlow!: ReturnType<typeof glowPoints>;
+  /** the skater's own sharp sun shadow map (he is left out of the sun cascades while it is on) */
+  hero = new HeroShadow();
   spawn = { pos: new Vector3(), heading: 0 };
   landmarks: Record<string, { pos: Vector3; look: Vector3 }> = {};
   acc = 0;
@@ -195,6 +198,8 @@ export class Game {
     // ---------------- post
     const msaa = this.quality >= 2 ? 4 : 0;
     this.post = new Post(this.renderer, this.scene, this.camera, msaa);
+    this.hero.attach(this.skater.root, this.board.root, [this.sun.shadow.getCamera(0), this.sun.shadow.getCamera(1)], [this.sun, this.hemi, this.lampSpot]);
+    this.hero.setSize(this.quality >= 2 ? 1024 : this.quality === 1 ? 512 : 0, this.renderer);
     const tName = params.get('time');
     this.tod.set(tName ? Math.max(0, this.tod.byName(tName)) : 0, true);
     this.applyEnv(this.tod.cur);
@@ -242,6 +247,7 @@ export class Game {
     this.sun.position.copy(e.lightDir).multiplyScalar(100);
     this.sun.shadow.intensity = e.shadowIntensity;
     this.sun.shadow.radius = e.shadowRadius;
+    this.hero.k = e.shadowRadius * 0.0055;
     this.hemi.color.copy(e.hemiSky); this.hemi.groundColor.copy(e.hemiGround); this.hemi.intensity = e.hemiIntensity;
     // toon materials light themselves from these (sun-aware sky ambient + backlight rim)
     shared.uSunDir.value.copy(e.lightDir).normalize();
@@ -309,7 +315,8 @@ export class Game {
       return;
     }
     const q = ph.mode === 'air' ? ph.boardQ.clone() : ph.basisQuat(ph.fwd, ph.up);
-    if (snap) this.boardSmoothQ.copy(q); else this.boardSmoothQ.slerp(q, 1 - Math.exp(-28 * dt));
+    // the drop-in pivot is a fast, exact rotation about the trailing wheels on the coping: no smoothing lag
+    if (snap || ph.dropin) this.boardSmoothQ.copy(q); else this.boardSmoothQ.slerp(q, 1 - Math.exp(-28 * dt));
     // catching a rail from a little below snaps the physics onto it: ease that jump out over a few frames
     if (snap) this.boardVisOff.set(0, 0, 0);
     else if (this.prevMode === 'air' && ph.mode === 'grind') {
@@ -357,6 +364,7 @@ export class Game {
         case 'bail': this.audio.grind(false); this.audio.thud(); this.rig.shake = 0.8; break;
         case 'boardClack': this.audio.clack(e.v); break;
         case 'bonk': this.audio.clack(2); this.rig.shake = Math.max(this.rig.shake, 0.3); break;
+        case 'dropIn': this.audio.land(0.25); break;
       }
     }
   }
@@ -412,6 +420,7 @@ export class Game {
   }
 
   render(dt: number) {
+    this.hero.update(this.renderer, this.scene, this.skater.hipsWorld(new Vector3()), this.board.root);
     this.post.render(dt);
   }
 
@@ -445,6 +454,7 @@ export class Game {
     this.resize();
     this.post.bloom.intensity = this.quality >= 1 ? this.tod.cur.bloom : 0;
     this.sun.shadow.camera.far = this.quality >= 2 ? 95 : this.quality === 1 ? 60 : 40;
+    this.hero.setSize(this.quality >= 2 ? 1024 : this.quality === 1 ? 512 : 0, this.renderer);
     if (this.quality === 0) { this.lampSpot.shadow.autoUpdate = false; this.lampSpot.shadow.needsUpdate = false; }
     void MathUtils;
   }

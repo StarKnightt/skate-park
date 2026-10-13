@@ -38,18 +38,45 @@ const TRUCK = 0.18;
 export const KICKTURN_T = 0.44;
 /** Ollie pop speed: a quick tap pops ~1.85 m/s (0.38 s of air), a full crouch (>= 0.3 s) ~2.8 m/s (0.57 s). */
 const POP_MIN = 1.85, POP_MAX = 2.8;
-const FLIPS: Record<FlipDir, { kind: FlipKind; dur: number; name: string; pts: number }> = {
-  left: { kind: 'kickflip', dur: 0.2, name: 'Kickflip', pts: 250 },
-  right: { kind: 'heelflip', dur: 0.2, name: 'Heelflip', pts: 250 },
-  down: { kind: 'shuvit', dur: 0.19, name: 'Pop Shove-It', pts: 200 },
-  up: { kind: 'treflip', dur: 0.25, name: 'Tre Flip', pts: 500 },
+/**
+ * dur..durMax: board rotation time (stretched to the air time), flick: pop -> start of the rotation.
+ * Real flips (kickflip_pop_24fps #04-#12): the front foot flicks ~0.08 s after the pop and the board is caught ~0.15-0.2 s
+ * before touchdown, so the legs are split around the peak while the board turns between them.
+ */
+const FLIPS: Record<FlipDir, { kind: FlipKind; dur: number; durMax: number; flick: number; name: string; pts: number }> = {
+  left: { kind: 'kickflip', dur: 0.2, durMax: 0.3, flick: 0.075, name: 'Kickflip', pts: 250 },
+  right: { kind: 'heelflip', dur: 0.2, durMax: 0.3, flick: 0.075, name: 'Heelflip', pts: 250 },
+  down: { kind: 'shuvit', dur: 0.19, durMax: 0.3, flick: 0.03, name: 'Pop Shove-It', pts: 200 },
+  up: { kind: 'treflip', dur: 0.25, durMax: 0.34, flick: 0.07, name: 'Tre Flip', pts: 500 },
 };
+const CATCH_LEAD = 0.17; // catch -> touchdown (s)
 /** Body collision spheres along the board normal (height, radius); the top one covers head and shoulders. */
 const BODY: [number, number][] = [[0.45, 0.25], [0.95, 0.26], [1.3, 0.29], [1.58, 0.31]];
 
 const _v = new Vector3(), _v2 = new Vector3(), _v3 = new Vector3(), _v4 = new Vector3(), _q = new Quaternion(), _m = new Matrix4();
 
 export interface FlipState { kind: FlipKind; name: string; pts: number; t: number; dur: number; delay: number; done: boolean }
+
+/**
+ * Drop-in: rolling off a deck over a coping into a steep transition. The board rolls on until the trailing truck sits on
+ * the coping (nose over the transition), stalls for a beat, then pivots nose-down about the trailing wheels until the
+ * leading wheels meet the wall just under the coping, and rides on down the wall. Mode stays 'ride' throughout (no air).
+ */
+export interface DropIn {
+  phase: 'roll' | 'stall' | 'pivot';
+  t: number; // time in the current phase (s)
+  pk: number; // pivot progress 0..1
+  start: Vector3; // board centre when the drop-in began
+  dist: number; // roll distance until the trailing wheels reach the coping (m)
+  pivot: Vector3; // trailing wheels on the coping lip
+  dir: Vector3; // horizontal direction into the transition
+  lead: number; // +1 nose first, -1 tail first
+  ang: number; // board pitch, leading end down (rad)
+  ang1: number; // pitch at which the leading wheels meet the wall
+  tRoll: number; tStall: number; tPivot: number;
+  speed: number; // approach speed (m/s)
+}
+const DROP_STALL_UP = -0.06; // leading end lifts a little while the tail sits on the coping
 
 // ------------------------------------------------------------------------------------------ bail board rigid body
 const BM = 2.4; // complete board (kg)
@@ -255,6 +282,8 @@ export class SkatePhysics {
   kickturn = { t: -1, dir: 1 };
   wobble = 0; // seconds of landing wobble remaining
   wobbleDur = 0.9;
+  dropin: DropIn | null = null;
+  dropinEndT = -10; // sim time the last drop-in handed over to riding down the wall
   bonk = 0;
   landImpulse = 0; // for absorb animation
   brakeAmt = 0;
@@ -297,7 +326,7 @@ export class SkatePhysics {
     this.vel.set(0, 0, 0);
     this.up.set(0, 1, 0);
     this.fwd.set(Math.sin(heading), 0, Math.cos(heading));
-    this.flip = null; this.grind = null; this.bail = null; this.vert = null;
+    this.flip = null; this.grind = null; this.bail = null; this.vert = null; this.dropin = null; this.dropinEndT = -10;
     this.manual.active = false; this.kickturn.t = -1; this.wobble = 0; this.pushT = -1; this.crouchTime = 0;
     this.popT = -1; this.landT = -10; this.fakie = false;
     const h = this.world.raycast(_v.copy(p).addScaledVector(Y, 1.5), _v2.set(0, -1, 0), 4);
@@ -345,6 +374,7 @@ export class SkatePhysics {
   }
 
   private rideStep(dt: number, inp: SkateInput) {
+    if (this.dropin || this.tryDropIn(dt)) { this.dropinStep(dt); return; }
     const sp = this.vel.length();
     const hit = this.probe(this.pos, this.up, 0.1 + sp * dt * 2.5);
     if (!hit) { this.toAir(false); return; }
@@ -445,7 +475,7 @@ export class SkatePhysics {
         this.pos.copy(pivot).addScaledVector(this.fwd, TRUCK);
       }
       if (this.kickturn.t >= KICKTURN_T) { this.kickturn.t = -1; this.emit('kickturn'); }
-    } else if (this.up.y < 0.8 && this.up.y > 0.05 && s < 0.55 && !this.fakie) {
+    } else if (this.up.y < 0.8 && this.up.y > -0.05 && s < 0.55 && !this.fakie) {
       // riding forward up a transition and running out of speed: pivot on the tail to face downhill
       const uphill = _v.set(0, 1, 0).addScaledVector(this.up, -this.up.y).normalize();
       if (this.fwd.dot(uphill) > 0.6 && this.vel.dot(uphill) > -0.15 && !this.manual.active) {
@@ -487,6 +517,117 @@ export class SkatePhysics {
 
   private startWobble(d: number) { this.wobble = d; this.wobbleDur = d; }
 
+  // ---------------------------------------------------------------------------------------- drop-in
+  /** rolling off a flat deck over a coping whose transition is steep: drop in instead of flying off the lip */
+  private tryDropIn(dt: number) {
+    if (this.up.y < 0.9 || this.kickturn.t >= 0) return false;
+    const s = this.vel.length();
+    if (s < 0.3) return false;
+    const dir = _v.copy(this.vel).setY(0);
+    if (dir.lengthSq() < 0.04) return false;
+    dir.normalize();
+    const p = this.pos;
+    const reach = Math.max(0.03, s * dt * 1.5);
+    let found = false, bx = 0, by = 0, bz = 0, bsd = 0;
+    const inw = _v2;
+    for (const line of this.world.grindLines) {
+      if (line.kind !== 'coping' || !line.inward) continue;
+      const n = line.pts.length, segs = line.closed ? n : n - 1;
+      for (let i = 0; i < segs; i++) {
+        const a = line.pts[i], c = line.pts[(i + 1) % n];
+        const abx = c.x - a.x, abz = c.z - a.z, l2 = abx * abx + abz * abz;
+        if (l2 < 1e-8) continue;
+        const u = clamp(((p.x - a.x) * abx + (p.z - a.z) * abz) / l2, 0, 1);
+        const cx = a.x + abx * u, cz = a.z + abz * u, cy = a.y + (c.y - a.y) * u;
+        const dy = p.y - cy;
+        if (dy < -0.12 || dy > 0.1) continue;
+        const ia = line.inward[Math.min(i, line.inward.length - 1)], ic = line.inward[Math.min((i + 1) % n, line.inward.length - 1)];
+        const ix = ia.x + (ic.x - ia.x) * u, iz = ia.z + (ic.z - ia.z) * u, il = Math.hypot(ix, iz);
+        if (il < 1e-4) continue;
+        const nx = ix / il, nz = iz / il, ox = p.x - cx, oz = p.z - cz;
+        const sd = ox * nx + oz * nz; // signed distance past the coping line, into the transition
+        if (sd < -reach || sd > 0.12) continue;
+        if ((u === 0 || u === 1) && Math.abs(ox * nz - oz * nx) > 0.05) continue; // beside the end of an open coping
+        if (dir.x * nx + dir.z * nz < 0.4) continue; // rolling along the coping or away from it
+        if (!found || Math.abs(sd) < Math.abs(bsd)) { found = true; bx = cx; by = cy; bz = cz; bsd = sd; inw.set(nx, 0, nz); }
+      }
+    }
+    if (!found) return false;
+    // only steep transitions (bowls, half pipe, quarter pipes); banks just roll over their coping. The wall angle where
+    // the board's centre will meet it (~0.17 m under the coping) is the angle the board pivots to.
+    const h = this.world.raycast(_v3.set(bx, by - 0.17, bz).addScaledVector(inw, 0.9), _v4.copy(inw).negate(), 1.3);
+    if (!h || h.normal.y > 0.64 || h.normal.dot(inw) < 0.3) return false;
+    const along = dir.dot(inw);
+    const lead = this.vel.dot(this.fwd) >= 0 ? 1 : -1;
+    // the centre rolls on until the trailing wheels sit just over the coping lip
+    const dist = Math.max(0, (0.012 - bsd) / along + TRUCK);
+    const start = p.clone();
+    const pivot = start.clone().addScaledVector(dir, dist - TRUCK);
+    pivot.y = Math.max(p.y + 0.004, by - 0.004);
+    this.dropin = {
+      phase: 'roll', t: 0, pk: 0, start, dist, pivot, dir: dir.clone(), lead, ang: 0,
+      ang1: clamp(Math.acos(clamp(h.normal.y, -1, 1)), 0.9, 1.5),
+      tRoll: dist / Math.max(s, 1.2), tStall: clamp(0.24 - 0.02 * s, 0.12, 0.2), tPivot: clamp(0.27 - 0.014 * s, 0.17, 0.25),
+      speed: s,
+    };
+    this.endManual(); this.pushT = -1; this.brakeAmt = 0;
+    this.emit('dropInStart', { speed: +s.toFixed(2), wall: Math.round((this.dropin.ang1 * 180) / Math.PI) });
+    return true;
+  }
+
+  /** kinematic drop-in: roll the trailing truck onto the coping, stall, pivot nose-down about the trailing wheels */
+  private dropinStep(dt: number) {
+    const d = this.dropin!;
+    d.t += dt;
+    const prev = _v4.copy(this.pos);
+    if (d.phase === 'roll') {
+      const k = Math.min(1, d.t / Math.max(d.tRoll, 1e-3));
+      this.pos.copy(d.start).addScaledVector(d.dir, d.dist * k);
+      this.pos.y = d.start.y + (d.pivot.y - d.start.y) * k;
+      this.up.set(0, 1, 0);
+      this.fwd.copy(d.dir).multiplyScalar(d.lead);
+      if (k >= 1) { d.phase = 'stall'; d.t = 0; }
+    } else {
+      if (d.phase === 'stall') {
+        const k = Math.min(1, d.t / d.tStall);
+        d.ang = DROP_STALL_UP * k * k * (3 - 2 * k);
+        if (k >= 1) { d.phase = 'pivot'; d.t = 0; }
+      } else {
+        const k = Math.min(1, d.t / d.tPivot);
+        d.pk = k;
+        // tips over like a fall: slow at first, still turning when the leading wheels meet the wall
+        d.ang = DROP_STALL_UP + (d.ang1 - DROP_STALL_UP) * k * k * (2.2 - 1.2 * k);
+      }
+      const ca = Math.cos(d.ang), sa = Math.sin(d.ang);
+      const tdir = _v.copy(d.dir).multiplyScalar(ca).addScaledVector(Y, -sa);
+      this.up.copy(Y).multiplyScalar(ca).addScaledVector(d.dir, sa);
+      this.fwd.copy(tdir).multiplyScalar(d.lead);
+      this.pos.copy(d.pivot).addScaledVector(tdir, TRUCK);
+      if (d.phase === 'pivot' && d.pk >= 1) { this.finishDropIn(); return; }
+    }
+    this.vel.subVectors(this.pos, prev).divideScalar(dt);
+  }
+
+  /** the leading wheels are on the wall: ride on down it */
+  private finishDropIn() {
+    const d = this.dropin!;
+    const ca = Math.cos(d.ang1), sa = Math.sin(d.ang1);
+    const tdir = _v.copy(d.dir).multiplyScalar(ca).addScaledVector(Y, -sa);
+    const up = _v2.copy(Y).multiplyScalar(ca).addScaledVector(d.dir, sa);
+    const c = _v3.copy(d.pivot).addScaledVector(tdir, TRUCK);
+    const h = this.world.raycast(_v4.copy(c).addScaledVector(up, 0.35), up.clone().negate(), 0.75);
+    if (h && h.normal.dot(up) > 0.6) { this.pos.copy(h.point); this.up.copy(h.normal); } else { this.pos.copy(c); this.up.copy(up); }
+    tdir.addScaledVector(this.up, -tdir.dot(this.up)).normalize();
+    this.fwd.copy(tdir).multiplyScalar(d.lead);
+    const v0 = Math.max(2.0, d.speed * Math.cos(d.ang1)) + 0.4;
+    this.vel.copy(tdir).multiplyScalar(v0);
+    this.fakie = d.lead < 0;
+    this.lastGround = h;
+    this.dropin = null;
+    this.dropinEndT = this.time;
+    this.emit('dropIn', { speed: +v0.toFixed(2) });
+  }
+
   private endManual() {
     if (!this.manual.active) return;
     this.manual.active = false;
@@ -527,8 +668,8 @@ export class SkatePhysics {
   startFlip(d: FlipDir, airT: number, inAir: boolean) {
     const f = FLIPS[d];
     let dur = f.dur, delay = 0;
-    // the front foot flicks once it has slid up to the nose; the catch comes ~0.15 s before touchdown
-    if (!inAir) delay = clamp(airT - 0.15 - dur, 0.035, 0.2);
+    // popped from the ground: the front foot flicks right after the pop, the rotation fills the air time up to the catch
+    if (!inAir) { delay = f.flick; dur = clamp(airT - delay - CATCH_LEAD, f.dur, f.durMax); }
     else dur = Math.min(dur, Math.max(0.14, airT - 0.1));
     this.flip = { kind: f.kind, name: f.name, pts: f.pts, t: 0, dur, delay, done: false };
     this.emit('flip', { kind: f.kind, dur: +dur.toFixed(3), delay: +delay.toFixed(3) });
@@ -1001,7 +1142,7 @@ export class SkatePhysics {
     board.init(this.pos, bQ, bv, bw);
     this.bail = { kind, reason, t: 0, body: this.pos.clone(), bodyVel, heading, board };
     this.mode = 'bail';
-    this.flip = null; this.grind = null; this.vert = null; this.endManual(); this.kickturn.t = -1; this.pushT = -1;
+    this.flip = null; this.grind = null; this.vert = null; this.dropin = null; this.endManual(); this.kickturn.t = -1; this.pushT = -1;
     this.emit('bail', { kind, reason });
   }
 
@@ -1055,7 +1196,7 @@ export class SkatePhysics {
     if (this.fwd.lengthSq() < 1e-6) this.fwd.set(1, 0, 0);
     this.fwd.normalize();
     this.wobble = 0; this.fakie = false; this.crouchTime = 0; this.pushT = -1; this.kickturn.t = -1;
-    this.flip = null; this.popT = -1; this.landT = -10;
+    this.flip = null; this.popT = -1; this.landT = -10; this.dropin = null; this.dropinEndT = -10;
   }
 
   // ---------------------------------------------------------------------------------------- helpers

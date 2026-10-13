@@ -1,6 +1,8 @@
 // Camera / HUD checks (workstream cam). Default follow camera, no view override.
-// bash tools/heavy.sh cam node tools/capture/run.mjs tools/capture/cam_check.mjs --out E:/shots/skate-park/pass-02/dev/cam
-// ONLY=bowl,vert,wall,rail,stairs,flat,hud  TAG=<subfolder>  EVERY=<save every n-th frame>
+// bash tools/heavy.sh cam node tools/capture/run.mjs tools/capture/cam_check.mjs --out E:/shots/skate-park/pass-03/dev/cam
+// ONLY=bowl,carve,carve2,pocket,pocketdrop,vert,wall,rail,stairs,flat,hud  TAG=<subfolder>  EVERY=<save every n-th frame>
+// metrics.json per frame: box = figure height (head top / hands / toes / board ends) as a fraction of frame height,
+// len = head-to-board length on screen (frame heights), side = angle between the view ray and his body line
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -16,14 +18,28 @@ const plainCam = (c) => c.eval(() => {
 const metrics = (c) => c.eval(() => {
   const g = window.__skate.game, cam = g.camera, ph = g.physics;
   const Vector3 = ph.pos.constructor;
-  const head = g.skater.headWorld(new Vector3()).add(new Vector3(0, 0.16, 0));
-  const board = g.board.root.position.clone();
   const hips = g.skater.hipsWorld(new Vector3());
+  const headB = g.skater.headWorld(new Vector3());
+  // cap top: past the head bone along the body line (spine), not world up, so a skater lying on a wall measures right
+  const head = headB.clone().addScaledVector(headB.clone().sub(hips).normalize(), 0.2);
+  const board = g.board.root.position.clone();
   cam.updateMatrixWorld();
   const pr = (v) => { const p = v.clone().project(cam); return [+p.x.toFixed(3), +p.y.toFixed(3), +p.z.toFixed(3)]; };
   const ph_ = pr(head), pb = pr(board), pp = pr(hips);
   const dir = cam.getWorldDirection(new Vector3());
+  // figure height on screen: head top, hands, toes, hips, board ends (fraction of frame height)
+  const pts = [head, hips, board];
+  for (const n of ['LeftHand', 'RightHand', 'LeftToeBase', 'RightToeBase']) { const b = g.skater.b.get(n); if (b) pts.push(b.bone.getWorldPosition(new Vector3())); }
+  const bq = g.board.root.quaternion, bx = new Vector3(0, 0, 1).applyQuaternion(bq);
+  pts.push(board.clone().addScaledVector(bx, 0.4), board.clone().addScaledVector(bx, -0.4));
+  const ys = pts.map((v) => v.clone().project(cam).y);
+  const toCam = cam.position.clone().sub(hips).normalize();
+  const axis = head.clone().sub(board).normalize();
   return {
+    box: +((Math.max(...ys) - Math.min(...ys)) / 2).toFixed(3),
+    len: +(Math.hypot((ph_[0] - pb[0]) * cam.aspect, ph_[1] - pb[1]) / 2).toFixed(3),
+    side: +((Math.acos(Math.min(1, Math.abs(toCam.dot(axis)))) * 180) / Math.PI).toFixed(0),
+    camHead: +(cam.position.y - head.y).toFixed(2),
     t: +g.simTime.toFixed(2), mode: ph.mode, pos: ph.pos.toArray().map((v) => +v.toFixed(2)),
     cam: cam.position.toArray().map((v) => +v.toFixed(2)),
     lookPitchDeg: +(Math.asin(Math.max(-1, Math.min(1, dir.y))) * 57.3).toFixed(1),
@@ -60,9 +76,10 @@ async function run(c, name, frames, setup, perFrame, every = 3) {
   const ev = await c.api('events');
   fs.writeFileSync(path.join(dir, 'metrics.json'), JSON.stringify({ rows, events: ev }, null, 0));
   await c.api('release');
-  const sizes = rows.map((r) => r.size), hy = rows.map((r) => r.hipsY), by = rows.map((r) => r.boardY), lp = rows.map((r) => r.lookPitchDeg);
+  const col = (k) => rows.map((r) => r[k]);
   const st = (a) => `${Math.min(...a).toFixed(2)}..${Math.max(...a).toFixed(2)} avg ${(a.reduce((x, y) => x + y, 0) / a.length).toFixed(2)}`;
-  console.log(`${name}: size ${st(sizes)} | hipsY% ${st(hy)} | boardY% ${st(by)} | lookPitch ${st(lp)} | events ${ev.map((e) => e.t + ':' + e.type).join(' ')}`);
+  console.log(`${name}: box ${st(col('box'))} | len ${st(col('len'))} | side ${st(col('side'))} | size ${st(col('size'))} | camHead ${st(col('camHead'))} | hipsY% ${st(col('hipsY'))} | boardY% ${st(col('boardY'))} | lookPitch ${st(col('lookPitchDeg'))} | dist ${st(col('dist'))}`);
+  console.log(`   events ${ev.filter((e) => e.type !== 'boardClack').map((e) => e.t + ':' + e.type).join(' ')}`);
 }
 
 export default async function (c) {
@@ -79,6 +96,20 @@ export default async function (c) {
     await c.api('teleport', -28, -2.3, -2.0, 90, 7.5);
     await c.api('script', [{ at: 0.2, down: ['KeyA'] }, { at: 0.6, up: ['KeyA'] }, { at: 1.3, down: ['KeyD'] }, { at: 1.9, up: ['KeyD'] },
       { at: 2.6, down: ['KeyA'] }, { at: 3.4, up: ['KeyA'] }]);
+  }, null, 2);
+  // #67: long high carve along the main bowl's south wall (up the SE corner, west along the coping, up the west wall)
+  if (want('carve2')) await run(c, 'carve2', 240, async () => {
+    await c.api('teleport', -24, -2.3, -4.2, 90, 7.0);
+    await c.api('script', [{ at: 0.2, down: ['KeyA'] }, { at: 1.6, up: ['KeyA'] }]);
+  }, null, 2);
+  // #67: pocket bowl carve along its south wall, then across to the west wall
+  if (want('pocket')) await run(c, 'pocket', 210, async () => {
+    await c.api('teleport', -26, -1.4, 12.8, 90, 5.0);
+    await c.api('script', [{ at: 0.4, down: ['KeyA'] }, { at: 1.8, up: ['KeyA'] }]);
+  }, null, 2);
+  // drop-in from the east deck into the pocket bowl
+  if (want('pocketdrop')) await run(c, 'pocketdrop', 240, async () => {
+    await c.api('teleport', -12.5, 0, 15, -90, 5.0);
   }, null, 2);
   if (want('vert')) await run(c, 'vert', 330, async () => {
     await c.api('teleport', 22.5, 0, -9, 90, 9.6);

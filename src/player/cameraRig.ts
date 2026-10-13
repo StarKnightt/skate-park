@@ -22,15 +22,21 @@ const _a = new Vector3(), _b = new Vector3(), _c = new Vector3(), _d = new Vecto
 const _r = new Vector3(), _o = new Vector3(), _f = new Vector3();
 const lerpAngle = (a: number, b: number, t: number) => a + wrapAngle(b - a) * t;
 
-interface Bowl { poly: { x: number; z: number }[]; lipY: number }
+interface Bowl {
+  poly: { x: number; z: number }[]; lipY: number; floorY: number; cx: number; cz: number;
+  minX: number; maxX: number; minZ: number; maxZ: number;
+}
+interface BowlEdge { b: Bowl; d: number; nx: number; nz: number }
 interface Seg { a: Vector3; b: Vector3; ux: number; uz: number; lenH: number; inward: Vector3 | null }
 
 /**
  * Third person follow camera. Frames the skater at about a third of the frame height just below centre, from
- * behind at about head height above the floor he rides on. Context layers: sunken bowls keep the camera near lip
- * height, transitions and walls swing it out to the open side, back-and-forth riding (half pipe, bowl) goes side-on
- * instead of swinging 180 degrees, rails / ledges / stairs go low and side-on, blocked views search for a clear
- * direction before pulling in, and a frame guard keeps the board in frame.
+ * behind at about head height above the floor he rides on. Context layers: inside a sunken bowl the camera rides
+ * along at about his head height and follows carves from behind along the wall, never looking down his body line;
+ * dropping in from the deck goes side-on along the coping; transitions and walls swing it out to the open side,
+ * back-and-forth riding (half pipe, bowl) goes side-on instead of swinging 180 degrees, rails / ledges / stairs go
+ * low and side-on, blocked views search for a clear direction before pulling in, and a frame guard keeps the board
+ * in frame.
  */
 export class CameraRig {
   yaw = Math.PI; // camera position angle around the target (0 = camera on +Z side)
@@ -62,13 +68,25 @@ export class CameraRig {
   private bowls: Bowl[] = [];
   private segs: Seg[] = [];
   private pos = new Vector3();
+  private wBowl = 0; private bowlRef: Bowl | null = null; private carveW = 0; private dropT = -99;
+  private pendDl = 0; private pendPrev = 0;
   /** last frame's internals, for capture diagnostics */
-  info = { side: 0, pend: 0, swing: 0, avoid: 0, wantD: 0, d: 0, clear: 0, floor: 0, yT: 0, elev: 0, bowl: false };
+  info = { side: 0, pend: 0, swing: 0, avoid: 0, wantD: 0, d: 0, clear: 0, floor: 0, yT: 0, elev: 0, bowl: false, bw: 0, carve: 0, drop: 0, base: 0, goal: 0 };
 
   constructor(public cam: PerspectiveCamera, private world: CollisionWorld) {
     for (const l of world.grindLines) {
       if (l.kind === 'coping') {
-        if (l.closed) this.bowls.push({ poly: l.pts.map((p) => ({ x: p.x, z: p.z })), lipY: l.pts.reduce((s, p) => s + p.y, 0) / l.pts.length });
+        if (l.closed) {
+          const poly = l.pts.map((p) => ({ x: p.x, z: p.z }));
+          const lipY = l.pts.reduce((s, p) => s + p.y, 0) / l.pts.length;
+          const cx = poly.reduce((s, p) => s + p.x, 0) / poly.length, cz = poly.reduce((s, p) => s + p.z, 0) / poly.length;
+          const fh = this.ray(_a.set(cx, lipY + 0.5, cz), DOWN, 12);
+          this.bowls.push({
+            poly, lipY, floorY: fh ? fh.point.y : lipY - 2, cx, cz,
+            minX: Math.min(...poly.map((p) => p.x)), maxX: Math.max(...poly.map((p) => p.x)),
+            minZ: Math.min(...poly.map((p) => p.z)), maxZ: Math.max(...poly.map((p) => p.z)),
+          });
+        }
         continue;
       }
       for (let i = 0; i + 1 < l.pts.length; i++) {
@@ -113,9 +131,23 @@ export class CameraRig {
     const pinned = this.idleT < -1e6; // test API camYaw(): exact offsets from behind, no automatic swings
     const orbit = this.orbitMode;
 
-    // ---- heading follows horizontal travel; held on vert walls / when slow. Reversed travel (half pipe, fakie)
-    // turns slowly unless the side-on pendulum view owns the yaw.
-    if (hv > 1.2 && !down && steep < 0.6) {
+    // ---- bowl context: signed distance to the coping (+ inside), and carving (travel along a bowl wall)
+    const edge = this.bowlEdge(s.pos.x, s.pos.z, 4.5);
+    const inBowl = !!edge && edge.d > 0;
+    if (inBowl) this.bowlRef = edge.b;
+    const bowlWant = inBowl && !down && !grind ? 1 : 0; // coping grinds keep the deck framing
+    this.wBowl = snap ? bowlWant : damp(this.wBowl, bowlWant, bowlWant ? 3 : 1.5, dt);
+    let carve = 0;
+    const nh = Math.hypot(s.up.x, s.up.z);
+    if (inBowl && mode === 'ride' && hv > 1.5 && nh > 0.1) {
+      const tang = Math.abs(s.vel.x * s.up.z - s.vel.z * s.up.x) / (nh * hv);
+      carve = smoothstep(0.5, 0.8, tang) * smoothstep(0.1, 0.25, nh) * smoothstep(1.5, 3, hv);
+    }
+    this.carveW = snap ? carve : damp(this.carveW, carve, carve > this.carveW ? 6 : 2, dt);
+
+    // ---- heading follows horizontal travel; held on vert walls / when slow (except carving along a bowl wall).
+    // Reversed travel (half pipe, fakie) turns slowly unless the side-on pendulum view owns the yaw.
+    if (hv > 1.2 && !down && (steep < 0.6 || this.carveW > 0.5)) {
       const want = Math.atan2(s.vel.x, s.vel.z);
       const reversed = Math.abs(wrapAngle(want - this.heading)) > 1.9 && this.wPend < 0.98;
       this.heading = dampAngle(this.heading, want, reversed ? 0.35 : air ? 1.2 : 2.6, dt);
@@ -133,7 +165,9 @@ export class CameraRig {
     else if (hv > 1.0 && (mode === 'ride' || air)) {
       const dx = s.vel.x / hv, dz = s.vel.z / hv;
       if (this.travelOk && dx * this.travel.x + dz * this.travel.z < -0.5 && this.steepAcc > 0.1) {
-        if (this.wPend < 0.05) this.choosePendSide(focus, this.travel); else this.alignPendSide(this.travel);
+        // turning on a bowl wall (carve up into a stall): side-on means along that wall, whatever the travel was
+        const axis = inBowl && nh > 0.3 ? _e.set(s.up.x / nh, 0, s.up.z / nh) : this.travel;
+        if (this.wPend < 0.05) this.choosePendSide(focus, axis, inBowl); else this.alignPendSide(axis);
         this.pendLastT = this.time;
         this.pendTurn.copy(s.pos);
       }
@@ -143,10 +177,18 @@ export class CameraRig {
     if (mode === 'ride' && steep > 0.45 && s.vel.y > 1 && !pinned) {
       const nl = Math.hypot(s.up.x, s.up.z);
       if (nl > 0.2 && hv > 0.2 && (s.vel.x * s.up.x + s.vel.z * s.up.z) / (hv * nl) < -0.8) {
-        if (this.wPend < 0.05) this.choosePendSide(focus, _e.set(-s.up.x / nl, 0, -s.up.z / nl));
+        if (this.wPend < 0.05) this.choosePendSide(focus, _e.set(-s.up.x / nl, 0, -s.up.z / nl), inBowl);
         this.pendLastT = this.time; this.pendTurn.copy(s.pos);
       }
     }
+    // dropping into a bowl from the deck: side-on along the coping before he reaches it, so the board tipping over the
+    // coping and the wall under it stay in view and the camera follows him over the lip beside him, not from behind
+    const drop = pinned || down || orbit ? 0 : this.dropInAhead(s, hv, edge);
+    if (drop > 0.3 && edge) {
+      _e.set(edge.nx, 0, edge.nz);
+      if (this.wPend < 0.05) this.choosePendSide(focus, _e); else if (this.time - this.dropT > 0.5) this.alignPendSide(_e);
+      this.pendLastT = this.time; this.pendTurn.copy(s.pos); this.dropT = this.time;
+    } else if (!inBowl && this.pendLastT === this.dropT && this.time - this.dropT > 1) this.pendLastT -= 8; // turned away
     // side-on stays perpendicular to the current travel (carves, exits), on the side already chosen
     if (this.wPend > 0.01 && hv > 1.2 && !air) {
       let px = -s.vel.z / hv, pz = s.vel.x / hv;
@@ -159,7 +201,8 @@ export class CameraRig {
     // still crossing between the walls: moving along the pendulum axis, not far from the last turn
     const crossing = hv > 1.5 && Math.abs(s.vel.x * this.pendDir.z - s.vel.z * this.pendDir.x) > 0.85 * hv
       && Math.hypot(s.pos.x - this.pendTurn.x, s.pos.z - this.pendTurn.z) < 16;
-    const pendWant = !down && !pinned && (since < 3 || (since < 8 && (onRamp || crossing))) ? 1 : 0;
+    // carving round a bowl wall is not back-and-forth: a side-on view there would look down his body line
+    const pendWant = !down && !pinned && this.carveW < 0.4 && (since < 3 || (since < 8 && (onRamp || crossing))) ? 1 : 0;
     this.wPend = snap ? 0 : damp(this.wPend, pendWant, pendWant > this.wPend ? 2.6 : 1.1, dt);
 
     // ---- rails, ledges, stairs and drops: low and side-on so the steps and the rail slope read
@@ -181,8 +224,16 @@ export class CameraRig {
     let base = back;
     if (!pinned) {
       if (this.wSide > 1e-3) base = lerpAngle(base, back + this.sideSign * 1.05, this.wSide);
-      if (this.wPend > 1e-3) base = lerpAngle(base, Math.atan2(this.pendDir.x, this.pendDir.z), this.wPend);
+      if (this.wPend > 1e-3) {
+        // blend angle unwrapped while side-on is active, so it never flips halfway when side-on and behind end up
+        // opposite; starting from opposite, it goes round through the camera's side
+        const raw = wrapAngle(Math.atan2(this.pendDir.x, this.pendDir.z) - base);
+        if (this.pendPrev <= 1e-3) this.pendDl = Math.abs(raw) > 2.6 && wrapAngle(this.yaw - base) * raw < 0 ? raw - Math.sign(raw) * 2 * Math.PI : raw;
+        else this.pendDl += wrapAngle(raw - this.pendDl);
+        base += this.pendDl * this.wPend;
+      }
     }
+    this.pendPrev = pinned ? 0 : this.wPend;
 
     // ---- open side of transitions and walls: swing the camera out toward it
     const wantWall = _b.set(0, 0, 0);
@@ -196,6 +247,8 @@ export class CameraRig {
         if (inw) wantWall.set(inw.x, 0, inw.z).normalize().multiplyScalar(0.8);
       }
       this.wallBeside(focus, wantWall);
+      // inside a bowl the open side is its middle, where he leans to: swinging there films him head-on
+      if (this.wBowl > 0) wantWall.multiplyScalar(1 - this.wBowl);
     }
     if (snap) this.wall.copy(wantWall);
     else {
@@ -211,7 +264,7 @@ export class CameraRig {
       const g = 1 - smoothstep(1.9, 2.6, Math.abs(a));
       swing = clamp(a, -0.62, 0.62) * wl * g;
     }
-    const yawT = base + swing + this.userYaw;
+    let yawT = base + swing + this.userYaw;
 
     // ---- distance: keep the skater about a third of the frame height (a quarter in portrait)
     const sp = clamp(s.speed / 10, 0, 1);
@@ -241,16 +294,34 @@ export class CameraRig {
     else if (grind) floorT = this.groundBelow(s.pos, this.floorY);
     else if (air && s.predicted && s.predicted.normal.y > 0.9) floorT = Math.min(this.floorY, s.predicted.point.y);
     else if (down) floorT = Math.min(this.floorY, focus.y - 0.3);
-    this.floorY = snap ? s.pos.y : damp(this.floorY, floorT, floorT < this.floorY ? 3.5 : 2.2, dt);
+    this.floorY = snap ? s.pos.y : damp(this.floorY, floorT, floorT < this.floorY ? (this.wBowl > 0.5 ? 6 : 3.5) : 2.2, dt);
     const fl = this.floorY;
     let yT = fl + (portrait ? 1.9 : 1.72) + 0.45 * Math.max(0, s.pos.y - fl - 0.25);
-    const bowl = this.bowlAt(s.pos.x, s.pos.z);
-    // inside a sunken bowl: stay near lip height (horizon and bowl shape readable, never down on the floor)
+    const bowl = inBowl ? edge.b : null;
+    // bailing in a sunken bowl: stay near lip height (horizon and bowl shape readable, never down on the floor)
     if (bowl && fl < bowl.lipY - 0.3) yT = Math.max(yT, Math.min(bowl.lipY + 0.35, fl + 2.45));
+    const br = this.bowlRef;
+    if (this.wBowl > 1e-3 && br) {
+      // riding in a bowl: a little above his head, rising with him up the walls, never lower than a standing head
+      // height above the floor and not far above the lip unless he flies out of it
+      const headY = mode === 'ride' ? s.pos.y + 1.5 * s.up.y : focus.y + 0.65;
+      let yB = Math.max(Math.max(fl, br.floorY) + (portrait ? 1.95 : 1.8), headY + 0.3);
+      yB = Math.min(yB, br.lipY + 0.55 + 0.6 * Math.max(0, focus.y - br.lipY));
+      yT = lerp(yT, yB, this.wBowl);
+      // camera still out over the deck (dropping in, riding up near the lip): deck height, never skimming the deck
+      const ce = this.bowlEdge(this.pos.x, this.pos.z, 2);
+      if (ce && ce.b === br) yT = lerp(yT, Math.max(yT, br.lipY + 1.1), smoothstep(0.6, -0.3, ce.d) * this.wBowl);
+    }
     if (this.wSide > 0) yT = lerp(yT, Math.max(fl + 1.0, s.pos.y + 0.5), this.wSide * 0.9);
-    this.camY = snap ? yT : damp(this.camY, yT, yT > this.camY ? 2.6 : 3.2, dt);
+    const prevY = this.camY;
+    this.camY = snap ? yT : damp(this.camY, yT, yT > this.camY ? 2.6 : this.wBowl > 0.5 ? 4 : 3.2, dt);
+    // follows him down into a bowl, never plunging
+    if (!snap && this.wBowl > 0.5) this.camY = Math.max(this.camY, prevY - 3.2 * dt);
     let elev = Math.asin(clamp((this.camY - L.y) / D, -0.95, 0.95));
     elev = orbit ? 0.2 + this.userPitch : clamp(elev + this.userPitch, -0.32, 0.55); // never top-down
+    if (this.wBowl > 0.01 && mode === 'ride' && !pinned && !orbit) {
+      yawT = this.bodySideOn(yawT, elev, s.up, this.wBowl * (1 - smoothstep(0.15, 0.5, Math.abs(this.userYaw))));
+    }
 
     // ---- clearance: if walls / ramps block the view, swing to a clear direction before pulling in
     const want = yawT + this.avoid;
@@ -269,7 +340,13 @@ export class CameraRig {
     // escape an obstruction quickly, ease back behind the skater slowly
     this.avoid = snap ? avoidT : damp(this.avoid, avoidT, Math.abs(avoidT) < Math.abs(this.avoid) ? 1.5 : 4, dt);
     const yawGoal = yawT + this.avoid;
+    const yaw0 = this.yaw;
     this.yaw = snap ? yawGoal : dampAngle(this.yaw, yawGoal, 5, dt);
+    if (!snap && this.wBowl > 0.01) {
+      // in a bowl, coming round from ahead of him after a stall is a steady swing, not a whip
+      const mx = lerp(40, 2.4, this.wBowl) * dt, dy = wrapAngle(this.yaw - yaw0);
+      if (Math.abs(dy) > mx) this.yaw = yaw0 + Math.sign(dy) * mx;
+    }
 
     const ce = Math.cos(elev), se = Math.sin(elev);
     const dir = _c.set(Math.sin(this.yaw) * ce, se, Math.cos(this.yaw) * ce);
@@ -282,6 +359,7 @@ export class CameraRig {
     const inf = this.info;
     inf.side = this.wSide; inf.pend = this.wPend; inf.swing = swing; inf.avoid = this.avoid; inf.wantD = D; inf.d = d;
     inf.clear = clear; inf.floor = fl; inf.yT = yT; inf.elev = elev; inf.bowl = !!bowl;
+    inf.bw = this.wBowl; inf.carve = this.carveW; inf.drop = drop; inf.base = base; inf.goal = yawGoal;
 
     // keep a margin from walls beside the camera
     const rx = Math.cos(this.yaw), rz = -Math.sin(this.yaw);
@@ -386,16 +464,77 @@ export class CameraRig {
     return h ? h.point.y : fallback;
   }
 
-  private bowlAt(x: number, z: number): Bowl | null {
-    for (const b of this.bowls) {
-      let inside = false;
-      const P = b.poly;
-      for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
-        if ((P[i].z > z) !== (P[j].z > z) && x < ((P[j].x - P[i].x) * (z - P[i].z)) / (P[j].z - P[i].z) + P[i].x) inside = !inside;
-      }
-      if (inside) return b;
+  private inPoly(P: { x: number; z: number }[], x: number, z: number) {
+    let inside = false;
+    for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+      if ((P[i].z > z) !== (P[j].z > z) && x < ((P[j].x - P[i].x) * (z - P[i].z)) / (P[j].z - P[i].z) + P[i].x) inside = !inside;
     }
+    return inside;
+  }
+
+  private bowlAt(x: number, z: number): Bowl | null {
+    for (const b of this.bowls) if (this.inPoly(b.poly, x, z)) return b;
     return null;
+  }
+
+  /** nearest bowl coping within maxOut outside it: signed distance (+ inside) and the inward normal there */
+  private bowlEdge(x: number, z: number, maxOut: number): BowlEdge | null {
+    let best: BowlEdge | null = null;
+    for (const b of this.bowls) {
+      if (x < b.minX - maxOut || x > b.maxX + maxOut || z < b.minZ - maxOut || z > b.maxZ + maxOut) continue;
+      const P = b.poly;
+      let md = 1e9, qx = 0, qz = 0, ex = 1, ez = 0;
+      for (let i = 0, j = P.length - 1; i < P.length; j = i++) {
+        const ax = P[j].x, az = P[j].z, sx = P[i].x - ax, sz = P[i].z - az;
+        const l2 = sx * sx + sz * sz;
+        const t = l2 > 0 ? clamp(((x - ax) * sx + (z - az) * sz) / l2, 0, 1) : 0;
+        const cx = ax + sx * t, cz = az + sz * t;
+        const dd = (x - cx) * (x - cx) + (z - cz) * (z - cz);
+        if (dd < md) { md = dd; qx = cx; qz = cz; ex = sx; ez = sz; }
+      }
+      const inside = this.inPoly(P, x, z), dist = Math.sqrt(md);
+      const d = inside ? dist : -dist;
+      if (d < -maxOut || (best && d < best.d)) continue;
+      let nx: number, nz: number;
+      if (dist > 1e-3) { nx = (x - qx) / dist; nz = (z - qz) / dist; if (!inside) { nx = -nx; nz = -nz; } }
+      else {
+        const l = Math.hypot(ex, ez) || 1;
+        nx = -ez / l; nz = ex / l;
+        if ((b.cx - x) * nx + (b.cz - z) * nz < 0) { nx = -nx; nz = -nz; }
+      }
+      best = { b, d, nx, nz };
+    }
+    return best;
+  }
+
+  /** 0..1: rolling on the deck toward a bowl's coping (under about a second away), or still high on its wall right
+   *  after coming in over it */
+  private dropInAhead(s: CamSubject, hv: number, e: BowlEdge | null) {
+    if (!e || hv < 0.8 || s.mode === 'grind') return 0;
+    const vin = s.vel.x * e.nx + s.vel.z * e.nz;
+    if (e.d <= 0) {
+      if (s.mode !== 'ride' || s.up.y < 0.9 || Math.abs(s.pos.y - e.b.lipY) > 0.35 || vin < 0.8 || vin < 0.6 * hv) return 0;
+      return 1 - smoothstep(0.5, 1.1, -e.d / vin);
+    }
+    if (this.time - this.dropT > 0.4) return 0;
+    return 1 - smoothstep(0.7, 1.5, e.b.lipY - s.pos.y);
+  }
+
+  /** yaw at least ~60 degrees off his body line (body axis n): on a steep bowl wall he leans toward the bowl's middle,
+   *  and a camera there looks down the length of his body */
+  private bodySideOn(yaw: number, elev: number, n: Vector3, w: number) {
+    const nh = Math.hypot(n.x, n.z);
+    if (nh < 0.2 || w < 1e-3) return yaw;
+    const K = (0.45 - n.y * Math.sin(elev)) / (nh * Math.cos(elev));
+    if (K >= 1) return yaw;
+    const min = Math.acos(Math.max(-1, K));
+    const phi = Math.atan2(n.x, n.z);
+    const d = wrapAngle(yaw - phi), c = wrapAngle(this.yaw - phi);
+    // a goal on the other side of his body line is reached around his back, never by sweeping across his front
+    const crosses = d * c < 0 && Math.abs(d) + Math.abs(c) < Math.PI;
+    if (Math.abs(d) >= min && !crosses) return yaw;
+    const sg = Math.abs(c) > 0.02 ? Math.sign(c) : Math.sign(d) || 1;
+    return phi + lerp(d, sg * min, w * smoothstep(0.2, 0.4, nh));
   }
 
   /** rail or ledge ahead along the travel direction (0..0.9), with the ledge's open side in `hint` */
@@ -450,11 +589,15 @@ export class CameraRig {
     return wrapAngle(this.yaw - back) >= 0 ? 1 : -1;
   }
 
-  private choosePendSide(focus: Vector3, axis: Vector3) {
+  /** side-on direction perpendicular to `axis`: the clearer side, else the one nearer the camera. keepSide (inside a
+   *  bowl): always the camera's side, since swapping sides on a wall sweeps across his front or through the wall */
+  private choosePendSide(focus: Vector3, axis: Vector3, keepSide = false) {
     const yA = Math.atan2(-axis.z, axis.x), yB = yA + Math.PI;
-    const a = this.clearance(focus, yA, 7), b = this.clearance(focus, yB, 7);
-    const pick = Math.abs(a - b) > 1.5 ? (a > b ? yA : yB)
-      : Math.abs(wrapAngle(yA - this.yaw)) <= Math.abs(wrapAngle(yB - this.yaw)) ? yA : yB;
+    let pick = Math.abs(wrapAngle(yA - this.yaw)) <= Math.abs(wrapAngle(yB - this.yaw)) ? yA : yB;
+    if (!keepSide) {
+      const a = this.clearance(focus, yA, 7), b = this.clearance(focus, yB, 7);
+      if (Math.abs(a - b) > 1.5) pick = a > b ? yA : yB;
+    }
     this.pendDir.set(Math.sin(pick), 0, Math.cos(pick));
   }
 

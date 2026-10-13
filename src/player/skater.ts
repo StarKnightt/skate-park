@@ -11,6 +11,7 @@ import { BoardView, deckTopY } from './board';
 const X = new Vector3(1, 0, 0), Y = new Vector3(0, 1, 0), Z = new Vector3(0, 0, 1);
 const ONE = new Vector3(1, 1, 1);
 const _v = new Vector3(), _v2 = new Vector3(), _v3 = new Vector3(), _q = new Quaternion(), _q2 = new Quaternion(), _m = new Matrix4();
+const _k1 = new Vector3(), _k2 = new Vector3(), _k3 = new Vector3(), _k4 = new Vector3(), _k5 = new Vector3(), _k6 = new Vector3();
 const BASE = import.meta.env.BASE_URL;
 
 const sm = (x: number) => { const t = clamp(x, 0, 1); return t * t * (3 - 2 * t); };
@@ -71,6 +72,7 @@ class Pose {
   curl = 1; // fingers: 1 relaxed curl, 0 open wide
   fA = new Vector3(); fF = new Vector3(0, 0, 1); fU = new Vector3(0, 1, 0); fP = new Vector3(0.45, 0.1, 1);
   bA = new Vector3(); bF = new Vector3(0, 0, 1); bU = new Vector3(0, 1, 0); bP = new Vector3(-0.15, 0.1, 1);
+  fK = 1; bK = 1; // knee over the toes (front / back leg): 1 = the knee is kept in the plane of the foot
 
   copy(o: Pose) {
     this.hipH = o.hipH; this.hipX = o.hipX; this.hipZ = o.hipZ;
@@ -78,7 +80,7 @@ class Pose {
     this.cYaw = o.cYaw; this.cPitch = o.cPitch; this.cRoll = o.cRoll;
     this.hYaw = o.hYaw; this.hPitch = o.hPitch; this.hRoll = o.hRoll;
     Object.assign(this.aL, o.aL); Object.assign(this.aR, o.aR);
-    this.curl = o.curl;
+    this.curl = o.curl; this.fK = o.fK; this.bK = o.bK;
     this.fA.copy(o.fA); this.fF.copy(o.fF); this.fU.copy(o.fU); this.fP.copy(o.fP);
     this.bA.copy(o.bA); this.bF.copy(o.bF); this.bU.copy(o.bU); this.bP.copy(o.bP);
     return this;
@@ -95,7 +97,7 @@ class Pose {
       this[s].raise = L(a[s].raise, b[s].raise); this[s].fwd = L(a[s].fwd, b[s].fwd);
       this[s].elbow = L(a[s].elbow, b[s].elbow); this[s].hang = L(a[s].hang, b[s].hang);
     }
-    this.curl = L(a.curl, b.curl);
+    this.curl = L(a.curl, b.curl); this.fK = L(a.fK, b.fK); this.bK = L(a.bK, b.bK);
     this.fA.lerpVectors(a.fA, b.fA, k); this.fF.lerpVectors(a.fF, b.fF, k).normalize();
     this.fU.lerpVectors(a.fU, b.fU, k).normalize(); this.fP.lerpVectors(a.fP, b.fP, k);
     this.bA.lerpVectors(a.bA, b.bA, k); this.bF.lerpVectors(a.bF, b.bF, k).normalize();
@@ -126,6 +128,8 @@ export class Skater {
   time = 0;
   onRecovered: ((pos: Vector3, fwd: Vector3) => void) | null = null;
   readonly stance = { front: 0.165, back: -0.205, tail: -0.31, nose: 0.29 };
+  /** scales the knee-over-toe constraint (1; tests set 0 to compare) */
+  kneeW = 1;
 
   // procedural pose state
   private P = new Pose();
@@ -139,6 +143,7 @@ export class Skater {
   private transS = new Spring(0, 5);
   private pumpS = new Spring(0, 6);
   private brakeS = new Spring(0, 9);
+  private dropS = new Spring(0, 9);
   private leanS = new Spring(0, 7);
   private lookS = new Spring(1, 6);
   private gazeS = new Spring(1.4, 7);
@@ -214,7 +219,7 @@ export class Skater {
           tm = toonMaterial({ map, bands: 0.45, wrap: 0.6, rim: 0.6, name: 'skinFace' });
           this.faceMat = tm;
         } else tm = toonMaterial({ vertexColors: true, bands: 0.85, wrap: 0.42, rim: 0.75, name: 'skaterVC' });
-        this.wrapCloth(tm, hasC1);
+        this.wrapCloth(tm, hasC1, !m.map);
         return tm;
       });
       sk.material = Array.isArray(sk.material) ? repl : repl[0];
@@ -265,14 +270,38 @@ export class Skater {
   }
 
   // ------------------------------------------------------------------------------------- materials
-  /** cloth: hems and sleeves flutter with speed and landings (COLOR_1.r), fold zones darken in a crouch (COLOR_1.g) */
-  private wrapCloth(m: MeshLambertMaterial, hasC1: boolean) {
+  /**
+   * cloth: hems and sleeves flutter with speed and landings (COLOR_1.r), fold zones darken in a crouch (COLOR_1.g).
+   * skin (vertex-coloured material): skin-coloured vertices (arms, hands, legs) shade like the painted face (softer bands,
+   * wider wrap, less rim) instead of the cloth's hard cel look, so hands don't read glossy and orange.
+   */
+  private wrapCloth(m: MeshLambertMaterial, hasC1: boolean, skin = false) {
     const prev = m.onBeforeCompile;
     const prevKey = m.customProgramCacheKey;
     const u = this.clothU;
     m.onBeforeCompile = (sh, r) => {
       prev.call(m, sh, r);
       Object.assign(sh.uniforms, u);
+      if (skin) {
+        // the face material: bands 0.45, wrap 0.6, rim 0.6 (skin vertex colour = the face's base skin, #e9b48f)
+        const patches: [string, string][] = [
+          ['return mix(w, b1 * 0.8 + b2, uBands);', 'return mix(w, b1 * 0.8 + b2, mix(uBands, 0.42, gSkinK));'],
+          ['float w = saturate( (d + uWrap) / (1.0 + uWrap) );', 'float wrapK = mix(uWrap, 0.6, gSkinK); float w = saturate( (d + wrapK) / (1.0 + wrapK) );'],
+          ['uRim * uRimStrength * gRimVis;', 'uRim * uRimStrength * gRimVis * (1.0 - 0.32 * gSkinK);'],
+        ];
+        let fs = sh.fragmentShader;
+        for (const [a, b] of patches) {
+          if (fs.includes(a)) fs = fs.replace(a, b);
+          else if (import.meta.env.DEV) console.warn('[skater] skin shading: toon shader text not found:', a);
+        }
+        sh.fragmentShader = fs.replace('#include <common>', `#include <common>
+          float gSkinK = 0.0;`).replace('#include <color_fragment>', `#include <color_fragment>
+          {
+            vec3 vc = vColor.rgb;
+            float gr = vc.g / max(vc.r, 1e-3), br = vc.b / max(vc.r, 1e-3);
+            gSkinK = (1.0 - smoothstep(0.07, 0.14, abs(gr - 0.56))) * (1.0 - smoothstep(0.09, 0.17, abs(br - 0.34))) * smoothstep(0.06, 0.16, vc.r);
+          }`);
+      }
       sh.vertexShader = sh.vertexShader
         .replace('#include <common>', `#include <common>
           uniform float uClothAmp; uniform float uClothT; uniform float uClothScale; uniform vec3 uClothWind;
@@ -294,7 +323,7 @@ export class Skater {
         .replace('#include <color_fragment>', `#include <color_fragment>
           diffuseColor.rgb *= 1.0 - clamp(vClothFold * uClothFold, 0.0, 1.0) * 0.32;`);
     };
-    m.customProgramCacheKey = () => prevKey.call(m) + (hasC1 ? '-cloth1' : '-cloth0');
+    m.customProgramCacheKey = () => prevKey.call(m) + (hasC1 ? '-cloth1' : '-cloth0') + (skin ? '-skin' : '');
   }
 
   /** expression textures share the GLB face UV layout; anything missing keeps the GLB face */
@@ -375,8 +404,12 @@ export class Skater {
     return this.rootSpaceQuat(bi.bone, out).multiply(_q.copy(bi.restRoot).invert());
   }
 
-  /** two-bone leg IK in root space; ankle target + knee pole + foot forward/up */
-  private legIK(side: 'Left' | 'Right', ankle: Vector3, pole: Vector3, footFwd: Vector3, footUp: Vector3) {
+  /**
+   * two-bone leg IK in root space; ankle target + knee pole + foot forward/up.
+   * overToe (0..1) moves the knee towards the vertical plane through the ankle along the foot (knee over the toes, never
+   * towards the other leg); `other` is the other ankle.
+   */
+  private legIK(side: 'Left' | 'Right', ankle: Vector3, pole: Vector3, footFwd: Vector3, footUp: Vector3, overToe = 0, other?: Vector3) {
     const up = this.b.get(side + 'UpLeg')!;
     const hip = this.rootSpacePos(up.bone, new Vector3());
     const { l1, l2 } = this.legLen;
@@ -389,6 +422,7 @@ export class Skater {
     const a = (l1 * l1 - l2 * l2 + d * d) / (2 * d);
     const h = Math.sqrt(Math.max(0, l1 * l1 - a * a));
     const po = pole.clone().addScaledVector(dir, -pole.dot(dir)).normalize();
+    if (overToe > 0.001 && other && h > 0.01) this.kneeOverToe(hip, dir, a, h, ankle, footFwd, other, po, overToe);
     const knee = hip.clone().addScaledVector(dir, a).addScaledVector(po, h);
     const target = hip.clone().add(toT);
     const restD1 = this.restDir(side + 'UpLeg', side + 'Leg');
@@ -404,6 +438,36 @@ export class Skater {
     const restF = this.restFootFwd(side);
     Skater.align(restF, Y, footFwd.clone().normalize(), footUp, _q);
     this.setRootRot(side + 'Foot', _q.clone());
+  }
+
+  /**
+   * The knee can sit anywhere on a circle around the hip-ankle line. Pick the point of that circle that lies just outside
+   * the vertical plane through the ankle along the foot (the side away from the other foot), nearest the given pole.
+   */
+  private kneeOverToe(hip: Vector3, dir: Vector3, a: number, h: number, ankle: Vector3, footFwd: Vector3, other: Vector3, po: Vector3, w: number) {
+    const f = _k1.set(footFwd.x, 0, footFwd.z);
+    if (f.lengthSq() < 1e-6) return;
+    f.normalize();
+    const n = _k2.set(-f.z, 0, f.x); // horizontal normal of the foot plane, pointing towards the other foot
+    if (n.dot(_k3.subVectors(other, ankle)) < 0) n.negate();
+    const e1 = _k3.copy(n).addScaledVector(dir, -n.dot(dir));
+    const alpha = e1.length();
+    if (alpha < 0.05) return; // leg lies across the plane: any knee direction is fine
+    e1.divideScalar(alpha);
+    const e2 = _k4.crossVectors(dir, e1);
+    // inward distance of the knee from the plane: g = (C - ankle).n + h * alpha * cos(phi); want g = -1.5 cm
+    const c0 = _k5.copy(hip).addScaledVector(dir, a).sub(ankle).dot(n);
+    const cphi = (-0.015 - c0) / (h * alpha);
+    if (cphi >= 1) return; // the knee can't get near the plane from the inside: keep the natural pole
+    const k = _k5;
+    if (cphi <= -1) k.copy(e1).negate();
+    else {
+      const sphi = Math.sqrt(1 - cphi * cphi);
+      const kA = _k6.copy(e1).multiplyScalar(cphi).addScaledVector(e2, sphi);
+      k.copy(e1).multiplyScalar(cphi).addScaledVector(e2, -sphi);
+      if (kA.dot(po) > k.dot(po)) k.copy(kA);
+    }
+    po.lerp(k, w).normalize();
   }
 
   private restDirs = new Map<string, Vector3>();
@@ -497,11 +561,11 @@ export class Skater {
     outF.copy(sh).addScaledVector(dir, d).sub(elbow).normalize();
   }
 
-  /** relaxed fingers curl; for balance they open and spread */
+  /** relaxed fingers curl; for balance they open and spread, still bent a little at every knuckle (more towards the pinky) */
   private applyFingers(curl: number) {
     for (const { bi, s, f, j } of this.fingers) {
       const relaxed = j === 1 ? 0.3 + f * 0.07 : j === 2 ? 0.55 + f * 0.05 : 0.42 + f * 0.04;
-      const opened = j === 2 ? 0.06 : 0.03;
+      const opened = j === 1 ? 0.12 + f * 0.05 : j === 2 ? 0.2 + f * 0.05 : 0.14 + f * 0.04;
       const c = lerp(opened, relaxed, curl);
       const q = bi.bone.quaternion.copy(bi.restLocal);
       if (j === 1) {
@@ -513,7 +577,7 @@ export class Skater {
     for (const { bi, s, j } of this.thumbs) {
       const q = bi.bone.quaternion.copy(bi.restLocal);
       if (j === 1) q.multiply(_q.setFromAxisAngle(bi.ax[1], s * lerp(-0.18, 0.25, curl)));
-      else q.multiply(_q.setFromAxisAngle(bi.ax[2], -s * lerp(0.0, 0.22, curl)));
+      else q.multiply(_q.setFromAxisAngle(bi.ax[2], -s * lerp(j === 2 ? 0.08 : 0.12, 0.22, curl)));
     }
   }
 
@@ -648,12 +712,12 @@ export class Skater {
     const push = this.pushS.update(ph.pushT >= 0 ? 1 : 0, dt);
     const man = this.manS.x;
     const gr = this.grindS.update(g ? 1 : 0, dt);
-    const stillNow = ph.mode === 'ride' && spd < 0.25 && ph.pushT < 0 && !ph.manual.active && ph.kickturn.t < 0 && ph.up.y > 0.95 && !this.inCrouch;
+    const stillNow = ph.mode === 'ride' && spd < 0.25 && ph.pushT < 0 && !ph.manual.active && ph.kickturn.t < 0 && ph.up.y > 0.95 && !this.inCrouch && !ph.dropin;
     this.idleT = stillNow ? this.idleT + dt : 0;
     const idle = this.idleS.update(this.idleT > 0.7 ? 1 : 0, dt);
     const trans = this.transS.update(onTrans ? 1 : 0, dt);
     const brake = this.brakeS.update(ph.brakeAmt, dt);
-    const leanT = ph.mode === 'ride' ? clamp(this.steer * spd * 0.068, -0.36, 0.36) * (1 - man * 0.5) : g ? g.balance * 0.35 : 0;
+    const leanT = ph.dropin ? 0 : ph.mode === 'ride' ? clamp(this.steer * spd * 0.068, -0.36, 0.36) * (1 - man * 0.5) : g ? g.balance * 0.35 : 0;
     const lean = this.leanS.update(leanT, dt);
     const look = this.lookS.update(ph.fakie ? -1 : 1, dt);
     const lookF = (look + 1) / 2;
@@ -674,6 +738,9 @@ export class Skater {
     const fOff = new Vector3(), bOff = new Vector3();
     let fPitch = 0, fRoll = 0, bPitch = 0;
     this.fPole.set(0.45, 0.1, 1);
+    // flips: absolute foot targets (root space) the feet leave the deck for, with their weights
+    let fSplit = 0, bSplit = 0;
+    const fAbs = new Vector3(), bAbs = new Vector3(), fPoleT = new Vector3(0.45, 0.1, 1);
 
     // ---- relaxed idle on the board: weight on the back leg, soft shoulders, fidgets
     if (idle > 0.001) {
@@ -709,15 +776,42 @@ export class Skater {
       const goingUp = uphill.lengthSq() > 1e-4 ? ph.vel.dot(uphill.normalize()) : 0;
       const steep = 1 - ph.up.y;
       const pumpT = !onTrans ? 0 : goingUp > 0.4 ? 0.05 : goingUp < -0.4 ? -0.15 * (1 - steep) - 0.02 : 0;
-      const pump = this.pumpS.update(pumpT, dt);
+      const pump = this.pumpS.update(pumpT * (1 - this.dropS.x), dt);
       P.hipH += pump; P.pPitch -= pump * 0.9;
       P.hipH += 0.016 * Math.sin(t * 2.6) * trans;
     }
     // the arms keep adjusting, more on transitions and at speed
-    const life = 0.1 + 0.16 * spdF + 0.42 * trans;
+    const life = (0.1 + 0.16 * spdF + 0.42 * trans) * (1 - 0.8 * this.dropS.x);
     P.aL.raise += life * (0.35 * Math.sin(t * 1.7 + 0.4) + 0.2 * Math.sin(t * 2.9)); P.aL.fwd += life * 0.4 * Math.sin(t * 1.1 + 1.3);
     P.aR.raise += life * (0.35 * Math.sin(t * 1.9 + 2.1) + 0.2 * Math.sin(t * 3.3 + 1)); P.aR.fwd += life * 0.4 * Math.sin(t * 1.3 + 0.2);
     if (trans > 0.3) open = 1;
+
+    // ---- drop-in: a beat with the tail on the coping (weight on the back foot, looking down the wall), then the chest
+    // goes forward over the front truck into a deep crouch, hands to the knees, held all the way through the transition
+    const dI = ph.dropin, sinceDrop = ph.time - ph.dropinEndT;
+    const dropOn = !!dI || (ph.mode === 'ride' && (sinceDrop < 0.25 || (sinceDrop < 2 && ph.up.y < 0.93)));
+    const dw = this.dropS.update(dropOn ? 1 : 0, dt);
+    if (dw > 0.001) {
+      const lead = dI ? dI.lead : ph.fakie ? -1 : 1;
+      const lean = dI ? (dI.phase === 'pivot' ? sm(dI.pk * 1.4) : 0) : 1;
+      P.hipH = lerp(P.hipH, lerp(0.76, 0.5, lean), dw);
+      hipShift += dw * lead * lerp(-0.05, 0.08, lean);
+      P.pYaw += dw * lead * 0.32 * lean; P.cYaw += dw * lead * 0.22 * lean;
+      // while the board tips the back goes nearly level out over the front truck (s12/s13); once the board is on the
+      // steep wall the chest stays only a little ahead of perpendicular to it, so he never dives head first
+      const noseW = _v.set(1, 0, 0).applyQuaternion(this.root.quaternion);
+      const tilt = Math.asin(clamp(-noseW.y * lead, -1, 1)); // leading end below level (rad)
+      const bend = lerp(0.34, clamp(1.45 - tilt, 0.38, dI ? 1.0 : 0.72), lean);
+      P.pPitch = lerp(P.pPitch, bend * 0.6, dw);
+      P.cPitch = lerp(P.cPitch, bend * 0.4, dw);
+      P.hPitch = lerp(P.hPitch, lerp(0.42, 0.05, lean), dw);
+      // hands go to the knees as he tips in, then out in front for balance on the way down the wall
+      const desc = dI ? 0 : 1;
+      const L = arm(lerp(lerp(0.35, 0.3, lean), 0.7, desc), lerp(lerp(0.4, 0.95, lean), 0.6, desc), lerp(lerp(0.5, 0.78, lean), 0.5, desc));
+      const R = arm(lerp(lerp(0.3, 0.28, lean), 0.65, desc), lerp(lerp(0.2, 0.8, lean), 0.3, desc), lerp(lerp(0.45, 0.72, lean), 0.45, desc));
+      for (const [a, b] of [[P.aL, L], [P.aR, R]] as [ArmP, ArmP][]) { a.raise = lerp(a.raise, b.raise, dw); a.fwd = lerp(a.fwd, b.fwd, dw); a.elbow = lerp(a.elbow, b.elbow, dw); a.hang = lerp(a.hang, 0, dw); }
+      if (dI && dI.phase !== 'pivot') backX = lerp(backX, st.tail + 0.04, dw); // back foot on the tail, over the coping
+    }
 
     // ---- wind-up crouch before the pop
     if (crouch > 0.001) {
@@ -821,29 +915,57 @@ export class Skater {
         const slide = sm((tp - 0.02) / 0.14) * (1 - kExt);
         frontX = lerp(st.front, st.nose - 0.03, slide);
         backX = lerp(st.back + 0.01, st.tail + 0.01, 1 - sm((tp - 0.05) / 0.1));
-        // flips: legs split, the front foot flicks off the toe edge (kickflip) or kicks the heel out over the heel edge
-        const fp = this.deckInfo.fp, kind = this.deckInfo.kind;
-        if (fp > 0 && fp < 1) {
-          const out = sm(fp / 0.3) * (1 - sm((fp - 0.66) / 0.3));
-          const lift = sm(fp / 0.22) * (1 - sm((fp - 0.74) / 0.26));
-          if (kind === 'kickflip') {
-            // front foot drags off the nose and flicks out over the toe edge; legs split wide
-            fOff.set(0.22 * out, 0.05 * out + 0.07 * lift, 0.22 * out); bOff.set(-0.11 * lift, 0.19 * lift, 0.02 * lift); fRoll = 0.4 * out;
-            this.fPole.lerp(_v.set(0.75, 0.35, 0.7), out);
-          } else if (kind === 'heelflip') {
-            // the heel kicks forward off the heel edge (toes up, heel leading); legs split wide
-            fOff.set(0.2 * out, 0.06 * out + 0.07 * lift, -0.24 * out); bOff.set(-0.11 * lift, 0.19 * lift, 0.02 * lift);
-            frontYaw -= 0.65 * out; fPitch = -0.45 * out;
-            this.fPole.lerp(_v.set(0.8, 0.35, 0.35), out);
-          } else if (kind === 'shuvit') {
-            const scoop = win(fp, 0, 0.1, 0.18, 0.34);
-            fOff.set(0, 0.15 * lift, 0); bOff.set(-0.02 * lift, 0.17 * lift, -0.08 * scoop); bPitch = 0.25 * scoop;
+        // flips run on the flip's own clock (flick at delay, catch at delay + dur), not on the board rotation alone:
+        // the legs leave the deck right at the flick and are back on the bolts exactly at the catch
+        const fl = ph.flip;
+        if (fl) {
+          const ft = fl.t, tFl = fl.delay, tC = fl.delay + fl.dur;
+          const kCatch = sm((ft - (tC - 0.11)) / 0.11); // both feet come back together onto the bolts
+          if (fl.kind === 'shuvit') {
+            // pop shove-it: the back foot scoops the tail behind the heels, then both feet lift straight up over the bolts
+            // (no flick, knees stay over the board) and come straight back down onto it
+            const scoop = win(ft, 0, 0.035, 0.08, 0.15);
+            const lift = sm((ft - 0.025) / 0.08) * (1 - kCatch);
+            frontX = st.front; backX = lerp(st.tail + 0.01, st.back + 0.01, sm((ft - 0.04) / 0.12));
+            fOff.set(0, 0.15 * lift, 0);
+            bOff.set(-0.035 * scoop, 0.16 * lift + 0.02 * scoop, -0.09 * scoop);
+            bPitch = 0.3 * scoop;
+            P.hipH -= 0.05 * lift; P.pPitch += 0.06 * lift; P.hPitch += 0.18 * lift;
           } else {
-            const scoop = win(fp, 0, 0.1, 0.18, 0.34);
-            fOff.set(0.08 * out, 0.13 * lift, 0.15 * out); bOff.set(-0.03 * lift, 0.17 * lift, -0.09 * scoop); fRoll = 0.25 * out;
+            // kickflip / heelflip / tre flip: the front foot slides up the grip to the nose, flicks off the edge and sweeps
+            // out ahead of the board; the back foot leaves the tail back and up. The legs are split wide around the peak
+            // with the board turning in open air between them, then both feet come together onto the bolts for the catch.
+            const kSlide = sm(ft / Math.max(0.04, tFl));
+            const kOff = sm((ft - (tFl - 0.02)) / 0.075);
+            const kBack = sm((ft - (tFl - 0.01)) / 0.09);
+            fSplit = kOff * (1 - kCatch); bSplit = kBack * (1 - kCatch);
+            frontX = lerp(lerp(st.front, st.nose - 0.03, kSlide), st.front, kCatch);
+            backX = lerp(st.tail + 0.01, st.back + 0.01, kCatch);
+            if (fl.kind === 'kickflip') {
+              // the front foot drags off the toe-side edge of the nose and sweeps forward, down and out, toes pointed
+              fAbs.set(st.nose + 0.22, 0.2, 0.23);
+              frontYaw += 0.55 * fSplit; fPitch = 0.6 * fSplit; fRoll = 0.35 * fSplit;
+              fPoleT.set(0.7, 0.2, 0.75);
+            } else if (fl.kind === 'heelflip') {
+              // the heel kicks forward and up, out off the heel-side edge: toes up, sole leading, the leg long
+              fAbs.set(st.nose + 0.2, 0.37, -0.2);
+              frontYaw += 0.75 * fSplit; fPitch = -1.1 * fSplit; fRoll = -0.15 * fSplit;
+              fPoleT.set(0.55, 0.85, -0.1);
+              P.pPitch -= 0.1 * fSplit; P.cPitch -= 0.06 * fSplit; // the heel kick sits the hips back a little
+            } else {
+              // tre flip: the back foot scoops backside, the front foot lifts and flicks lightly off the toe side
+              fAbs.set(st.nose + 0.1, 0.31, 0.09);
+              frontYaw += 0.35 * fSplit; fPitch = 0.25 * fSplit;
+              fPoleT.set(0.75, 0.3, 0.75);
+              const scoop = win(ft, 0, 0.035, 0.08, 0.16);
+              bOff.set(-0.03 * scoop, 0.02 * scoop, -0.09 * scoop); bPitch = 0.3 * scoop;
+            }
+            bAbs.set(st.tail - 0.08, 0.5, -0.03);
+            bPitch += 0.35 * bSplit;
+            // the body rises over the board so both legs can reach, chest over the board, eyes on the board
+            P.hipH += 0.07 * Math.max(fSplit, bSplit); P.pPitch += 0.08 * fSplit; P.hPitch += 0.22 * fSplit;
+            P.aL.raise += 0.1 * fSplit; P.aR.raise += 0.1 * fSplit;
           }
-          P.hipH -= 0.03 * lift;
-          P.aL.raise += 0.1 * lift; P.aR.raise += 0.1 * lift;
         }
       } else {
         // rolled off an edge / dropping in: crouch a little, arms out, reach for the ground before touchdown
@@ -878,7 +1000,8 @@ export class Skater {
     }
 
     // ---- cap the bend: the torso never folds flat at the waist (~35 deg on transitions)
-    const cap = onTrans ? 0.61 : 0.82;
+    const cap = lerp(onTrans ? 0.61 : 0.82, 1.0, this.dropS.x);
+    P.hipH = Math.max(P.hipH, 0.42);
     const bend = P.pPitch + P.cPitch;
     if (bend > cap) { const k = cap / bend; P.pPitch *= k; P.cPitch *= k; }
 
@@ -909,14 +1032,18 @@ export class Skater {
     if (fPitch || fRoll) { const side = new Vector3().crossVectors(fu, ff).normalize(); _q.setFromAxisAngle(side, fPitch); ff.applyQuaternion(_q); fu.applyQuaternion(_q); _q.setFromAxisAngle(ff, fRoll); fu.applyQuaternion(_q); }
     if (bPitch) { const side = new Vector3().crossVectors(bu, bf).normalize(); _q.setFromAxisAngle(side, bPitch); bf.applyQuaternion(_q); bu.applyQuaternion(_q); }
     P.fA.copy(fa).addScaledVector(ff, -shoeC).addScaledVector(fu, ankleH).add(fOff);
-    P.fF.copy(ff); P.fU.copy(fu); P.fP.copy(this.fPole);
+    if (fSplit > 0.001) P.fA.lerp(fAbs, fSplit);
+    P.fF.copy(ff); P.fU.copy(fu); P.fP.copy(this.fPole).lerp(fPoleT, fSplit);
     P.bA.copy(ba).addScaledVector(bf, -shoeC).addScaledVector(bu, ankleH).add(bOff);
-    P.bF.copy(bf); P.bU.copy(bu); P.bP.set(-0.15, 0.1, 1);
+    if (bSplit > 0.001) P.bA.lerp(bAbs, bSplit);
+    P.bF.copy(bf); P.bU.copy(bu); P.bP.set(-0.15, 0.1, 1).lerp(_v.set(0.25, -0.2, 1), bSplit);
+    P.fK = 1 - fSplit; P.bK = 1 - bSplit;
 
     // push: the back foot reaches ahead, plants beside the front truck, sweeps back along the ground, returns to the tail
     if (pt >= 0 && push > 0.02) {
       if (pt < this.pushPrevT) { this.pushPlant = null; this.pushRet = -1; }
       this.pushPrevT = pt;
+      P.bK = 1 - push;
       const plant = new Vector3(frontX + 0.05, 0, 0.21);
       const deckAnkle = P.bA.clone();
       if (pt < 0.24) {
@@ -953,6 +1080,7 @@ export class Skater {
     } else { this.pushPlant = null; this.pushRet = -1; this.pushPrevT = 0; }
     // foot brake: the back foot drags behind on the ground
     if (brake > 0.01) {
+      P.bK *= 1 - brake;
       P.bA.lerp(new Vector3(st.back - 0.32, ankleH, 0.14), brake);
       P.bU.lerp(Y, brake).normalize();
       P.bF.lerp(new Vector3(0.3, 0, 1).normalize(), brake).normalize();
@@ -1034,8 +1162,8 @@ export class Skater {
     }
     this.aimArm('Right', U, F);
     // legs
-    this.legIK('Left', P.fA, P.fP, P.fF, P.fU);
-    this.legIK('Right', P.bA, P.bP, P.bF, P.bU);
+    this.legIK('Left', P.fA, P.fP, P.fF, P.fU, P.fK * this.kneeW, P.bA);
+    this.legIK('Right', P.bA, P.bP, P.bF, P.bU, P.bK * this.kneeW, P.fA);
     this.applyFingers(P.curl);
   }
 
@@ -1334,7 +1462,7 @@ export class Skater {
     else if (ph.mode === 'air' && (ph.popped || ph.airTime > 0.15)) want = 'wide';
     else if (ph.wobble > 0) want = 'wide';
     else if (this.grinT > 0) want = 'grin';
-    else if (ph.mode === 'grind' || ph.manual.active || this.inCrouch || ph.speed > 4.2 || ph.kickturn.t >= 0) want = 'focus';
+    else if (ph.mode === 'grind' || ph.manual.active || this.inCrouch || ph.speed > 4.2 || ph.kickturn.t >= 0 || this.dropS.x > 0.5) want = 'focus';
     if (want !== this.expr && (this.exprHold <= 0 || want === 'grimace' || want === 'wide')) {
       this.setExpr(want);
       this.exprHold = 0.22;

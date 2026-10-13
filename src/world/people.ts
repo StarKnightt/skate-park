@@ -1,6 +1,6 @@
 import {
-  AnimationAction, AnimationClip, AnimationMixer, Box3, BoxGeometry, BufferAttribute, BufferGeometry, Color, CylinderGeometry, Group, LOD,
-  Mesh, MeshLambertMaterial, Object3D, SkinnedMesh, Sphere, Texture, Vector3,
+  AnimationAction, AnimationClip, AnimationMixer, Box3, BoxGeometry, BufferAttribute, BufferGeometry, CanvasTexture, Color, CylinderGeometry, Group, LOD,
+  Mesh, MeshLambertMaterial, Object3D, SkinnedMesh, Sphere, SRGBColorSpace, Texture, Vector3,
 } from 'three';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as skeletonClone } from 'three/examples/jsm/utils/SkeletonUtils.js';
@@ -53,6 +53,8 @@ export const PEOPLE_SPOTS: Spot[] = [
   { clip: 'recline', at: [-28.47, 0.03, -46.97], heading: 197, sit: 'floor', rel: true, look: { tee: '#ff70a6', shorts: '#1f6f8b' } },
   { clip: 'sit_laugh', at: [-30.4, 0.38, -47.1], heading: 180, sit: 'seat', rel: true, look: { tee: '#fbf8f2', shorts: '#e8463a' } },
   { clip: 'sit_idle', at: [-8.0, 3.15, -53.35], heading: 180, sit: 'seat', rel: true, look: { tee: '#e8463a', shorts: '#e8463a', cap: '#ffd23f', socks: '#e6b08c' } },
+  // the snack kiosk's vendor behind the service window (town side)
+  { clip: 'stand_idle', at: [24.25, 0, 28.7], heading: 0, look: { tee: '#fbf8f2', trim: '#e8463a', cap: '#e8463a', shorts: '#2b3a55' } },
 ];
 
 const lin = (h: string) => new Color(h);
@@ -79,10 +81,96 @@ function boardProp(): BufferGeometry {
 }
 
 /**
- * Distance levels of a person: [switch distance (m), share of triangles kept, max relative error, merge the face into one
- * vertex-coloured draw]. Errors stay under a pixel at each switch distance (1080p).
+ * Distance levels of a person: switch distance (m), share of body triangles kept, max relative error, share of face
+ * triangles kept (simplified with its UVs so the painted features stay in place), merge the face into the one
+ * vertex-coloured draw (only once a face is a few pixels tall). Errors stay under a pixel at each switch distance (1080p).
  */
-const LODS: [number, number, number, boolean][] = [[0, 1, 0, false], [9, 0.14, 0.02, false], [22, 0.05, 0.05, true], [45, 0.025, 0.1, true]];
+const LODS: { d: number; keep: number; err: number; face: number; merge: boolean }[] = [
+  { d: 0, keep: 1, err: 0, face: 1, merge: false },
+  { d: 9, keep: 0.14, err: 0.02, face: 0.4, merge: false },
+  { d: 22, keep: 0.05, err: 0.05, face: 0.14, merge: false },
+  { d: 45, keep: 0.025, err: 0.1, face: 0.025, merge: true },
+];
+
+/**
+ * The painted face with its features drawn bolder: every dark feature (brows, lash lines, irises, mouth) is found as a
+ * connected region well below the skin tone and grown and deepened, thin ones more than round ones, so a face a few
+ * dozen pixels tall still shows eyes, brows and a mouth. Freckles and specks are too small to count. Works from the
+ * texture alone (any face painted in the same style keeps working).
+ */
+function crowdFace(src: Texture): Texture | null {
+  const img = src.image as (CanvasImageSource & { width: number; height: number }) | undefined;
+  if (!img?.width) return null;
+  const W = img.width, H = img.height, n = W * H;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const cx = cv.getContext('2d', { willReadFrequently: true })!;
+  cx.drawImage(img, 0, 0);
+  const id = cx.getImageData(0, 0, W, H), d = id.data;
+  const L = new Float32Array(n);
+  for (let i = 0; i < n; i++) L[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < n; i += 5) hist[Math.min(255, L[i] | 0)]++;
+  let skinL = 1;
+  for (let v = 1; v < 256; v++) if (hist[v] > hist[skinL]) skinL = v;
+  const dark = new Uint8Array(n);
+  for (let i = 0; i < n; i++) dark[i] = L[i] < skinL * 0.6 ? 1 : 0;
+  const lab = new Int32Array(n).fill(-1);
+  const comps: { grow: number; c: [number, number, number] }[] = [];
+  const stack: number[] = [];
+  const minArea = (W * H) / 9000;
+  for (let i = 0; i < n; i++) {
+    if (!dark[i] || lab[i] >= 0) continue;
+    const k = comps.length;
+    let cnt = 0, r = 0, g = 0, b = 0, x0 = W, x1 = 0, y0 = H, y1 = 0;
+    lab[i] = k; stack.push(i);
+    while (stack.length) {
+      const p = stack.pop()!, x = p % W, y = (p / W) | 0;
+      cnt++; r += d[p * 4]; g += d[p * 4 + 1]; b += d[p * 4 + 2];
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (x > 0 && dark[p - 1] && lab[p - 1] < 0) { lab[p - 1] = k; stack.push(p - 1); }
+      if (x < W - 1 && dark[p + 1] && lab[p + 1] < 0) { lab[p + 1] = k; stack.push(p + 1); }
+      if (y > 0 && dark[p - W] && lab[p - W] < 0) { lab[p - W] = k; stack.push(p - W); }
+      if (y < H - 1 && dark[p + W] && lab[p + W] < 0) { lab[p + W] = k; stack.push(p + W); }
+    }
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1, thin = Math.max(bw, bh) / Math.max(1, Math.min(bw, bh)) > 3;
+    comps.push({ grow: cnt < minArea ? 0 : (thin ? 6 : 2.5) * (W / 1024), c: [r / cnt * 0.82, g / cnt * 0.78, b / cnt * 0.78] });
+  }
+  // coverage of the grown features (max over the stamps), one colour per texel
+  const cover = new Float32Array(n), owner = new Int32Array(n).fill(-1);
+  for (let p = 0; p < n; p++) {
+    const k = lab[p];
+    if (k < 0 || !comps[k].grow) continue;
+    const x = p % W, y = (p / W) | 0;
+    const edge = x === 0 || x === W - 1 || y === 0 || y === H - 1 || lab[p - 1] !== k || lab[p + 1] !== k || lab[p - W] !== k || lab[p + W] !== k;
+    cover[p] = 1; owner[p] = k;
+    if (!edge) continue;
+    const R = comps[k].grow, ri = Math.ceil(R + 1);
+    for (let dy = -ri; dy <= ri; dy++) for (let dx = -ri; dx <= ri; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+      const q = yy * W + xx, c = Math.min(1, Math.max(0, R + 0.5 - Math.hypot(dx, dy)));
+      if (c > cover[q]) { cover[q] = c; owner[q] = k; }
+    }
+  }
+  for (let p = 0; p < n; p++) {
+    const k = owner[p];
+    if (k < 0) continue;
+    // the feature itself only deepens (iris, pupil and lash detail stay); eye whites and catchlights are never covered
+    if (lab[p] === k) { for (let q = 0; q < 3; q++) d[p * 4 + q] *= 0.86; continue; }
+    if (L[p] > skinL * 1.08) continue;
+    const c = comps[k].c, a = cover[p] * 0.92;
+    for (let q = 0; q < 3; q++) d[p * 4 + q] = d[p * 4 + q] * (1 - a) + c[q] * a;
+  }
+  cx.putImageData(id, 0, 0);
+  const t = new CanvasTexture(cv);
+  t.flipY = src.flipY;
+  t.colorSpace = SRGBColorSpace;
+  t.wrapS = src.wrapS; t.wrapT = src.wrapT;
+  t.anisotropy = 8;
+  t.name = 'crowdFace';
+  return t;
+}
 
 /** one compact geometry from simplified index lists of several part meshes (same skin and bind space) */
 function compactMerge(parts: [BufferGeometry, Uint32Array][]): BufferGeometry {
@@ -128,6 +216,7 @@ export class People {
   private acc = 0;
   private refs: Color[] = [];
   private refNames: string[] = [];
+  private faceMap: Texture | null = null;
 
   constructor(private ground: (x: number, z: number) => number) { this.group.name = 'people'; }
 
@@ -136,6 +225,13 @@ export class People {
     try { gltf = await loader.loadAsync(url); } catch { return false; }
     if (!gltf.animations?.length) return false;
     this.analyse(gltf.scene);
+    gltf.scene.traverse((o) => {
+      const map = ((o as SkinnedMesh).material as MeshLambertMaterial | undefined)?.map;
+      if (map && !this.faceMap) {
+        try { this.faceMap = crowdFace(map); } catch (e) { console.warn('people: crowd face skipped', e); }
+        if (!this.faceMap) { map.anisotropy = 8; this.faceMap = map; }
+      }
+    });
     try { await this.buildLods(gltf.scene); } catch (e) { console.warn('people: distance levels skipped', e); }
     this.setup(gltf);
     return true;
@@ -150,14 +246,17 @@ export class People {
     if (!parts.length) return;
     const body = parts.find((m) => !(m.material as MeshLambertMaterial).map) ?? parts[0];
     const src = parts.map((m) => {
-      const g = m.geometry, p = g.getAttribute('position'), nm = g.getAttribute('normal'), c = g.getAttribute('color');
-      const n = p.count, pos = new Float32Array(n * 3), att = new Float32Array(n * 6);
+      const g = m.geometry, p = g.getAttribute('position'), nm = g.getAttribute('normal'), c = g.getAttribute('color'), uv = g.getAttribute('uv');
+      // the textured part (face) also carries its UVs into the error metric, so the painted features stay where they are
+      const face = !!(m.material as MeshLambertMaterial).map && !!uv;
+      const n = p.count, pos = new Float32Array(n * 3), att = new Float32Array(n * 8);
       for (let i = 0; i < n; i++) {
         pos[i * 3] = p.getX(i); pos[i * 3 + 1] = p.getY(i); pos[i * 3 + 2] = p.getZ(i);
-        if (c) { att[i * 6] = c.getX(i); att[i * 6 + 1] = c.getY(i); att[i * 6 + 2] = c.getZ(i); }
-        att[i * 6 + 3] = nm.getX(i); att[i * 6 + 4] = nm.getY(i); att[i * 6 + 5] = nm.getZ(i);
+        if (c) { att[i * 8] = c.getX(i); att[i * 8 + 1] = c.getY(i); att[i * 8 + 2] = c.getZ(i); }
+        att[i * 8 + 3] = nm.getX(i); att[i * 8 + 4] = nm.getY(i); att[i * 8 + 5] = nm.getZ(i);
+        if (face) { att[i * 8 + 6] = uv.getX(i); att[i * 8 + 7] = uv.getY(i); }
       }
-      return { m, pos, att, idx: new Uint32Array(g.index!.array) };
+      return { m, pos, att, face, idx: new Uint32Array(g.index!.array) };
     });
     const mesh = (g: BufferGeometry, from: SkinnedMesh, name: string) => {
       const sm = new SkinnedMesh(g, from.material);
@@ -168,10 +267,10 @@ export class People {
     };
     const levels: Object3D[][] = [parts];
     for (let l = 1; l < LODS.length; l++) {
-      const [, keep, err, merge] = LODS[l];
-      // part colour keeps the part borders, the normal keeps the shading
-      const lists = src.map((s) => S.simplifyWithAttributes(s.idx, s.pos, 3, s.att, 6, [1, 1, 1, 0.35, 0.35, 0.35], null,
-        Math.floor((s.idx.length * keep) / 3) * 3, err, [])[0]);
+      const { keep, err, face, merge } = LODS[l];
+      // part colour keeps the part borders, the normal keeps the shading, the UVs keep the face drawing in place
+      const lists = src.map((s) => S.simplifyWithAttributes(s.idx, s.pos, 3, s.att, 8, [1, 1, 1, 0.35, 0.35, 0.35, s.face ? 3 : 0, s.face ? 3 : 0], null,
+        Math.floor((s.idx.length * (s.face ? face : keep)) / 3) * 3, err, [])[0]);
       if (merge) levels.push([mesh(compactMerge(src.map((s, k) => [s.m.geometry, lists[k]])), body, `${body.name}_lod${l}`)]);
       else {
         levels.push(src.map((s, k) => {
@@ -185,7 +284,7 @@ export class People {
     }
     const parent = parts[0].parent!, lod = new LOD();
     lod.name = 'personLod';
-    levels.forEach((objs, l) => { const grp = new Group(); objs.forEach((o) => grp.add(o)); lod.addLevel(grp, LODS[l][0], 0.1); });
+    levels.forEach((objs, l) => { const grp = new Group(); objs.forEach((o) => grp.add(o)); lod.addLevel(grp, LODS[l].d, 0.1); });
     parent.add(lod);
   }
 
@@ -238,8 +337,18 @@ export class People {
       const map = (sm.material as MeshLambertMaterial).map as Texture | null;
       if (map) {
         if (!face) {
-          face = toonMaterial({ map, bands: 0.45, wrap: 0.6, rim: 0.5, name: 'personFace' });
+          // softer terminator and rim than the skater's close-up face: at a few metres a hard band or a lit edge across
+          // a 30-pixel face reads as a smear or a pale sheet; the drawing is sampled a little sharper than its mip
+          face = toonMaterial({ map: this.faceMap ?? map, bands: 0.3, wrap: 0.68, rim: 0.25, name: 'personFace' });
           face.color.setRGB(skin.r / skinRef.r, skin.g / skinRef.g, skin.b / skinRef.b);
+          const prev = face.onBeforeCompile, key = face.customProgramCacheKey();
+          face.onBeforeCompile = (sh, r) => {
+            prev.call(face, sh, r);
+            sh.fragmentShader = sh.fragmentShader.replace('#include <map_fragment>', `#ifdef USE_MAP
+              diffuseColor *= texture2D( map, vMapUv, -0.6 );
+            #endif`);
+          };
+          face.customProgramCacheKey = () => `${key}-crowdFace`;
         }
         sm.material = face;
       } else {

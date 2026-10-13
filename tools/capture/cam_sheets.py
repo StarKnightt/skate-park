@@ -37,7 +37,9 @@ for name in sorted(os.listdir(root)):
         fi = int(f[1:5])
         m = meta.get(fi)
         lab = f'f{fi:03d}'
-        if m:
+        if m and 'box' in m:
+            lab += f" {m['mode'][:4]} box{m['box']:.2f} len{m['len']:.2f} {m['side']:.0f}d p{m['lookPitchDeg']:.0f}"
+        elif m:
             lab += f" {m['mode'][:4]} sz{m['size']:.2f} hip{m['hipsY']:.0f}% brd{m['boardY']:.0f}% p{m['lookPitchDeg']:.0f}"
         dr.text((x + 4, y + 3), lab, fill=(255, 236, 200), font=font)
     out = os.path.join(root, f'sheet_{name}.jpg')

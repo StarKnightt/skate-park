@@ -13,11 +13,13 @@ from skimage import measure
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cloth_masks as cm
+import hand_rig as hr
 from cloth_masks import smoothstep
 
 OUT = sys.argv[1]
 SK = json.load(open(sys.argv[2]))["bones"]
 LM = cm.Landmarks(SK)
+HANDS = {S: hr.Hand(SK, S) for S in "LR"}
 os.makedirs(OUT, exist_ok=True)
 
 
@@ -348,9 +350,89 @@ def part_cream(p):
     return union(*ds)
 
 
+def seg2d(x, z, a, b):
+    """distance from 2D points to segment a-b and the position along it (0..1)"""
+    ab = np.asarray(b) - np.asarray(a)
+    t = np.clip(((x - a[0]) * ab[0] + (z - a[1]) * ab[1]) / (ab @ ab), 0, 1)
+    return np.hypot(x - (a[0] + t * ab[0]), z - (a[1] + t * ab[1])), t
+
+
+def polyline2d(x, z, pts):
+    """distance to a 2D polyline and the normalised arc position of the nearest point (for fading the ends)"""
+    pts = np.asarray(pts, dtype=np.float64)
+    lens = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    acc = np.concatenate([[0], np.cumsum(lens)]) / lens.sum()
+    best, pos = np.full(len(x), 1e9), np.zeros(len(x))
+    for i in range(len(pts) - 1):
+        d, t = seg2d(x, z, pts[i], pts[i + 1])
+        m = d < best
+        best = np.where(m, d, best)
+        pos = np.where(m, acc[i] + t * (acc[i + 1] - acc[i]), pos)
+    return best, pos
+
+
+# palm creases in hand coordinates (x towards the knuckles from the wrist joint, z towards the thumb side)
+PALM_CREASES = [
+    [(0.067, -0.041), (0.071, -0.022), (0.075, -0.004), (0.080, 0.010), (0.087, 0.021)],      # distal transverse
+    [(0.066, 0.039), (0.062, 0.021), (0.058, 0.003), (0.055, -0.015), (0.053, -0.025)],      # proximal transverse
+    [(0.066, 0.039), (0.055, 0.031), (0.042, 0.025), (0.028, 0.020), (0.015, 0.016), (0.007, 0.012)],   # thenar
+]
+
+
+def palm_detail(q, H):
+    """Displacement on the palm block: palmar creases on the palm side, extensor tendons on the back."""
+    x, y, z = q[:, 0], q[:, 1], q[:, 2]
+    disp = np.zeros(len(q))
+    palm_side = smoothstep(0.003, 0.008, -y)
+    for pts in PALM_CREASES:
+        d, t = polyline2d(x, z, pts)
+        disp -= 0.00045 * np.exp(-(d / 0.00120) ** 2) * smoothstep(0.0, 0.12, t) * (1 - smoothstep(0.85, 1.0, t)) * palm_side
+    back = smoothstep(0.004, 0.009, y)
+    for f in hr.FINGERS:
+        k = H.local(H.joints[f][0][None, :])[0]
+        a, b = (0.016, 0.32 * k[2] - 0.004), (k[0] - 0.010, k[2])
+        d, t = seg2d(x, z, a, b)
+        disp += 0.00024 * np.exp(-(d / 0.0024) ** 2) * smoothstep(0.05, 0.45, t) * (1 - smoothstep(0.70, 1.0, t)) * back
+    return disp
+
+
+def hand_sdf(p, H):
+    """Palm block (pads, thenar/hypothenar, distal pad under the finger bases, base knuckles, creases, tendons)
+    with the four finger chains and the thumb chain from hand_rig (tapered, knuckled, creased, padded, nailed)."""
+    wr, hx, hy, hz, R, Lp = H.wr, H.hx, H.hy, H.hz, H.R, H.Lp
+    palm = round_box(p, wr + hx * (Lp * 0.50) + hy * 0.001, [Lp * 0.50, 0.0110, 0.0375], 0.0105, R)
+    heel = ellipsoid(p, wr + hx * 0.020 - hy * 0.004, [0.024, 0.0125, 0.030], R)
+    thenar = ellipsoid(p, wr + hx * 0.035 + hz * 0.022 - hy * 0.0075, [0.029, 0.0132, 0.0180], R)
+    hypo = ellipsoid(p, wr + hx * 0.044 - hz * 0.026 - hy * 0.005, [0.035, 0.0112, 0.0125], R)
+    dpad = ellipsoid(p, wr + hx * (Lp - 0.002) - hy * 0.0050, [0.0120, 0.0070, 0.041], R)
+    d = sunion(0.0065, palm, heel, thenar, hypo)
+    d = smin(d, dpad, 0.006)
+    kn = [ellipsoid(p, H.joints[f][0] + hy * 0.0040 - hx * 0.0012, np.array([0.0082, 0.0060, 0.0080]) * (hr.SIZE[f][0] / 0.0089), R)
+          for f in hr.FINGERS]
+    d = smin(d, union(*kn), 0.0045)
+    d = d - palm_detail(H.local(p), H)
+    for f in hr.FINGERS:
+        ch = H.chains[f]
+        df, c = ch.evaluate(p)
+        d = smin(d, df - ch.features(c), 0.0048)
+    th = H.chains["Thumb"]
+    dt, c = th.evaluate(p)
+    return smin(d, dt - th.features(c), 0.0070)
+
+
+def part_hand(p, S):
+    H = HANDS[S]
+    lo, hi = H.bbox(0.035)
+    out = nrm(np.maximum(np.maximum(lo - p, p - hi), 0)) + 0.019   # lower bound outside: the hand is >= 19 mm inside
+    m = np.all((p > lo) & (p < hi), axis=1)
+    if m.any():
+        out[m] = hand_sdf(p[m], H)
+    return out
+
+
 def part_arms(p, sides="LR"):
     """T-pose arms (palms down): deltoid, biceps (front), triceps (back), a bony elbow with an inner crease,
-    a forearm bulge narrowing to a flat wrist, and hands with palm thickness, pads, knuckles, tapered fingers and thumb."""
+    a forearm bulge narrowing to a flat wrist, and the sculpted hand (hand_sdf)."""
     ds = []
     F, U = np.array([0, 0, 1.0]), np.array([0, 1.0, 0])
     for S in sides:
@@ -368,30 +450,7 @@ def part_arms(p, sides="LR"):
         arm = sunion(0.013, upper, delt, biceps, triceps, olec, epis, fore, fbulge)
         t, rl, rd = cm.axis_coords(p, el, nunit(ua + fa))
         arm = arm + 0.0024 * np.exp(-(t / 0.0075) ** 2) * smoothstep(0.3, 0.9, rd[:, 2]) * (rl < 0.06)   # inner-elbow crease
-        # hand frame: x = towards the knuckles, y = back of the hand (up in the T-pose), z = towards the thumb/index side
-        f1 = {f: J(n + "Hand" + f + "1") for f in ("Index", "Middle", "Ring", "Pinky")}
-        knuck = sum(f1.values()) / 4
-        hx = nunit(knuck - wr)
-        hz0 = nunit(f1["Index"] - f1["Pinky"])
-        hy = nunit(-s * np.cross(hx, hz0))
-        hz = np.cross(hx, hy) * (1 if np.dot(np.cross(hx, hy), hz0) > 0 else -1)
-        R = np.stack([hx, hy, hz], 1)
-        Lp = np.linalg.norm(knuck - wr)
-        palm = round_box(p, wr + hx * (Lp * 0.50) + hy * 0.001, [Lp * 0.50, 0.0112, 0.0380], 0.0105, R)
-        heel = ellipsoid(p, wr + hx * 0.020 - hy * 0.004, [0.024, 0.0125, 0.030], R)
-        thenar = ellipsoid(p, wr + hx * 0.032 + hz * 0.021 - hy * 0.007, [0.027, 0.0130, 0.0175], R)
-        hypo = ellipsoid(p, wr + hx * 0.040 - hz * 0.025 - hy * 0.005, [0.032, 0.0110, 0.0125], R)
-        parts = [palm, heel, thenar, hypo]
-        for f, r0 in (("Index", 0.0097), ("Middle", 0.0101), ("Ring", 0.0095), ("Pinky", 0.0082)):
-            pts = [J(n + "Hand" + f + str(i)) for i in range(1, 5)]
-            parts.append(sphere(p, pts[0] + hy * 0.0045, r0 * 0.95))                    # knuckle
-            for i in range(3):
-                parts.append(round_cone(p, pts[i], pts[i + 1], r0 * (1 - 0.085 * i), r0 * (1 - 0.085 * (i + 1))))
-        tp = [J(n + "HandThumb" + str(i)) for i in range(1, 5)]
-        for i in range(3):
-            parts.append(round_cone(p, tp[i], tp[i + 1], 0.0128 - 0.0011 * i, 0.0117 - 0.0011 * i))
-        hand = sunion(0.0065, *parts)
-        ds.append(smin(arm, hand, 0.010))
+        ds.append(smin(arm, part_hand(p, S), 0.010))
     return union(*ds)
 
 
@@ -585,26 +644,87 @@ def bbox_pts(*pts, pad=0.0):
     return a.min(0) - pad, a.max(0) + pad
 
 
-def mesh_part(name, fn, bmin, bmax, h):
-    t0 = time.time()
-    bmin = np.asarray(bmin, float) - 3 * h
-    bmax = np.asarray(bmax, float) + 3 * h
-    n = np.ceil((bmax - bmin) / h).astype(int) + 1
-    xs = bmin[0] + np.arange(n[0]) * h
-    ys = bmin[1] + np.arange(n[1]) * h
-    zs = bmin[2] + np.arange(n[2]) * h
-    vol = np.empty(n, np.float32)
+def eval_grid(fn, xs, ys, zs):
+    vol = np.empty((len(xs), len(ys), len(zs)), np.float32)
     Y, Z = np.meshgrid(ys, zs, indexing="ij")
     Yr, Zr = Y.ravel(), Z.ravel()
     step = max(1, int(400000 // Yr.size))
-    for i in range(0, n[0], step):
+    for i in range(0, len(xs), step):
         xi = xs[i:i + step]
         P = np.stack([np.repeat(xi, Yr.size), np.tile(Yr, len(xi)), np.tile(Zr, len(xi))], 1)
-        vol[i:i + step] = fn(P).reshape(len(xi), n[1], n[2])
+        vol[i:i + step] = fn(P).reshape(len(xi), len(ys), len(zs))
+    return vol
+
+
+def upsample(vol, f):
+    """separable linear upsampling of a grid by an integer factor (corner aligned)"""
+    for ax in range(3):
+        v = np.moveaxis(vol, ax, 0)
+        n = v.shape[0]
+        out = np.empty(((n - 1) * f + 1,) + v.shape[1:], np.float32)
+        for k in range(f):
+            out[k:(n - 1) * f:f] = v[:-1] * (1 - k / f) + v[1:] * (k / f)
+        out[-1] = v[-1]
+        vol = np.moveaxis(out, 0, ax)
+    return np.ascontiguousarray(vol)
+
+
+def hand_budget(S, hand_tris):
+    """Post-process for the fine-voxel arms: relax once (like the Blender smooth pass), then quadric-decimate the
+    whole part until the hand holds ~hand_tris; build_skater.py then thins only the arm above the wrist."""
+    import trimesh
+    import fast_simplification as fs
+
+    def post(verts, faces):
+        m = trimesh.Trimesh(verts, faces, process=False)
+        trimesh.smoothing.filter_laplacian(m, lamb=0.5, iterations=1, volume_constraint=False)
+        V, F = np.asarray(m.vertices, np.float64), np.asarray(m.faces, np.int32)
+        tot, best = int(hand_tris / 0.40), None
+        for _ in range(8):   # the hand share is not monotonic in the total: keep the closest result
+            V2, F2 = fs.simplify(V, F, target_count=tot, agg=3)
+            hand = int(HANDS[S].in_hand(V2[F2].mean(1)).sum())
+            if best is None or abs(hand - hand_tris) < abs(best[2] - hand_tris):
+                best = (V2, F2, hand)
+            if abs(hand - hand_tris) <= 0.03 * hand_tris:
+                break
+            tot = int(tot * (1 + 0.8 * (hand_tris / max(hand, 1) - 1)))
+        V2, F2, hand = best
+        print("  %s hand budget: %d tris total, %d in the hand" % (S, len(F2), hand), flush=True)
+        return V2, F2
+    return post
+
+
+def mesh_part(name, fn, bmin, bmax, h, nb=0, post=None):
+    """Marching cubes of one part. nb > 0: narrow band - a grid nb times coarser finds the surface, and the
+    exact field is only evaluated within 1.6 coarse voxels of it (fine voxels for small detail, e.g. the hands).
+    post(verts, faces) -> (verts, faces) runs before the OBJ is written."""
+    t0 = time.time()
+    bmin = np.asarray(bmin, float) - 3 * h
+    bmax = np.asarray(bmax, float) + 3 * h
+    mask = None
+    if nb:
+        hc = h * nb
+        nc = np.ceil((bmax - bmin) / hc).astype(int) + 1
+        vol = upsample(eval_grid(fn, *[bmin[i] + np.arange(nc[i]) * hc for i in range(3)]), nb)
+        n = np.array(vol.shape)
+        ax = [bmin[i] + np.arange(n[i]) * h for i in range(3)]
+        mask = np.abs(vol) < 1.6 * hc
+        idx = np.nonzero(mask)
+        for a in range(0, len(idx[0]), 400000):
+            ii = tuple(k[a:a + 400000] for k in idx)
+            vol[ii] = fn(np.stack([ax[0][ii[0]], ax[1][ii[1]], ax[2][ii[2]]], 1))
+        evals = len(idx[0])
+    else:
+        n = np.ceil((bmax - bmin) / h).astype(int) + 1
+        vol = eval_grid(fn, *[bmin[i] + np.arange(n[i]) * h for i in range(3)])
+        evals = vol.size
     # force a closed border
     vol[0, :, :] = vol[-1, :, :] = 1; vol[:, 0, :] = vol[:, -1, :] = 1; vol[:, :, 0] = vol[:, :, -1] = 1
-    verts, faces, _, _ = measure.marching_cubes(vol, level=0.0, spacing=(h, h, h))
+    verts, faces, _, _ = measure.marching_cubes(vol, level=0.0, spacing=(h, h, h), mask=mask)
     verts += bmin
+    mc_tris = len(faces)
+    if post:
+        verts, faces = post(verts, faces)
     v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
     vol6 = np.einsum("ij,ij->i", v0, np.cross(v1, v2)).sum()
     if vol6 < 0:
@@ -614,20 +734,24 @@ def mesh_part(name, fn, bmin, bmax, h):
         f.write("o %s\n" % name)
         np.savetxt(f, verts, fmt="v %.5f %.5f %.5f")
         np.savetxt(f, faces + 1, fmt="f %d %d %d")
-    print("%-12s grid %s  verts %7d  tris %7d  %.1fs" % (name, tuple(n), len(verts), len(faces), time.time() - t0), flush=True)
+    print("%-12s grid %s  evals %9d  mc tris %7d  verts %7d  tris %7d  %.1fs" % (
+        name, tuple(int(k) for k in n), evals, mc_tris, len(verts), len(faces), time.time() - t0), flush=True)
     return len(faces)
 
 
 # colours are sRGB hex; material "vc" uses vertex colour, "face" uses the painted face texture
+# options: nb = narrow-band factor (mesh_part); hand_tris = separate decimation budget for the hand (build_skater.py),
+# target tris then counts the arm up to the wrist only
+ARM_OPT = {"nb": 3, "hand_tris": 9000}
 PARTS = [
-    # name, fn, bbox, voxel, colour, material, target tris
+    # name, fn, bbox, voxel, colour, material, target tris[, options]
     ("head", part_head, ([-0.13, 1.40, -0.14], [0.13, 1.83, 0.15]), 0.0022, "#e9b48f", "face", 7500),
     ("hair", part_hair, ([-0.135, 1.56, -0.15], [0.135, 1.75, 0.125]), 0.0018, "#4a2e1c", "vc", 5200),
     ("cap", part_cap, ([-0.125, 1.63, -0.14], [0.125, 1.83, 0.21]), 0.0016, "#e5b03b", "vc", 6500),
     ("tee", part_tee, ([-0.40, 0.94, -0.16], [0.40, 1.53, 0.14]), 0.0030, "#2f8f86", "vc", 9000),
     ("cream", part_cream, ([-0.40, 1.36, -0.12], [0.40, 1.50, 0.08]), 0.0025, "#f1e6cc", "vc", 1800),
-    ("armL", lambda p: part_arms(p, "L"), ([0.13, 1.30, -0.11], [0.95, 1.50, 0.10]), 0.0019, "#e9b48f", "vc", 5600),
-    ("armR", lambda p: part_arms(p, "R"), ([-0.95, 1.30, -0.11], [-0.13, 1.50, 0.10]), 0.0019, "#e9b48f", "vc", 5600),
+    ("armL", lambda p: part_arms(p, "L"), ([0.13, 1.30, -0.11], [0.95, 1.50, 0.10]), 0.0008, "#e9b48f", "vc", 3300, ARM_OPT),
+    ("armR", lambda p: part_arms(p, "R"), ([-0.95, 1.30, -0.11], [-0.13, 1.50, 0.10]), 0.0008, "#e9b48f", "vc", 3300, ARM_OPT),
     ("legs", part_legs, ([-0.24, 0.05, -0.12], [0.24, 0.98, 0.11]), 0.0045, "#e9b48f", "vc", 2400),
     ("shorts", part_shorts, ([-0.27, 0.48, -0.15], [0.27, 1.07, 0.15]), 0.0030, "#d2bd8e", "vc", 7500),
     ("shortscuff", part_shorts_cuff, ([-0.26, 0.50, -0.12], [0.26, 0.66, 0.12]), 0.0032, "#c4ad7c", "vc", 1200),
@@ -643,11 +767,16 @@ if __name__ == "__main__":
     meta_path = os.path.join(OUT, "parts.json")
     old = {m["name"]: m for m in json.load(open(meta_path))} if os.path.exists(meta_path) else {}
     meta = []
-    for name, fn, (bmin, bmax), h, col, mat, target in PARTS:
+    for name, fn, (bmin, bmax), h, col, mat, target, *opt in PARTS:
+        opt = opt[0] if opt else {}
         if only and name not in only:
             tris = old.get(name, {}).get("tris", 0)
         else:
-            tris = mesh_part(name, fn, bmin, bmax, h)
-        meta.append({"name": name, "color": col, "material": mat, "target_tris": target, "tris": int(tris)})
+            post = hand_budget(name[-1], opt["hand_tris"]) if opt.get("hand_tris") else None
+            tris = mesh_part(name, fn, bmin, bmax, h, opt.get("nb", 0), post)
+        m = {"name": name, "color": col, "material": mat, "target_tris": target, "tris": int(tris)}
+        if opt.get("hand_tris"):
+            m["hand_tris"] = opt["hand_tris"]
+        meta.append(m)
     json.dump(meta, open(meta_path, "w"), indent=1)
     print("done")
