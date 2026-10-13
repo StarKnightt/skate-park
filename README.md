@@ -64,7 +64,10 @@ recordings — see `src/debug/testHooks.ts` and `tools/capture/`.
   for collision queries, [postprocessing](https://github.com/pmndrs/postprocessing) for bloom / tone mapping / grade.
 - **Park:** built procedurally in code (`src/world/park.ts`) with an exact collision mesh: two pool bowls with tile
   bands and metal coping, a 3 m half pipe with a little vert, quarter pipes, 30° banks, a six-stair with a handrail,
-  a funbox with hips and a flat bar, painted ledges / curb / manual pad, a flat rail and three mural walls.
+  a funbox with hips and a flat bar, painted ledges / curb / manual pad, a flat rail, connecting lines (pyramid, hips,
+  extra banks, a platform three-stair with rail, more ledges and rails), landscaped edges (seat steps, planters,
+  benches, sand drifts) and murals on a pavilion, a kiosk and the half-pipe wall. People hang out around the park:
+  skaters waiting on the decks, friends on the steps, walkers on the boardwalk, a couple on the beach and a lifeguard.
 - **Physics:** custom kinematic skateboard controller (`src/player/physics.ts`, 120 Hz): slope gravity, rolling
   resistance, diminishing push, carving, pumping, kickturns, ballistic air with spin control, vert assist and a
   landing-prediction assist, grinds on polylines, manual balance, wall / curb impacts and a rag-doll-free bail with a
@@ -107,7 +110,7 @@ recordings — see `src/debug/testHooks.ts` and `tools/capture/`.
 ### Generated for this project (original artwork, Cursor image generation)
 Skater concept turnaround (`assets_src/generated/skater_concept_turnaround.jpg`), the three murals ("sun and waves",
 "koi and octopus", "tropical patchwork"), the deck graphic (sun, waves and a paper boat) and the painted cumulus
-clouds sheet (chroma-keyed into `public/textures/clouds.webp`). The skater's face texture is painted procedurally by
+clouds sheet (chroma-keyed into `public/textures/clouds.webp`). The skater's five face expressions (neutral, focused, wide-eyed, grin, grimace) are painted procedurally by
 `tools/character/paint_face.py`. All other geometry (park, scenery, houses, palms, board, skater) is generated in code.
 
 ### Animation
@@ -115,12 +118,12 @@ Fall, get-up, idle and balance clips from [Mixamo](https://www.mixamo.com) (Adob
 shipped only baked into `public/models/skater.glb`: Falling Flat On Face, Slip And Fall Backwards, Knocked Over And
 Falling To The Ground, Mid Air Falling Into A Roll, Frantically Slip And Fall To Stomach, Falling In The Air Idle,
 Getting Up From Stomach, Getting Up From Back, Getting Up From Being Knocked Down, Standing Idle, Wobbling On A Ledge,
-Slipping Off An Edge Then Regaining Balance. The rig is the standard Mixamo skeleton (reference "Bryce"); no Mixamo
+Slipping Off An Edge Then Regaining Balance, Standard Walk, Male Knocked Down From A Punch (wall impact), Laying On A Bed Shrugging (re-baked to the floor as the post-bail shake-off), Weight Shift Idle, Idle Stand Looking Around. The park's people (`public/models/people.glb`, recoloured variants of the same original character) use Sitting With Breathing Idle, Sitting While Laughing, Sitting Reclined On The Floor, Standing Texting On Phone, AJ Waving Gesture and Sitting Unenthusiastic Clap. The rig is the standard Mixamo skeleton (reference "Bryce"); no Mixamo
 character mesh is used. Raw FBX files are not part of this repository.
 
 ### Libraries and tools
 three.js (MIT) · three-mesh-bvh (MIT) · postprocessing (Zlib) · Vite (MIT) · TypeScript (Apache-2.0) ·
-glTF-Transform (MIT) · meshoptimizer decoder (MIT) · Nunito font via @fontsource (SIL OFL 1.1) · Blender (GPL, build
+glTF-Transform (MIT) · meshoptimizer decoder + simplifier (MIT, people LODs) · Nunito font via @fontsource (SIL OFL 1.1) · Blender (GPL, build
 tool only) · NumPy, SciPy, scikit-image, Pillow (build tools only) · Playwright (capture tool only).
 
 ### Skills consulted
