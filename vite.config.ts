@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite';
 
-export default defineConfig(({ command }) => ({
-  base: command === 'build' ? '/skate-park/' : '/',
+export default defineConfig(({ command, isPreview }) => ({
+  base: command === 'build' || isPreview ? '/skate-park/' : '/',
   server: { port: 5188, strictPort: true, host: '127.0.0.1' },
   preview: { port: 5189, strictPort: true, host: '127.0.0.1' },
   build: {
