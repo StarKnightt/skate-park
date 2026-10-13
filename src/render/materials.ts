@@ -38,6 +38,7 @@ export const shared = {
   uSkySun: { value: new Color(0.6, 0.5, 0.4) },
   uSkyAnti: { value: new Color(0.4, 0.45, 0.6) },
   uGroundBounce: { value: new Color(0.3, 0.25, 0.2) },
+  uShDbg: { value: 0 },
 };
 
 export interface ToonOpts {
@@ -74,23 +75,37 @@ float fbm(vec2 p){ float a = 0.5, s = 0.0; for(int i=0;i<4;i++){ s += a*vnoise(p
  */
 const SUN_SHADOW_RPDB = /* glsl */ `
 #if defined( USE_SHADOWMAP ) && NUM_SUN_LIGHT_SHADOWS > 0 && defined( SHADOWMAP_TYPE_PCF )
-  float sunShadowPCF( sampler2DShadow shadowMap, vec2 shadowMapSize, float shadowIntensity, float shadowBias, float shadowRadius, vec3 sc, vec2 dzduv ) {
+  float sunShadowPCF( sampler2DShadow shadowMap, vec2 shadowMapSize, float shadowIntensity, float shadowBias, float shadowRadius, vec3 sc, vec2 dzduv, float tight ) {
     float shadow = 1.0;
     sc.z += shadowBias;
     bool inFrustum = sc.x >= 0.0 && sc.x <= 1.0 && sc.y >= 0.0 && sc.y <= 1.0;
     if ( inFrustum && sc.z <= 1.0 ) {
       vec2 texelSize = vec2( 1.0 ) / shadowMapSize;
-      float radius = shadowRadius * texelSize.x;
-      float phi = interleavedGradientNoise( gl_FragCoord.xy ) * PI2;
       // the hardware 2x2 compare reaches one atlas texel (the atlas is two cascades wide)
       float slopeTexel = abs( dzduv.x ) * texelSize.x * 0.5 + abs( dzduv.y ) * texelSize.y;
-      float s = 0.0;
-      for ( int k = 0; k < 5; k ++ ) {
-        vec2 o = vogelDiskSample( k, 5, phi ) * radius;
-        float zr = sc.z + clamp( dot( dzduv, o ), -0.02, 0.02 ) - slopeTexel;
-        s += texture( shadowMap, vec3( sc.xy + o, zr ) );
+      float wide = 0.0, fine = 0.0;
+      if ( tight < 1.0 ) {
+        // wide soft kernel for the ground and walls: 5 taps, rotated per pixel
+        float radius = shadowRadius * texelSize.x;
+        float phi = interleavedGradientNoise( gl_FragCoord.xy ) * PI2;
+        for ( int k = 0; k < 5; k ++ ) {
+          vec2 o = vogelDiskSample( k, 5, phi ) * radius;
+          float zr = sc.z + clamp( dot( dzduv, o ), -0.02, 0.02 ) - slopeTexel;
+          wide += texture( shadowMap, vec3( sc.xy + o, zr ) );
+        }
+        wide *= 0.2;
       }
-      shadow = s * 0.2;
+      if ( tight > 0.0 ) {
+        // small curved shapes: a tight 3x3 tent on a fixed grid, smooth with no per-pixel rotation (a rotated kernel
+        // as wide as a limb draws its penumbra as a dot grid)
+        for ( int j = -1; j <= 1; j ++ ) for ( int i = -1; i <= 1; i ++ ) {
+          vec2 o = vec2( float( i ), float( j ) ) * 0.75 * texelSize;
+          float zr = sc.z + clamp( dot( dzduv, o ), -0.02, 0.02 ) - slopeTexel;
+          fine += texture( shadowMap, vec3( sc.xy + o, zr ) ) * ( 2.0 - abs( float( i ) ) ) * ( 2.0 - abs( float( j ) ) );
+        }
+        fine *= 0.0625;
+      }
+      shadow = mix( wide, fine, tight );
     }
     return mix( 1.0, shadow, shadowIntensity );
   }
@@ -113,13 +128,28 @@ const SUN_SHADOW_RPDB = /* glsl */ `
     // right at the terminator of such a bend the shadow map cannot resolve the surface (it runs along the light rays),
     // but the answer is known: the ray towards the sun meets the bend again after a chord of ~2 ndl / bend
     float bendLit = bend > 0.05 ? smoothstep( 0.08, 0.3, 2.0 * max( ndl, 0.0 ) / bend ) : 1.0;
+    if ( uShDbg == 2.0 || uShDbg == 4.0 ) bendLit = 1.0;
+    // small, strongly curved receivers (limbs, cloth folds, trunks, people): texels and kernel are as big as the shape,
+    // so its own folds and cloth shell would shadow it in a dot grid. There, ignore occluders a few cm along the light
+    // ray (limbs shadowing other limbs are further apart), keep the kernel tight and leave the metre-scale bend logic out
+    float small = smoothstep( 2.0, 6.0, gCurv );
+    if ( uShDbg == 6.0 ) small = 0.0;
+    bendLit = mix( bendLit, 1.0, small );
     for ( int i = SUN_LIGHT_CASCADES - 1; i >= 0; i -- ) {
       vec4 cascade = sunShadowCascade[ cascadeOffset + i ];
       if ( viewDepth >= cascade.x && viewDepth < cascade.y ) {
         mat4 M = sunShadowMatrix[ cascadeOffset + i ];
         // world size of one shadow texel in this cascade: the normal offset scales with it
         float texelWorld = 1.0 / ( length( vec3( M[0][1], M[1][1], M[2][1] ) ) * sunLightShadow.shadowMapSize.y );
-        vec3 sc = ( M * vec4( wp + wn * ( sunLightShadow.shadowNormalBias + texelWorld * 0.6 ), 1.0 ) ).xyz;
+        float nOff = sunLightShadow.shadowNormalBias + texelWorld * 0.6, lOff = small * ( 0.025 + texelWorld );
+        if ( uShDbg == 10.0 ) { nOff += small * ( 0.015 + 0.5 * texelWorld ); lOff = 0.0; }
+        if ( uShDbg == 11.0 ) { nOff += small * ( 0.015 + 0.5 * texelWorld ); }
+        if ( uShDbg == 12.0 ) { nOff += small * ( 0.03 + 1.0 * texelWorld ); lOff = 0.0; }
+        if ( uShDbg == 13.0 ) lOff = 0.15;
+        if ( uShDbg == 14.0 ) lOff = 0.4;
+        if ( uShDbg == 15.0 ) nOff += 0.15;
+        if ( uShDbg == 16.0 ) { lOff = 1.5; }
+        vec3 sc = ( M * vec4( wp + wn * nOff + uSunDir * lOff, 1.0 ) ).xyz;
         mat3 M3 = mat3( M );
         vec3 dx = M3 * gDPdx, dy = M3 * gDPdy;
         float det = dx.x * dy.y - dx.y * dy.x;
@@ -131,11 +161,12 @@ const SUN_SHADOW_RPDB = /* glsl */ `
         // receiver a chord of ~2 ndl / bend further on: keep the plane bias reach well inside that chord
         if ( bend > 1e-3 && ndl > 0.0 ) {
           float reach = ( sunLightShadow.shadowRadius + 1.0 ) * texelWorld / max( ndl, 0.01 );
-          planeW *= clamp( 1.6 * ndl / ( bend * reach ), 0.0, 1.0 );
+          planeW *= mix( clamp( 1.6 * ndl / ( bend * reach ), 0.0, 1.0 ), 1.0, small );
         }
+        if ( uShDbg == 1.0 || uShDbg == 4.0 ) planeW = 0.0;
         dzduv = clamp( dzduv, vec2( -40.0 ), vec2( 40.0 ) ) * planeW;
         float cs = sunShadowPCF( shadowMap, sunLightShadow.shadowMapSize, sunLightShadow.shadowIntensity, sunLightShadow.shadowBias,
-          sunLightShadow.shadowRadius, sc, dzduv );
+          sunLightShadow.shadowRadius, sc, dzduv, small );
         float bl = smoothstep( cascade.z, cascade.y, viewDepth );
         shadow = mix( cs, shadow, bl );
         #ifdef TOON_RIM
@@ -152,6 +183,7 @@ const SUN_SHADOW_RPDB = /* glsl */ `
       }
     }
     gRimVis = min( gRimVis, mix( 1.0, rimVis, sunLightShadow.shadowIntensity ) );
+    gDbgSmall = small; gDbgShadow = min( shadow, mix( 1.0, bendLit, sunLightShadow.shadowIntensity ) ); gDbgBend = bend;
     return min( shadow, mix( 1.0, bendLit, sunLightShadow.shadowIntensity ) );
   }
   #define SUN_SHADOW_FN getSunShadowRPDB
@@ -463,7 +495,7 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
     let fs = (rim > 0 ? '#define TOON_RIM\n' : '') + sh.fragmentShader;
     fs = fs.replace('#include <common>', `#include <common>
       varying vec3 vWorldPos; varying vec3 vWorldNrm;
-      uniform float uTime, uBands, uWrap, uRim, uSpec, uShin, uLampIntensity, uRimStrength, uSeed;
+      uniform float uTime, uBands, uWrap, uRim, uSpec, uShin, uLampIntensity, uRimStrength, uSeed, uShDbg;
       uniform vec3 uLampColor, uRimColor, uWarmth;
       uniform vec3 uLampPos[${MAX_LAMPS}];
       uniform int uLampSkip;
@@ -473,6 +505,7 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
       ${NOISE}
       // per-fragment values shared between the colour stage and the lighting functions
       vec3 gN; vec3 gDPdx; vec3 gDPdy; vec3 gDNdx; vec3 gDNdy; float gFp; float gCurv; float gSkyVis; float gGround; vec3 gBounce; float gSheen; float gRimVis;
+      float gDbgSmall = -1.0; float gDbgShadow = -1.0; float gDbgBend = 0.0;
       float toonRamp(float w){
         float b1 = smoothstep(0.38, 0.46, w);
         float b2 = smoothstep(0.72, 0.80, w) * 0.25;
@@ -578,6 +611,9 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
           }
           outgoingLight += diffuseColor.rgb * uLampColor * (acc * uLampIntensity * RECIPROCAL_PI);
         }` : ''}
+        if (uShDbg == 7.0) outgoingLight = vec3(gDbgSmall, smoothstep(0.0, 20.0, gCurv), 0.0);
+        if (uShDbg == 8.0) outgoingLight = vec3(gDbgShadow);
+        if (uShDbg == 9.0) outgoingLight = vec3(max(gDbgBend, 0.0) * 0.05, max(-gDbgBend, 0.0) * 0.05, 0.0);
       }
       #include <opaque_fragment>`);
     sh.fragmentShader = fs;
