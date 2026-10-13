@@ -40,6 +40,7 @@ Momentum based: pushing gives diminishing returns, transitions convert height in
 carving keeps your speed. Landings are judged on board angle, heading versus travel (fakie is fine) and whether the
 flip was caught: slightly off makes you wobble, really off makes you bail. Hitting a wall at speed bails you too.
 Trick names and a small combo score pop up and fade; tricks chain into combos until you roll away for a second.
+Roll slowly over a coping from a deck to drop in: tail on the coping, lean the nose down onto the wall, ride it out.
 
 ## Run / build
 
@@ -120,6 +121,9 @@ Falling To The Ground, Mid Air Falling Into A Roll, Frantically Slip And Fall To
 Getting Up From Stomach, Getting Up From Back, Getting Up From Being Knocked Down, Standing Idle, Wobbling On A Ledge,
 Slipping Off An Edge Then Regaining Balance, Standard Walk, Male Knocked Down From A Punch (wall impact), Laying On A Bed Shrugging (re-baked to the floor as the post-bail shake-off), Weight Shift Idle, Idle Stand Looking Around. The park's people (`public/models/people.glb`, recoloured variants of the same original character) use Sitting With Breathing Idle, Sitting While Laughing, Sitting Reclined On The Floor, Standing Texting On Phone, AJ Waving Gesture and Sitting Unenthusiastic Clap. The rig is the standard Mixamo skeleton (reference "Bryce"); no Mixamo
 character mesh is used. Raw FBX files are not part of this repository.
+
+Pass-3 additions (drop-in, a dedicated high-resolution shadow for the skater, painted leaf-clump foliage, the lit kiosk
+interior, the charcoal grip texture) are all generated in code; no new third-party assets were added.
 
 ### Libraries and tools
 three.js (MIT) · three-mesh-bvh (MIT) · postprocessing (Zlib) · Vite (MIT) · TypeScript (Apache-2.0) ·

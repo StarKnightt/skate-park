@@ -48,6 +48,12 @@ def keys_for(clip, events):
             keys += [(fr + 30, "manual"), (fr + 90, "manual_late")]
         elif t == "bonk":
             keys += [(fr + 2, "bonk")]
+        elif t == "dropinPhase" and e.get("phase") == "stall":
+            keys += [(fr + 2, "dropin_tail_on_coping")]
+        elif t == "dropinPhase" and e.get("phase") == "pivot":
+            keys += [(fr + 3, "dropin_nose_down")]
+        elif t == "dropIn":
+            keys += [(fr + 4, "dropin_crouch")]
         elif t == "push" and "push" in clip and pushes < 3:
             pushes += 1
             keys += [(fr + 9, "push_plant")]
