@@ -20,6 +20,8 @@ export interface SkateInput {
   grindPressed: boolean;
   manual: boolean;
   lean: number; // -1 back .. 1 forward
+  /** minimum pop charge 0..1 for this ollie (F-key quick pop, Easy-mode tap ollie); the crouch time can only raise it */
+  popCharge?: number;
 }
 
 export const emptyInput = (): SkateInput => ({
@@ -646,7 +648,7 @@ export class SkatePhysics {
   }
 
   private pop(inp: SkateInput) {
-    const charge = clamp((this.crouchTime - 0.06) / 0.24, 0, 1);
+    const charge = Math.max(clamp((this.crouchTime - 0.06) / 0.24, 0, 1), clamp(inp.popCharge ?? 0, 0, 1));
     const popV = POP_MIN + (POP_MAX - POP_MIN) * charge;
     const dir = _v.copy(this.up).multiplyScalar(0.7).addScaledVector(Y, 0.3).normalize();
     this.endManual();

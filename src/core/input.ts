@@ -1,5 +1,16 @@
-import type { FlipDir, SkateInput } from '../player/physics';
+import type { FlipDir, SkateInput, SkatePhysics } from '../player/physics';
 import { emptyInput } from '../player/physics';
+
+/** what the input layer may read from the physics (never write) */
+export type SkateState = Pick<SkatePhysics, 'mode' | 'speed' | 'vel' | 'fwd' | 'up' | 'pos' | 'grind' | 'manual' | 'flip' | 'airTime'>;
+
+/** an input producer that rides by itself (auto-ride autopilot) */
+export interface AutoSource {
+  /** called once per physics step instead of the player's input while auto-ride is engaged */
+  sample(dt: number, airborne: boolean): SkateInput;
+  /** forget plans (after a respawn, a takeover or re-engaging) */
+  reset(): void;
+}
 
 /** Unified input: keyboard, gamepad, touch and scripted (test) sources. */
 export class Input {
@@ -10,8 +21,12 @@ export class Input {
   private dragging = false;
   private lastX = 0; private lastY = 0;
   private padPrev: boolean[] = [];
-  touch = { steer: 0, push: false, brake: false, ollieHeld: false, ollieReleased: false, flip: null as FlipDir | null, grind: false, grindPressed: false, manual: false };
-  events = { timeOfDay: false, respawn: false, recenter: false, help: false };
+  touch = {
+    steer: 0, push: false, brake: false, ollieHeld: false, ollieReleased: false, flip: null as FlipDir | null, grind: false, grindPressed: false, manual: false,
+    /** pass-4 touch buttons (edges, cleared by the input layer): TRICK (easy), AUTO toggle, pause */
+    trickPressed: false, autoPressed: false, pausePressed: false,
+  };
+  events = { timeOfDay: false, respawn: false, recenter: false, help: false, pause: false, autoToggle: false };
   scripted: Partial<Record<string, boolean>> | null = null;
   usingTouch = false;
   usingPad = false;
@@ -46,6 +61,28 @@ export class Input {
   }
 
   addCameraDrag(dx: number, dy: number) { this.camDX += dx; this.camDY += dy; }
+
+  // ---------------------------------------------------------------- pass-4 contract (stubs; the input helper fills them)
+  /** pointer lock is active on the canvas */
+  locked = false;
+  /** auto-ride source (the autopilot); when autoActive and the player gives no movement/trick input, sample() returns its input */
+  auto: AutoSource | null = null;
+  autoActive = false;
+  /** true when the last sample() contained player movement/trick input (auto-ride takeover) */
+  userActive = false;
+  /** read-only physics state for mode logic (auto-push speed, grounded): set once by the game */
+  ph: SkateState | null = null;
+  attach(ph: SkateState) { this.ph = ph; }
+  /** call once per displayed frame, even while paused: polls the gamepad and raises button edges/events */
+  poll(_dt: number) { /* TODO pass 4 */ }
+  /** camera look since the last call in radians, already scaled (sensitivity, invert-Y, curves, stick rate cap) */
+  consumeLook(_dt: number): { yaw: number; pitch: number } {
+    const d = this.consumeCamera();
+    return { yaw: -d.dx * 0.006, pitch: d.dy * 0.006 };
+  }
+  requestLock() { /* TODO pass 4 */ }
+  releaseLock() { /* TODO pass 4 */ }
+  setAuto(on: boolean) { this.autoActive = on && !!this.auto; this.auto?.reset(); }
 
   private down(code: string) { return this.keys.has(code) || !!this.scripted?.[code]; }
 
@@ -142,6 +179,7 @@ export class Input {
   consumeEvents() {
     const e = { ...this.events };
     this.events.timeOfDay = this.events.respawn = this.events.recenter = this.events.help = false;
+    this.events.pause = this.events.autoToggle = false;
     return e;
   }
 }

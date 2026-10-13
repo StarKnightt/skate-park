@@ -1,12 +1,13 @@
 // Transpile src/**/*.ts to tools/sim/.build (ESM, .js import specifiers) so physics can run headless in node.
-// node tools/sim/build_src.mjs   (then import from tools/sim/.build/...)
+// node tools/sim/build_src.mjs [outDir]   (default tools/sim/.build; then import from <outDir>/...)
+// Give each concurrent user its own outDir (e.g. tools/sim/.build-auto) so parallel builds don't overwrite each other.
 import fs from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '../..');
 const src = path.join(root, 'src');
-const out = path.join(root, 'tools/sim/.build');
+const out = process.argv[2] ? path.resolve(process.argv[2]) : path.join(root, 'tools/sim/.build');
 const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
 for (const f of walk(src).filter((f) => f.endsWith('.ts'))) {
   const code = fs.readFileSync(f, 'utf8');

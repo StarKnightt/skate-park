@@ -56,6 +56,11 @@ export class AudioEngine {
     if (this.ctx) this.master.gain.setTargetAtTime(m ? 0 : 0.9, this.ctx.currentTime, 0.1);
   }
 
+  /** pass-4 contract (implemented by the UI/audio helper): duck everything while the pause menu is open */
+  duck(_on: boolean) { /* TODO pass 4 */ }
+  /** pass-4 contract: music and sound-effect volumes 0..1 (from settings.musicVol / settings.sfxVol) */
+  setVolumes(_music: number, _sfx: number) { /* TODO pass 4 */ }
+
   one(key: string, gain = 1, rate = 1, offset = 0, dur?: number) {
     const c = this.ctx; const b = this.buffers.get(key);
     if (!c || !b) return;
