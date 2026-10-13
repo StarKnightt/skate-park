@@ -1,14 +1,15 @@
 import {
   Clock, Color, Fog, Group, HemisphereLight, Mesh, PCFShadowMap, PerspectiveCamera, PlaneGeometry, Quaternion, Scene,
-  SRGBColorSpace, Texture, TextureLoader, Vector3, WebGLRenderer, NoToneMapping, MathUtils, DoubleSide,
+  SRGBColorSpace, Texture, TextureLoader, Vector3, WebGLRenderer, NoToneMapping, MathUtils, DoubleSide, SpotLight,
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { SunLight } from 'three/examples/jsm/lights/SunLight.js';
 import { buildPark, meshFromBuilder, mergeTubes } from './world/park';
+import { buildParkDetail } from './world/parkDetail';
 import { CollisionWorld } from './world/collision';
 import { buildScenery, Scenery } from './world/scenery';
-import { loadSharedTextures, shared, toonMaterial } from './render/materials';
+import { loadSharedTextures, shared, toonMaterial, LAMP } from './render/materials';
 import { Sky, CloudLayer, Ocean, glowPoints } from './render/environment';
 import { TimeOfDay, PRESETS, EnvState } from './render/timeOfDay';
 import { Post } from './render/post';
@@ -49,6 +50,9 @@ export class Game {
   post!: Post;
   sun = new SunLight(0xffffff, 2.5);
   hemi = new HemisphereLight(0xffffff, 0xffffff, 1);
+  /** the one shadow casting lamp: follows the street lamp nearest to the skater (blue hour / sunset) */
+  lampSpot = new SpotLight(0xffffff, 0, LAMP.range, LAMP.angle, LAMP.penumbra, 2);
+  lampIdx = -1;
   lampGlow!: ReturnType<typeof glowPoints>;
   spawn = { pos: new Vector3(), heading: 0 };
   landmarks: Record<string, { pos: Vector3; look: Vector3 }> = {};
@@ -60,7 +64,7 @@ export class Game {
   scriptInput: ((t: number) => Partial<Record<string, boolean>> | null) | null = null;
   quality = 2;
   frameTimes: number[] = [];
-  boardReturn: null | { t: number; fromP: Vector3; fromQ: Quaternion } = null;
+  boardReturn: null | { t: number; fromP: Vector3; fromQ: Quaternion; hop: boolean } = null;
   lastInput: SkateInput = emptyInput();
   started = false;
   ready = false;
@@ -102,10 +106,10 @@ export class Game {
     const b = park.builder;
     this.world = new CollisionWorld(b.collisionGeometry(), b.cSurf, park.grindLines);
     const mats = {
-      concrete: toonMaterial({ vertexColors: true, color: 0xf2e6d6, detail: 'concrete', bands: 0.12, wrap: 0.75, rim: 0.12, name: 'concrete' }),
-      wall: toonMaterial({ vertexColors: true, color: 0xeddccb, detail: 'wall', bands: 0.2, wrap: 0.5, rim: 0.12, name: 'wall' }),
-      paint: toonMaterial({ vertexColors: true, detail: 'paint', bands: 0.3, wrap: 0.5, rim: 0.2, name: 'paint' }),
-      wood: toonMaterial({ color: 0xffffff, detail: 'wood', bands: 0.15, wrap: 0.75, rim: 0.1, name: 'wood' }),
+      concrete: toonMaterial({ vertexColors: true, color: 0xe8ded2, detail: 'concrete', bands: 0.06, wrap: 0.3, rim: 0.12, name: 'concrete' }),
+      wall: toonMaterial({ vertexColors: true, color: 0xe8dccd, detail: 'wall', bands: 0.1, wrap: 0.3, rim: 0.12, name: 'wall' }),
+      paint: toonMaterial({ vertexColors: true, detail: 'paint', bands: 0.2, wrap: 0.3, rim: 0.25, name: 'paint' }),
+      wood: toonMaterial({ color: 0xffffff, detail: 'wood', bands: 0.12, wrap: 0.45, rim: 0.1, name: 'wood' }),
     };
     for (const m of Object.values(mats)) m.shadowSide = DoubleSide;
     const parkGroup = new Group();
@@ -116,12 +120,13 @@ export class Game {
     const texByName: Record<string, Texture> = { mural_sunwaves: murals[0], mural_koi: murals[1], mural_patchwork: murals[2] };
     for (const mu of park.murals) {
       const g = new PlaneGeometry(mu.w, mu.h);
-      const m = new Mesh(g, toonMaterial({ map: texByName[mu.tex], detail: null, bands: 0.15, wrap: 0.45, rim: 0.05, name: mu.key }));
+      const m = new Mesh(g, toonMaterial({ map: texByName[mu.tex], detail: 'mural', bands: 0.1, wrap: 0.3, rim: 0.05, name: mu.key }));
       m.position.copy(mu.center);
       m.lookAt(mu.center.clone().add(mu.normal));
       m.receiveShadow = true;
       parkGroup.add(m);
     }
+    parkGroup.add(buildParkDetail(park));
     this.scene.add(parkGroup);
     this.scenery = buildScenery(park.lamps);
     this.scene.add(this.scenery.group);
@@ -138,11 +143,25 @@ export class Game {
     this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(this.quality >= 2 ? 2048 : 1024, this.quality >= 2 ? 2048 : 1024);
     this.sun.shadow.camera.far = this.quality >= 2 ? 95 : 60;
-    this.sun.shadow.bias = -0.0004;
-    this.sun.shadow.normalBias = 0.035;
+    // toon materials add a receiver-plane bias per PCF tap and a normal offset of ~0.6 texel per cascade on top of these
+    this.sun.shadow.bias = -0.00008;
+    this.sun.shadow.normalBias = 0.012;
     this.sun.shadow.radius = 3;
     this.scene.add(this.sun);
     this.scene.add(this.hemi);
+    const ls = this.lampSpot;
+    ls.castShadow = this.quality >= 1;
+    ls.shadow.mapSize.set(this.quality >= 2 ? 1024 : 512, this.quality >= 2 ? 1024 : 512);
+    ls.shadow.camera.near = 0.3;
+    ls.shadow.camera.far = LAMP.range;
+    ls.shadow.bias = -0.0006;
+    ls.shadow.normalBias = 0.02;
+    ls.shadow.radius = 2.5;
+    ls.shadow.autoUpdate = false;
+    ls.shadow.needsUpdate = true; // render once so a depth texture is always bound to the shadow sampler
+    ls.position.set(0, -50, 0);
+    ls.target.position.set(0, -60, 0);
+    this.scene.add(ls, ls.target);
 
     // ---------------- player
     this.physics = new SkatePhysics(this.world);
@@ -150,9 +169,12 @@ export class Game {
     this.scene.add(this.board.root);
     this.skater = new Skater(gltf);
     this.scene.add(this.skater.root);
-    this.skater.onRecovered = (pos, heading) => {
-      this.boardReturn = { t: 0, fromP: this.board.root.position.clone(), fromQ: this.board.root.quaternion.clone() };
-      this.physics.finishRecover(pos, heading);
+    this.skater.onRecovered = (pos, fwd) => {
+      // the board stays where it came to rest; the rider steps onto it (flipping it over first if it lies upside down)
+      const fromP = this.board.root.position.clone(), fromQ = this.board.root.quaternion.clone();
+      this.physics.finishRecover(pos, fwd);
+      const toQ = this.physics.basisQuat(this.physics.fwd, this.physics.up);
+      this.boardReturn = { t: 0, fromP, fromQ, hop: fromQ.angleTo(toQ) > 1.0 };
     };
     this.rig = new CameraRig(this.camera, this.world);
     this.respawn();
@@ -185,7 +207,7 @@ export class Game {
     this.ready = true;
     loading?.classList.add('done');
     setTimeout(() => loading?.remove(), 900);
-    if (!this.touch || !touchMode) this.hud.toast('Click or press a key for sound', 4);
+    if (!touchMode && !params.has('mute')) this.hud.soundPrompt();
     this.renderer.setAnimationLoop((t) => this.frame(t));
   }
 
@@ -198,7 +220,8 @@ export class Game {
     this.physics.reset(pos, heading);
     this.syncBoard(1, true);
     this.rig.snap(this.physics.pos, Math.atan2(this.physics.fwd.x, this.physics.fwd.z));
-    this.skater.phase = 'ride'; this.skater.procW = 1; this.skater.mixer.stopAllAction(); this.skater.action = null;
+    this.skater.reset();
+    this.boardReturn = null;
   }
 
   nextTime() { this.tod.next(); this.hud.setTimeLabel(PRESETS[this.tod.index].name); }
@@ -218,7 +241,15 @@ export class Game {
     this.sun.intensity = e.lightIntensity;
     this.sun.position.copy(e.lightDir).multiplyScalar(100);
     this.sun.shadow.intensity = e.shadowIntensity;
+    this.sun.shadow.radius = e.shadowRadius;
     this.hemi.color.copy(e.hemiSky); this.hemi.groundColor.copy(e.hemiGround); this.hemi.intensity = e.hemiIntensity;
+    // toon materials light themselves from these (sun-aware sky ambient + backlight rim)
+    shared.uSunDir.value.copy(e.lightDir).normalize();
+    shared.uSunColor.value.copy(e.lightColor).multiplyScalar(e.lightIntensity);
+    shared.uSkyTop.value.copy(e.hemiSky).multiplyScalar(e.hemiIntensity);
+    shared.uSkySun.value.copy(e.skySun).multiplyScalar(e.hemiIntensity);
+    shared.uSkyAnti.value.copy(e.skyAnti).multiplyScalar(e.hemiIntensity);
+    shared.uGroundBounce.value.copy(e.hemiGround).multiplyScalar(e.hemiIntensity);
     const fog = this.scene.fog as Fog;
     fog.color.copy(e.fog); fog.near = e.fogNear; fog.far = e.fogFar;
     this.sky.apply(e);
@@ -227,14 +258,18 @@ export class Game {
       + Math.abs(e.cloudShade.r - gs.r) + Math.abs(e.cloudShade.g - gs.g) + Math.abs(e.cloudShade.b - gs.b);
     this.clouds.apply(e, clamp(1 - dist * 2.5, 0, 1));
     this.ocean.apply(e);
-    shared.uLampIntensity.value = e.lamps * 1.4;
+    shared.uLampIntensity.value = e.lamps * LAMP.intensity;
+    this.lampSpot.color.copy(shared.uLampColor.value);
+    this.lampSpot.intensity = shared.uLampIntensity.value;
+    this.lampSpot.shadow.autoUpdate = e.lamps > 0.02 && this.lampSpot.castShadow;
+    if (e.lamps <= 0.02) { this.lampIdx = -1; shared.uLampSkip.value = -1; this.lampSpot.position.y = -50; }
     shared.uRimColor.value.copy(e.rim);
     shared.uRimStrength.value = e.rimStrength;
     shared.uWarmth.value.copy(e.warmth);
     this.scenery.windows.emissiveIntensity = e.windows * 1.3;
-    this.scenery.lampHeads.emissiveIntensity = e.lamps * 3.0;
+    this.scenery.lampHeads.emissiveIntensity = e.lamps * 4.5;
     this.scenery.lighthouseLamp.emissiveIntensity = 0.3 + e.lamps * 3;
-    (this.lampGlow.material as any).uniforms.uIntensity.value = e.lamps * 0.9;
+    (this.lampGlow.material as any).uniforms.uIntensity.value = e.lamps * 1.1;
     if (this.post) {
       this.post.bloom.intensity = e.bloom * (this.quality >= 1 ? 1 : 0);
       this.post.setExposure(e.exposure);
@@ -244,29 +279,62 @@ export class Game {
     this.scene.background = e.fog;
   }
 
+  /** park the shadow casting spot light in the street lamp nearest to the skater; the shader skips that lamp's pool */
+  updateLampLight() {
+    if (shared.uLampIntensity.value <= 0.02 * LAMP.intensity) return;
+    const p = this.physics.pos, lamps = this.scenery.lampLights;
+    const n = Math.min(lamps.length, shared.uLampPos.value.length);
+    const d2 = (i: number) => (lamps[i].x - p.x) ** 2 + (lamps[i].z - p.z) ** 2;
+    let best = -1, bd = Infinity;
+    for (let i = 0; i < n; i++) { const d = d2(i); if (d < bd) { bd = d; best = i; } }
+    if (this.lampIdx >= 0 && best !== this.lampIdx && d2(this.lampIdx) < bd * 1.2 + 1) best = this.lampIdx;
+    if (best < 0 || best === this.lampIdx) return;
+    this.lampIdx = best;
+    const l = lamps[best];
+    this.lampSpot.position.copy(l);
+    this.lampSpot.target.position.set(l.x, l.y - 5, l.z);
+    this.lampSpot.target.updateMatrixWorld();
+    shared.uLampSkip.value = best;
+  }
+
   syncBoard(dt: number, snap = false) {
     const ph = this.physics;
     const r = this.board.root;
     if (ph.mode === 'bail' && ph.bail) {
-      r.position.copy(ph.bail.boardPos).addScaledVector(new Vector3(0, 1, 0).applyQuaternion(ph.bail.boardQ), -0.07);
-      r.quaternion.copy(ph.bail.boardQ);
+      ph.bail.board.rootPos(r.position);
+      r.quaternion.copy(ph.bail.board.q);
       this.boardSmoothQ.copy(r.quaternion);
+      this.boardVisOff.set(0, 0, 0);
+      this.prevMode = ph.mode;
       return;
     }
     const q = ph.mode === 'air' ? ph.boardQ.clone() : ph.basisQuat(ph.fwd, ph.up);
     if (snap) this.boardSmoothQ.copy(q); else this.boardSmoothQ.slerp(q, 1 - Math.exp(-28 * dt));
-    r.position.copy(ph.pos);
+    // catching a rail from a little below snaps the physics onto it: ease that jump out over a few frames
+    if (snap) this.boardVisOff.set(0, 0, 0);
+    else if (this.prevMode === 'air' && ph.mode === 'grind') {
+      this.boardVisOff.add(this.prevPos.addScaledVector(this.prevVel, dt).sub(ph.pos));
+      if (this.boardVisOff.length() > 0.45) this.boardVisOff.setLength(0.45);
+    }
+    this.boardVisOff.multiplyScalar(Math.exp(-16 * dt));
+    this.prevMode = ph.mode; this.prevPos.copy(ph.pos); this.prevVel.copy(ph.vel);
+    r.position.copy(ph.pos).add(this.boardVisOff);
     r.quaternion.copy(this.boardSmoothQ);
     if (this.boardReturn) {
       const br = this.boardReturn;
       br.t += dt;
-      const k = clamp(br.t / 0.4, 0, 1), e = k * k * (3 - 2 * k);
-      const p = br.fromP.clone().lerp(ph.pos, e); p.y += Math.sin(k * Math.PI) * 0.25;
+      const k = clamp(br.t / 0.35, 0, 1), e = k * k * (3 - 2 * k);
+      const p = br.fromP.clone().lerp(r.position, e);
+      if (br.hop) p.y += Math.sin(k * Math.PI) * 0.16;
       r.position.copy(p);
       r.quaternion.slerpQuaternions(br.fromQ, this.boardSmoothQ, e);
       if (k >= 1) this.boardReturn = null;
     }
   }
+  boardVisOff = new Vector3();
+  prevMode = 'ride';
+  prevPos = new Vector3();
+  prevVel = new Vector3();
 
   eventLog: { t: number; type: string; [k: string]: any }[] = [];
   private processEvents() {
@@ -328,7 +396,7 @@ export class Game {
     // camera follows the hips
     const focus = this.skater.hipsWorld(new Vector3());
     if (ph.mode === 'ride' || ph.mode === 'grind' || ph.mode === 'air') focus.lerp(ph.pos.clone().addScaledVector(ph.up, 0.9), 0.5);
-    this.rig.update(dt, focus, ph.vel, ph.speed, ph.mode, ph.mode === 'ride' ? 1 - ph.up.y : ph.mode === 'air' && ph.vert ? 1 : 0);
+    this.rig.update(dt, focus, ph);
     this.tricks.update(dt, ph.mode === 'ride', ph.manual.active || ph.kickturn.t >= 0);
     this.hud.update(dt);
     this.audio.update(dt, ph.speed, ph.surface, ph.mode === 'ride', ph.grind ? ph.grind.speed : 0);
@@ -336,6 +404,7 @@ export class Game {
     this.ocean.mat.uniforms.uTime.value = this.simTime;
     this.sky.mat.uniforms.uTime.value = this.simTime;
     this.scenery.update(this.simTime, dt);
+    this.updateLampLight();
     this.sky.mesh.position.copy(this.camera.position);
     this.clouds.group.position.copy(this.camera.position);
     this.ocean.mesh.position.x = Math.round(this.camera.position.x / 50) * 50;
@@ -376,6 +445,7 @@ export class Game {
     this.resize();
     this.post.bloom.intensity = this.quality >= 1 ? this.tod.cur.bloom : 0;
     this.sun.shadow.camera.far = this.quality >= 2 ? 95 : this.quality === 1 ? 60 : 40;
+    if (this.quality === 0) { this.lampSpot.shadow.autoUpdate = false; this.lampSpot.shadow.needsUpdate = false; }
     void MathUtils;
   }
 }

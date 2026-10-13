@@ -163,45 +163,57 @@ export class Ocean {
         uniform float uTime, uFogNear, uFogFar, uShore, uGlint; uniform vec3 uDeep, uShallow, uSky, uHorizon, uSunDir, uSunCol, uFog;
         varying vec3 vW;
         ${NOISE}
-        vec2 waveGrad(vec2 p, float t){
+        float fbm3(vec2 p){ float a = 0.5, s = 0.0; for(int i=0;i<3;i++){ s += a*vnoise(p); p = p*2.02 + 13.7; a *= 0.5; } return s / 0.875; }
+        // incommensurate directional waves with drifting swell groups; each fades once it is smaller than a few pixels
+        vec2 waveGrad(vec2 p, float t, float fp){
           vec2 g = vec2(0.0);
-          vec2 dirs[5]; dirs[0] = normalize(vec2(0.3, 1.0)); dirs[1] = normalize(vec2(-0.6, 1.0)); dirs[2] = normalize(vec2(1.0, 0.4));
-          dirs[3] = normalize(vec2(-1.0, 0.7)); dirs[4] = normalize(vec2(0.1, -1.0));
-          float fr[5]; fr[0] = 0.21; fr[1] = 0.33; fr[2] = 0.57; fr[3] = 0.91; fr[4] = 1.7;
-          for (int i = 0; i < 5; i++) {
-            float f = fr[i]; float ph = dot(dirs[i], p) * f + t * sqrt(9.8 * f) * 0.5 + float(i) * 1.7;
-            g += dirs[i] * cos(ph) * f * (0.22 / (1.0 + float(i)));
+          for (int i = 0; i < 9; i++) {
+            float fi = float(i);
+            float a = fi * 2.39996323 + 0.37;
+            vec2 dir = normalize(vec2(cos(a), sin(a)) + vec2(0.0, 0.85));
+            float f = 0.15 * pow(1.43, fi) * (1.0 + 0.13 * sin(fi * 4.13 + 0.7));
+            float ph = dot(dir, p) * f + t * sqrt(9.8 * f) * 0.55 + fi * 1.913;
+            float grp = 0.35 + vnoise(p * (0.015 + 0.004 * fi) + vec2(fi * 7.31, t * 0.02 * (1.0 + 0.1 * fi)));
+            float lod = 1.0 - smoothstep(0.1, 0.35, fp * f);
+            g += dir * cos(ph) * f * (0.24 / (1.0 + fi * 0.75)) * grp * lod;
           }
           return g;
         }
         void main(){
-          vec2 p = vW.xz;
-          float dist = length(cameraPosition.xz - p);
-          float lodf = 1.0 / (1.0 + dist * 0.004);
-          vec2 g = waveGrad(p, uTime) * lodf;
-          g += (vec2(fbm(p * 0.35 + uTime * 0.05), fbm(p * 0.35 - uTime * 0.04 + 9.0)) - 0.5) * 0.5 * lodf;
+          vec2 p0 = vW.xz;
+          float dist = length(cameraPosition.xz - p0);
+          float fp = max(length(fwidth(p0)), 1e-4);
+          // large-scale domain warp: no crest line stays straight, nothing tiles
+          vec2 wv = vec2(fbm3(p0 * 0.012 + vec2(uTime * 0.004, 0.0)), fbm3(p0 * 0.012 + vec2(5.2, -uTime * 0.003))) - 0.5;
+          vec2 p = p0 + wv * 60.0;
+          vec2 g = waveGrad(p, uTime, fp);
+          g += (vec2(fbm(p * 0.35 + uTime * 0.05), fbm(p * 0.35 - uTime * 0.04 + 9.0)) - 0.5) * 0.45 * (1.0 - smoothstep(0.4, 1.4, fp));
           vec3 n = normalize(vec3(-g.x, 1.0, -g.y));
           vec3 v = normalize(cameraPosition - vW);
           float fres = pow(1.0 - max(dot(n, v), 0.0), 4.0);
-          float shoreD = max(0.0, uShore - p.y + sin(p.x * 0.05) * 3.0);
+          float shoreD = max(0.0, uShore - p0.y + sin(p0.x * 0.05) * 3.0);
           vec3 base = mix(uShallow, uDeep, smoothstep(2.0, 90.0, shoreD));
           // painterly darker swell bands
-          float band = smoothstep(0.45, 0.55, fbm(p * 0.03 + vec2(0.0, uTime * 0.01)));
+          float band = smoothstep(0.42, 0.58, fbm(p * 0.03 + vec2(0.0, uTime * 0.01)));
           base *= 0.9 + 0.12 * band;
           vec3 skyR = mix(uHorizon, uSky, clamp(reflect(-v, n).y * 2.0, 0.0, 1.0));
           vec3 col = mix(base, skyR, clamp(fres * 0.85 + 0.12, 0.0, 1.0));
-          // glitter path
+          // glitter path: sparkles in irregular drifting clusters, averaged where they would be smaller than a pixel
           vec3 sd = normalize(uSunDir);
           vec3 r = reflect(-v, n);
           float s = max(dot(r, sd), 0.0);
           float path = pow(s, 14.0);
-          float spark = step(0.93 - path * 0.2, h12(floor(p * vec2(1.7, 3.0)) + floor(uTime * 7.0))) * pow(s, 6.0);
-          col += uSunCol * (pow(s, 220.0) * 6.0 + path * 0.35 + spark * 2.2) * uGlint * smoothstep(-0.12, 0.05, sd.y);
+          vec2 sc = floor(mat2(0.83, -0.56, 0.56, 0.83) * p * vec2(1.9, 3.4));
+          float cell = h12(sc + floor(uTime * 7.0 + h12(sc) * 5.0) * 1.37);
+          float clusters = smoothstep(0.3, 0.72, fbm3(p * 0.05 + vec2(uTime * 0.03, 0.0)));
+          float thr = 0.97 - path * 0.22 - clusters * 0.07;
+          float spark = mix(step(thr, cell), 1.0 - thr, smoothstep(0.25, 1.0, fp * 3.4)) * pow(s, 6.0) * (0.35 + clusters);
+          col += uSunCol * (pow(s, 220.0) * 6.0 + path * 0.35 + spark * 2.6) * uGlint * smoothstep(-0.12, 0.05, sd.y);
           // shore foam: lapping bands
-          float lap = sin(shoreD * 0.9 - uTime * 1.3 + fbm(p * 0.2) * 3.0);
+          float lap = sin(shoreD * 0.9 - uTime * 1.3 + fbm(p0 * 0.2) * 3.0);
           float foam = smoothstep(0.75, 0.95, lap) * (1.0 - smoothstep(0.0, 14.0, shoreD));
-          foam += 1.0 - smoothstep(0.0, 2.2 + sin(uTime * 0.8 + p.x * 0.1) * 0.8, shoreD);
-          foam *= smoothstep(0.35, 0.55, fbm(p * 0.6 + uTime * 0.1));
+          foam += 1.0 - smoothstep(0.0, 2.2 + sin(uTime * 0.8 + p0.x * 0.1) * 0.8, shoreD);
+          foam *= smoothstep(0.35, 0.55, fbm(p0 * 0.6 + uTime * 0.1));
           col = mix(col, vec3(0.98, 0.97, 0.95) * (0.75 + 0.25 * uSunCol), clamp(foam, 0.0, 1.0) * 0.85);
           float f = smoothstep(uFogNear, uFogFar, dist);
           col = mix(col, uFog, f);

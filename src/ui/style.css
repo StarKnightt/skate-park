@@ -22,12 +22,11 @@ body { font-family: 'Nunito', system-ui, sans-serif; color: var(--cream); }
 .trick .combo b { color: #ffe08a; font-weight: 900; }
 
 .hint { position: absolute; left: 18px; bottom: 16px; font-weight: 700; font-size: 13px; line-height: 1.55; color: var(--cream);
-  background: rgba(59, 42, 47, .28); padding: 9px 13px; border-radius: 12px; backdrop-filter: blur(4px); transition: opacity 1.2s; }
+  background: rgba(59, 42, 47, .28); padding: 9px 13px; border-radius: 12px; backdrop-filter: blur(4px); transition: opacity .5s; }
 .hint kbd { font-family: inherit; font-weight: 900; background: rgba(255, 248, 236, .18); border-radius: 5px; padding: 0 5px; }
-.hint.hide { opacity: 0; }
-.hint.touch { left: max(12px, env(safe-area-inset-left)); bottom: auto; top: 56px; font-size: 11.5px; padding: 7px 10px; max-width: min(92vw, 420px); }
+.hint.hide { opacity: 0; visibility: hidden; transition: opacity 1.2s, visibility 0s linear 1.2s; }
+.hint.mobile { left: max(12px, env(safe-area-inset-left)); bottom: auto; top: 56px; font-size: 11.5px; padding: 7px 10px; max-width: min(92vw, 420px); }
 
-.topbar { position: absolute; right: 14px; top: 12px; display: flex; gap: 8px; pointer-events: auto; }
 .pill { pointer-events: auto; border: 0; cursor: pointer; font-family: inherit; font-weight: 800; font-size: 13px; color: var(--ink);
   background: rgba(255, 248, 236, .78); padding: 8px 13px; border-radius: 999px; display: flex; align-items: center; gap: 7px;
   box-shadow: 0 3px 12px rgba(120, 60, 50, .18); backdrop-filter: blur(6px); transition: transform .15s, background .2s; }
@@ -35,6 +34,18 @@ body { font-family: 'Nunito', system-ui, sans-serif; color: var(--cream); }
 .pill:active { transform: scale(.96); }
 .pill svg { width: 17px; height: 17px; }
 .pill.icon { padding: 8px 10px; }
+/* top-right pills: small and faint while skating, fully visible on pointer movement / hover / tap */
+.topbar { position: absolute; right: 12px; top: 10px; display: flex; gap: 6px; pointer-events: auto; opacity: .32;
+  transition: opacity .6s ease; }
+.topbar.awake, .topbar:hover, .topbar:focus-within { opacity: 1; transition: opacity .15s ease; }
+.topbar .pill { font-size: 11.5px; padding: 5px 10px; gap: 5px; box-shadow: 0 2px 8px rgba(120, 60, 50, .14); }
+.topbar .pill svg { width: 14px; height: 14px; }
+.topbar .pill.icon { padding: 5px 7px; min-width: 26px; justify-content: center; }
+@media (pointer: coarse) {
+  .topbar { opacity: .5; }
+  .topbar .pill { font-size: 12px; padding: 8px 11px; }
+  .topbar .pill.icon { padding: 8px 9px; min-width: 34px; }
+}
 
 .help { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); pointer-events: auto; width: min(560px, 92vw);
   max-height: 86vh; overflow: auto; background: rgba(255, 248, 236, .94); color: var(--ink); border-radius: 18px; padding: 18px 22px;
@@ -49,7 +60,7 @@ body { font-family: 'Nunito', system-ui, sans-serif; color: var(--cream); }
 
 .toast { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); font-weight: 800; font-size: 13px; color: var(--ink);
   background: rgba(255, 248, 236, .82); padding: 7px 14px; border-radius: 999px; transition: opacity .6s; pointer-events: none; }
-.toast.hide { opacity: 0; }
+.toast.hide { opacity: 0; visibility: hidden; transition: opacity .6s, visibility 0s linear .6s; }
 
 .loading { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: linear-gradient(#f7b98c, #f3a7a0 55%, #a8a6dc);
   transition: opacity .7s; }
@@ -73,7 +84,9 @@ body { font-family: 'Nunito', system-ui, sans-serif; color: var(--cream); }
 .tbtn.ollie { right: max(20px, env(safe-area-inset-right)); bottom: max(26px, env(safe-area-inset-bottom)); width: 96px; height: 96px; font-size: 15px; }
 .tbtn.grind { right: max(128px, calc(env(safe-area-inset-right) + 108px)); bottom: max(34px, env(safe-area-inset-bottom)); width: 64px; height: 64px; }
 .tbtn.manual { right: max(36px, env(safe-area-inset-right)); bottom: max(136px, calc(env(safe-area-inset-bottom) + 116px)); width: 64px; height: 64px; }
-.swipehint { position: absolute; right: 12px; bottom: 200px; font-size: 11px; font-weight: 800; opacity: .8; text-align: right; }
+.swipehint { position: absolute; right: 12px; bottom: 200px; font-size: 11px; font-weight: 800; opacity: .8; text-align: right;
+  transition: opacity 1.2s; }
+.hints-off .swipehint { opacity: 0; }
 @media (orientation: landscape) and (max-height: 500px) {
   .tbtn.manual { bottom: max(124px, env(safe-area-inset-bottom)); right: max(30px, env(safe-area-inset-right)); }
   .swipehint { bottom: 186px; }

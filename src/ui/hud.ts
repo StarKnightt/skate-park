@@ -6,6 +6,8 @@ const MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-
 const SOUND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>';
 const MUTE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg>';
 
+const HINT_SECONDS = 6;
+
 /** Minimal HUD: trick name + combo pop, fading hint, time of day + sound + help buttons. */
 export class Hud {
   root = document.createElement('div');
@@ -13,12 +15,15 @@ export class Hud {
   private comboEl: HTMLDivElement;
   private hintEl: HTMLDivElement;
   private helpEl: HTMLDivElement;
+  private topEl: HTMLDivElement;
   private todBtn: HTMLButtonElement;
   private soundBtn: HTMLButtonElement;
   private toastEl: HTMLDivElement;
   private trickT = 0;
   private comboT = 0;
   private hintT = 0;
+  private promptOn = false;
+  private sleepTimer = 0;
   onTimeOfDay: () => void = () => {};
   onSound: () => void = () => {};
 
@@ -70,8 +75,9 @@ export class Hud {
     this.nameEl = this.root.querySelector('.name')!;
     this.comboEl = this.root.querySelector('.combo')!;
     this.hintEl = this.root.querySelector('.hint')!;
-    if (touch) this.hintEl.classList.add('touch');
+    if (touch) this.hintEl.classList.add('mobile');
     this.helpEl = this.root.querySelector('.help')!;
+    this.topEl = this.root.querySelector('.topbar')!;
     this.todBtn = this.root.querySelector('.tod')!;
     this.soundBtn = this.root.querySelector('.snd')!;
     this.toastEl = this.root.querySelector('.toast')!;
@@ -79,10 +85,26 @@ export class Hud {
     this.soundBtn.addEventListener('click', (e) => { e.stopPropagation(); this.onSound(); });
     this.root.querySelector('.hlp')!.addEventListener('click', (e) => { e.stopPropagation(); this.toggleHelp(); });
     this.root.querySelector('.close')!.addEventListener('click', (e) => { e.stopPropagation(); this.toggleHelp(false); });
-    for (const b of this.root.querySelectorAll('button')) b.addEventListener('pointerdown', (e) => e.stopPropagation());
+    for (const b of this.root.querySelectorAll('button')) b.addEventListener('pointerdown', (e) => { e.stopPropagation(); this.wake(4000); this.dismissPrompt(); });
+    // top-right pills: faint while playing, fully visible on pointer movement / hover / tap
+    addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse') this.wake(2500); });
+    addEventListener('pointerdown', (e) => this.wake(e.pointerType === 'mouse' ? 2500 : 3500));
+    // the sound prompt goes away on the first input
+    const firstInput = () => this.dismissPrompt();
+    addEventListener('keydown', firstInput); addEventListener('pointerdown', firstInput);
   }
 
-  toggleHelp(v?: boolean) { this.helpEl.classList.toggle('show', v); }
+  private wake(ms: number) {
+    this.topEl.classList.add('awake');
+    clearTimeout(this.sleepTimer);
+    this.sleepTimer = window.setTimeout(() => this.topEl.classList.remove('awake'), ms);
+  }
+
+  /** help overlay; closing it brings the short controls hint back for a few seconds */
+  toggleHelp(v?: boolean) {
+    const open = this.helpEl.classList.toggle('show', v);
+    if (open) this.hintEl.classList.add('hide'); else this.showHint();
+  }
   setTimeLabel(name: string) {
     const night = name.startsWith('Blue');
     this.todBtn.innerHTML = (night ? MOON : SUN) + `<span>${name}</span>`;
@@ -103,17 +125,25 @@ export class Hud {
     this.comboEl.classList.add('show');
     this.comboT = final ? 2.0 : 99;
   }
-  toast(msg: string, t = 3) { this.toastEl.textContent = msg; this.toastEl.classList.remove('hide'); this.toastT = t; }
+  toast(msg: string, t = 3) { this.toastEl.textContent = msg; this.toastEl.classList.remove('hide'); this.toastT = t; this.promptOn = false; }
   private toastT = 0;
+  /** small "click for sound" prompt: a few seconds, or until the first key / click / tap */
+  soundPrompt() { this.toast('Click or press a key for sound', 3.5); this.promptOn = true; }
+  private dismissPrompt() {
+    if (!this.promptOn) return;
+    this.promptOn = false; this.toastT = 0; this.toastEl.classList.add('hide');
+  }
 
   update(dt: number) {
-    this.hintT += dt;
-    if (this.hintT > 9) this.hintEl.classList.add('hide');
+    if (this.hintT < HINT_SECONDS) {
+      this.hintT += dt;
+      if (this.hintT >= HINT_SECONDS) { this.hintEl.classList.add('hide'); document.body.classList.add('hints-off'); }
+    }
     if (this.trickT > 0) { this.trickT -= dt; if (this.trickT <= 0) this.nameEl.classList.remove('show'); }
     if (this.comboT > 0 && this.comboT < 90) { this.comboT -= dt; if (this.comboT <= 0) this.comboEl.classList.remove('show'); }
-    if (this.toastT > 0) { this.toastT -= dt; if (this.toastT <= 0) this.toastEl.classList.add('hide'); }
+    if (this.toastT > 0) { this.toastT -= dt; if (this.toastT <= 0) { this.toastEl.classList.add('hide'); this.promptOn = false; } }
   }
-  showHint() { this.hintT = 0; this.hintEl.classList.remove('hide'); }
+  showHint() { this.hintT = 0; this.hintEl.classList.remove('hide'); document.body.classList.remove('hints-off'); }
 }
 
 /** On-screen touch controls: left stick, OLLIE (hold / swipe release for flips), GRIND, MANUAL, drag to orbit. */

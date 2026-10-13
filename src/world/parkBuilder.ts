@@ -1,6 +1,7 @@
 import { BufferAttribute, BufferGeometry, ShapeUtils, Vector2, Vector3 } from 'three';
 
-export const enum Surface { Concrete = 0, Wood = 1, Sand = 2 }
+/** Barrier = invisible block-only fence just behind a visible barrier (physics never bails on it). */
+export const enum Surface { Concrete = 0, Wood = 1, Sand = 2, Barrier = 9 }
 
 export interface Bucket { pos: number[]; nor: number[]; uv: number[]; col: number[]; idx: number[] }
 
@@ -8,6 +9,8 @@ export interface BuildOpts {
   collide?: boolean;
   surface?: Surface;
   color?: [number, number, number];
+  /** per-vertex colour for the visual bucket (overrides `color`); never affects collision */
+  vcolor?: (p: Vector3, n: Vector3) => [number, number, number];
   visual?: boolean;
   uv?: (p: Vector3) => [number, number];
 }
@@ -34,11 +37,12 @@ export class ParkBuilder {
     if (visual) {
       const b = this.bucket(key!);
       const base = b.pos.length / 3;
-      const col = o.color ?? [1, 1, 1];
+      const col0 = o.color ?? [1, 1, 1];
       for (let i = 0; i < verts.length; i += 3) {
         b.pos.push(verts[i], verts[i + 1], verts[i + 2]);
         b.nor.push(normals[i], normals[i + 1], normals[i + 2]);
         if (o.uv) { const uv = o.uv(_a.set(verts[i], verts[i + 1], verts[i + 2])); b.uv.push(uv[0], uv[1]); } else b.uv.push(0, 0);
+        const col = o.vcolor ? o.vcolor(_a.set(verts[i], verts[i + 1], verts[i + 2]), _n.set(normals[i], normals[i + 1], normals[i + 2])) : col0;
         b.col.push(col[0], col[1], col[2]);
       }
       for (const t of tris) b.idx.push(base + t);
@@ -110,7 +114,12 @@ export class ParkBuilder {
     const all = [...outline, ...holes.flat()];
     const verts: number[] = [], normals: number[] = [], tris: number[] = [];
     for (const p of all) { verts.push(p.x, p.y, p.z); normals.push(n.x, n.y, n.z); }
-    for (const f of faces) tris.push(f[0], f[1], f[2]);
+    const c2 = [...contour, ...hs.flat()];
+    for (const f of faces) {
+      const p = c2[f[0]], q = c2[f[1]], r = c2[f[2]];
+      if (Math.abs((q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x)) < 1e-9) continue; // collinear outline vertices
+      tris.push(f[0], f[1], f[2]);
+    }
     this.fixWinding(verts, normals, tris);
     this.addMesh(key, verts, normals, tris, o);
   }

@@ -1,15 +1,21 @@
-"""Assemble, rig and export the skater GLB.
+"""Assemble, rig and export the skater GLB (and the background-people GLB from the same mesh + rig).
 
-blender -b --factory-startup --threads 4 --python build_skater.py -- <config.json>
+blender -b --factory-startup --threads 8 --python build_skater.py -- <config.json>
 
-config: { "bryce": fbx, "parts_dir": dir with *.obj + parts.json, "face_png": png,
-          "anims": [[name, fbx], ...], "out_glb": path, "preview_dir": dir }
+config: { "bryce": fbx, "parts_dir": dir with *.obj + parts.json, "face_png": png, "skeleton": bryce_skeleton.json,
+          "anims": [[name, fbx] or [name, fbx, {"hips_dy": metres}], ...], "out_glb": path, "preview_dir": dir,
+          "people": {"anims": [...], "out_glb": path} }
 Raw Mixamo FBX are only read here; the output GLB bakes the skeleton + clips into the product.
+Vertex colours: Col (COLOR_0) = flat part colour, Col1 (COLOR_1) = (flutter, fold, 0, 1) cloth masks.
 """
 import bpy, bmesh, sys, json, os, math
+import numpy as np
 from mathutils import Vector, Matrix
 
 cfg = json.load(open(sys.argv[sys.argv.index("--") + 1:][0]))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "character"))
+import cloth_masks
+SKEL = json.load(open(cfg.get("skeleton") or os.path.join(os.path.dirname(cfg["parts_dir"]), "bryce_skeleton.json")))["bones"]
 LOG = []
 
 
@@ -104,7 +110,20 @@ for p in parts:
     attr = me.color_attributes.new(name="Col", type="FLOAT_COLOR", domain="CORNER")
     for d in attr.data:
         d.color = lin
+    # cloth masks from the rest-pose position (blender (x, y, z) -> glTF (x, z, -y))
+    co = np.empty(len(me.vertices) * 3)
+    me.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    flut, fold = cloth_masks.masks(p["name"], np.stack([co[:, 0], co[:, 2], -co[:, 1]], 1), SKEL)
+    c1 = np.zeros((len(co), 4), np.float32)
+    c1[:, 0], c1[:, 1], c1[:, 3] = flut, fold, 1.0
+    attr1 = me.color_attributes.new(name="Col1", type="FLOAT_COLOR", domain="POINT")
+    attr1.data.foreach_set("color", c1.ravel())
     me.color_attributes.active_color = attr
+    try:
+        me.color_attributes.render_color_index = me.color_attributes.find("Col")
+    except Exception as e:
+        log("render_color_index", e)
     me.materials.clear()
     if p["material"] == "face":
         me.materials.append(mat_face)
@@ -178,10 +197,37 @@ def rigid_to(o, bone, cond=None):
         vg_target.add([v.index], 1.0, "REPLACE")
 
 
+def _ss(a, b, x):
+    t = min(max((x - a) / (b - a), 0.0), 1.0)
+    return t * t * (3 - 2 * t)
+
+
+def neck_blend(o):
+    """Neck skin (below the skull, behind the jaw): Spine2 -> Neck -> Head by height, so head turns twist the
+    whole neck instead of creasing at its base (bone heat gives the throat mostly to the Head bone)."""
+    gs = [o.vertex_groups.get(n) or o.vertex_groups.new(name=n) for n in ("mixamorig:Spine2", "mixamorig:Neck", "mixamorig:Head")]
+    for v in o.data.vertices:
+        c = o.matrix_world @ v.co
+        y, z = c.z, -c.y
+        zj = 0.049 - (y - 1.52) * 1.2   # jaw line: the chin and face stay on the Head bone
+        f = 1.0 - _ss(zj - 0.012, zj + 0.012, z) if y < 1.585 else 0.0
+        if f <= 0:
+            continue
+        t = min(max((y - 1.47) / 0.105, 0.0), 1.0)
+        wh, ws = _ss(0.55, 1.0, t), 1.0 - _ss(0.0, 0.3, t)
+        for g in v.groups:
+            g.weight *= (1.0 - f)
+        for g, w in zip(gs, (ws, max(0.0, 1.0 - wh - ws), wh)):
+            if w * f > 1e-4:
+                g.add([v.index], w * f, "ADD")
+
+
 H = "mixamorig:Head"
 for o in objs:
     if o.name in ("cap", "hair"):
         rigid_to(o, H)
+    elif o.name == "head":
+        neck_blend(o)
 
 bpy.data.objects.remove(proxy, do_unlink=True)
 arm.data.pose_position = "POSE"
@@ -206,7 +252,9 @@ log("body tris", len(body.data.polygons), "verts", len(body.data.vertices), "vgr
 # weight sanity check at known body locations (blender coords: x, -z_gltf, y_gltf)
 _names = {g.index: g.name for g in body.vertex_groups}
 for tgt, want in [((0.6, 0.0, 1.42), "ForeArm"), ((0.35, 0.0, 1.42), "Arm"), ((0.14, 0.0, 0.3), "Leg"), ((0.0, 0.0, 1.65), "Head"),
-                  ((0.0, 0.0, 1.2), "Spine"), ((0.11, 0.0, 0.7), "UpLeg")]:
+                  ((0.0, 0.0, 1.2), "Spine"), ((0.11, 0.0, 0.7), "UpLeg"), ((0.845, 0.011, 1.4065), "LeftHandMiddle"),
+                  ((-0.845, 0.011, 1.4065), "RightHandMiddle"), ((0.8375, -0.0185, 1.4015), "LeftHandIndex"),
+                  ((0.777, -0.0455, 1.365), "LeftHandThumb"), ((0.0, -0.02, 1.52), "Neck")]:
     t = Vector(tgt)
     best = min(body.data.vertices, key=lambda v: ((body.matrix_world @ v.co) - t).length)
     ws = sorted([(_names[g.group].replace("mixamorig:", ""), round(g.weight, 2)) for g in best.groups], key=lambda x: -x[1])[:3]
@@ -227,44 +275,62 @@ def action_fcurves(act):
     return out
 
 
-if not arm.animation_data:
-    arm.animation_data_create()
-for name, fbx in cfg["anims"]:
-    before_objs = set(scene.objects)
-    before_acts = set(bpy.data.actions)
-    bpy.ops.import_scene.fbx(filepath=fbx, automatic_bone_orientation=False, ignore_leaf_bones=False)
-    new_acts = [a for a in bpy.data.actions if a not in before_acts]
-    if not new_acts:
-        log("NO ACTION in", fbx)
-        continue
-    act = max(new_acts, key=lambda a: len(action_fcurves(a)))
-    act.name = name
-    act.use_fake_user = True
-    for fc in action_fcurves(act):
-        if fc.data_path.endswith(".location"):
-            for kp in fc.keyframe_points:
-                kp.co.y *= 0.01
-                kp.handle_left.y *= 0.01
-                kp.handle_right.y *= 0.01
-            if "Hips" in fc.data_path:
-                log("  hips loc", name, fc.array_index, round(fc.keyframe_points[0].co.y, 3), round(fc.keyframe_points[-1].co.y, 3))
-    for o in [o for o in scene.objects if o not in before_objs]:
-        bpy.data.objects.remove(o, do_unlink=True)
-    for a in new_acts:
-        if a is not act:
-            bpy.data.actions.remove(a)
-    track = arm.animation_data.nla_tracks.new()
-    track.name = name
-    fr = act.frame_range
-    strip = track.strips.new(name, int(fr[0]), act)
-    if hasattr(strip, "action_slot") and len(getattr(act, "slots", [])):
-        try:
-            strip.action_slot = act.slots[0]
-        except Exception as e:
-            log("slot assign failed", e)
-    track.mute = False
-    log("anim", name, "frames", tuple(fr), "fcurves", len(action_fcurves(act)))
-arm.animation_data.action = None
+REST_HIPS_Y = SKEL["mixamorig:Hips"]["head"][1]
+CLIP_INFO = {}
+
+
+def import_anims(anims):
+    """Import Mixamo clips as NLA tracks. Entry: [name, fbx] or [name, fbx, {"hips_dy": metres}]."""
+    if not arm.animation_data:
+        arm.animation_data_create()
+    for entry in anims:
+        name, fbx = entry[0], entry[1]
+        opt = entry[2] if len(entry) > 2 else {}
+        before_objs = set(scene.objects)
+        before_acts = set(bpy.data.actions)
+        bpy.ops.import_scene.fbx(filepath=fbx, automatic_bone_orientation=False, ignore_leaf_bones=False)
+        new_acts = [a for a in bpy.data.actions if a not in before_acts]
+        if not new_acts:
+            log("NO ACTION in", fbx)
+            continue
+        act = max(new_acts, key=lambda a: len(action_fcurves(a)))
+        act.name = name
+        act.use_fake_user = True
+        hips_y = None
+        for fc in action_fcurves(act):
+            if fc.data_path.endswith(".location"):
+                dy = opt.get("hips_dy", 0.0) if ("Hips" in fc.data_path and fc.array_index == 1) else 0.0
+                for kp in fc.keyframe_points:
+                    kp.co.y = kp.co.y * 0.01 + dy
+                    kp.handle_left.y = kp.handle_left.y * 0.01 + dy
+                    kp.handle_right.y = kp.handle_right.y * 0.01 + dy
+                if "Hips" in fc.data_path:
+                    log("  hips loc", name, fc.array_index, round(fc.keyframe_points[0].co.y, 3), round(fc.keyframe_points[-1].co.y, 3))
+                    if fc.array_index == 1:
+                        ys = [kp.co.y for kp in fc.keyframe_points]
+                        hips_y = (round(REST_HIPS_Y + ys[0], 3), round(REST_HIPS_Y + min(ys), 3), round(REST_HIPS_Y + max(ys), 3))
+        for o in [o for o in scene.objects if o not in before_objs]:
+            bpy.data.objects.remove(o, do_unlink=True)
+        for a in new_acts:
+            if a is not act:
+                bpy.data.actions.remove(a)
+        track = arm.animation_data.nla_tracks.new()
+        track.name = name
+        fr = act.frame_range
+        strip = track.strips.new(name, int(fr[0]), act)
+        if hasattr(strip, "action_slot") and len(getattr(act, "slots", [])):
+            try:
+                strip.action_slot = act.slots[0]
+            except Exception as e:
+                log("slot assign failed", e)
+        track.mute = False
+        CLIP_INFO[name] = {"frames": int(fr[1] - fr[0]), "seconds": round((fr[1] - fr[0]) / 30.0, 2), "hips_y_first_min_max": hips_y,
+                           "source": os.path.basename(fbx)}
+        log("anim", name, "frames", tuple(fr), "fcurves", len(action_fcurves(act)), "hips y (first,min,max)", hips_y)
+    arm.animation_data.action = None
+
+
+import_anims(cfg["anims"])
 
 # ------------------------------------------------------------------ previews (EEVEE)
 def preview():
@@ -308,22 +374,46 @@ except Exception as e:
     log("preview failed", e)
 
 # ------------------------------------------------------------------ export
-select_only([arm, body], arm)
-props = {p.identifier for p in bpy.ops.export_scene.gltf.get_rna_type().properties}
-opts = dict(filepath=cfg["out_glb"], export_format="GLB", use_selection=True, export_yup=True, export_apply=False,
-            export_texcoords=True, export_normals=True, export_materials="EXPORT", export_skins=True,
-            export_animations=True, export_morph=False, export_lights=False, export_cameras=False)
-extra = dict(export_animation_mode="NLA_TRACKS", export_force_sampling=True, export_def_bones=True,
-             export_rest_position_armature=True, export_optimize_animation_size=True, export_vertex_color="ACTIVE",
-             export_all_vertex_colors=False, export_image_format="AUTO", export_anim_slide_to_zero=True,
-             export_reset_pose_bones=True, export_bake_animation=False)
-for k, v in extra.items():
-    if k in props:
-        opts[k] = v
-opts = {k: v for k, v in opts.items() if k in props or k == "filepath"}
-log("export opts", sorted(opts.keys()))
-bpy.ops.export_scene.gltf(**opts)
-log("exported", cfg["out_glb"], os.path.getsize(cfg["out_glb"]))
+log("color attributes", [(a.name, a.domain, a.data_type) for a in body.data.color_attributes])
+_c1 = np.empty(len(body.data.vertices) * 4, np.float32)
+body.data.color_attributes["Col1"].data.foreach_get("color", _c1)
+_c1 = _c1.reshape(-1, 4)
+log("Col1 flutter>0.5 %.3f fold>0.5 %.3f" % ((_c1[:, 0] > 0.5).mean(), (_c1[:, 1] > 0.5).mean()))
+
+
+def export(path):
+    select_only([arm, body], arm)
+    props = {p.identifier for p in bpy.ops.export_scene.gltf.get_rna_type().properties}
+    opts = dict(filepath=path, export_format="GLB", use_selection=True, export_yup=True, export_apply=False,
+                export_texcoords=True, export_normals=True, export_materials="EXPORT", export_skins=True,
+                export_animations=True, export_morph=False, export_lights=False, export_cameras=False)
+    extra = dict(export_animation_mode="NLA_TRACKS", export_force_sampling=True, export_def_bones=True,
+                 export_rest_position_armature=True, export_optimize_animation_size=True, export_vertex_color="ACTIVE",
+                 export_all_vertex_colors=True, export_image_format="AUTO", export_anim_slide_to_zero=True,
+                 export_reset_pose_bones=True, export_bake_animation=False)
+    for k, v in extra.items():
+        if k in props:
+            opts[k] = v
+    opts = {k: v for k, v in opts.items() if k in props or k == "filepath"}
+    log("export opts", sorted(opts.keys()))
+    bpy.ops.export_scene.gltf(**opts)
+    log("exported", path, os.path.getsize(path))
+
+
+export(cfg["out_glb"])
 if cfg.get("blend_out"):
     bpy.ops.wm.save_as_mainfile(filepath=cfg["blend_out"])
+skater_clips = dict(CLIP_INFO)
+
+# ------------------------------------------------------------------ background people: same mesh + rig, other clips
+if cfg.get("people"):
+    for t in list(arm.animation_data.nla_tracks):
+        arm.animation_data.nla_tracks.remove(t)
+    for a in list(bpy.data.actions):
+        bpy.data.actions.remove(a)
+    CLIP_INFO.clear()
+    import_anims(cfg["people"]["anims"])
+    export(cfg["people"]["out_glb"])
+json.dump({"skater": skater_clips, "people": dict(CLIP_INFO) if cfg.get("people") else {}},
+          open(os.path.join(os.path.dirname(cfg["out_glb"]), "clip_info.json"), "w"), indent=1)
 open(os.path.join(os.path.dirname(cfg["out_glb"]), "build_skater.log"), "w").write("\n".join(LOG))

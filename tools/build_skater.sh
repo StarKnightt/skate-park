@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
-# Full skater pipeline: SDF model -> face texture -> Blender rig + Mixamo clips -> optimised GLB.
-# Runs every heavy step sequentially at below-normal priority. Raw Mixamo FBX are read in place, never copied.
+# Full skater pipeline: SDF model -> face textures -> Blender rig + Mixamo clips -> optimised GLBs
+# (public/models/skater.glb + public/models/people.glb, public/textures/face_*.webp).
+# Only the Blender step is a heavy job: it takes the global lock itself (run this script directly, not via heavy.sh).
+# Raw Mixamo FBX are read in place, never copied. SKIP_SDF=1 reuses the existing parts.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 B=.agent-notes/build
-BLENDER='E:\blender\blender-5.1.2-windows-x64\blender.exe'
+BLENDER=/e/blender/blender-5.1.2-windows-x64/blender.exe
+OWNER=${HEAVY_OWNER:-chars}
 mkdir -p "$B/parts"
-lowprio() { powershell -NoProfile -Command "\$p = Start-Process -FilePath '$1' -ArgumentList $2 -PassThru -NoNewWindow -RedirectStandardOutput '$3' -RedirectStandardError '$3.err'; \$p.PriorityClass = 'BelowNormal'; \$p.WaitForExit(); exit \$p.ExitCode"; }
 if [ "${SKIP_SDF:-0}" != "1" ]; then
-  lowprio python "'tools/character/sdf_skater.py','$B/parts','$B/bryce_skeleton.json'" "$B/sdf.log"
+  python tools/character/sdf_skater.py "$B/parts" "$B/bryce_skeleton.json" > "$B/sdf.log" 2> "$B/sdf.err"
+  tail -3 "$B/sdf.log"
 fi
-python tools/character/paint_face.py "$B/face.png"
-lowprio "$BLENDER" "'-b','--factory-startup','--threads','4','--python-exit-code','1','--python','tools/blender/build_skater.py','--','$B/skater_cfg.json'" "$B/build.log"
-grep -E "^(weights|body|proxy|uv)" "$B/build_skater.log" || true
-npx gltf-transform resample "$B/skater_raw.glb" "$B/skater_rs.glb" > /dev/null
-npx gltf-transform prune "$B/skater_rs.glb" "$B/skater_pr.glb" > /dev/null
-npx gltf-transform webp "$B/skater_pr.glb" "$B/skater_wp.glb" --quality 90 > /dev/null
-npx gltf-transform meshopt "$B/skater_wp.glb" public/models/skater.glb --level medium > /dev/null
-ls -la public/models/skater.glb
+python tools/character/paint_face.py "$B/face.png" public/textures
+rm -f "$B/skater_raw.glb" "$B/people_raw.glb"
+bash tools/heavy.sh "$OWNER" "$BLENDER" -b --factory-startup --threads 8 --python-exit-code 1 \
+  --python tools/blender/build_skater.py -- "$B/skater_cfg.json" > "$B/build.log" 2> "$B/build.log.err"
+grep -E "^(weights|body|proxy|uv|color|Col1)" "$B/build_skater.log" || true
+optimise() {  # <raw.glb> <out.glb>
+  local s="${1%_raw.glb}"
+  npx gltf-transform resample "$1" "${s}_rs.glb" > /dev/null
+  npx gltf-transform prune "${s}_rs.glb" "${s}_pr.glb" --keep-attributes true > /dev/null
+  npx gltf-transform webp "${s}_pr.glb" "${s}_wp.glb" --quality 90 > /dev/null
+  npx gltf-transform meshopt "${s}_wp.glb" "$2" --level medium > /dev/null
+}
+optimise "$B/skater_raw.glb" public/models/skater.glb
+if [ -f "$B/people_raw.glb" ]; then optimise "$B/people_raw.glb" public/models/people.glb; fi
+ls -la public/models/*.glb public/textures/face_*.webp

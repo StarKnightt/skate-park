@@ -6,7 +6,7 @@ import {
 const GRADE = /* glsl */ `
 uniform float uSat, uContrast, uExposure, uGrain, uTime, uVig;
 uniform vec3 uTint, uVigColor, uLift;
-float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+float gh(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor) {
   vec3 c = inputColor.rgb * uTint;
   float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
@@ -15,11 +15,14 @@ void mainImage(const in vec4 inputColor, const in vec2 uv, out vec4 outputColor)
   vec3 g = pow(max(c, 0.0), vec3(1.0 / 2.2));
   g = (g - 0.5) * uContrast + 0.5;
   g += uLift * (1.0 - g);
-  // warm vignette (never black)
-  vec2 q = uv - 0.5;
-  float v = smoothstep(0.32, 0.85, length(q * vec2(1.15, 1.0)));
+  // warm vignette (never black), round in screen space whatever the aspect ratio
+  float asp = resolution.x / resolution.y;
+  vec2 q = (uv - 0.5) * vec2(asp, 1.0) / length(vec2(asp, 1.0) * 0.5);
+  float v = smoothstep(0.42, 1.05, length(q));
   g = mix(g, g * uVigColor, v * uVig);
-  g += (hash(uv * 900.0 + fract(uTime)) - 0.5) * uGrain;
+  // per-pixel triangular dither: hides 8-bit banding in the sky without a visible grain pattern
+  vec2 fc = gl_FragCoord.xy + fract(uTime * 7.31) * vec2(113.0, 71.0);
+  g += (gh(fc) + gh(fc + 37.7) - 1.0) * uGrain;
   outputColor = vec4(pow(max(g, 0.0), vec3(2.2)), inputColor.a);
 }`;
 
@@ -27,7 +30,7 @@ export class GradeEffect extends Effect {
   constructor() {
     super('GradeEffect', GRADE, {
       uniforms: new Map<string, Uniform>([
-        ['uSat', new Uniform(1.1)], ['uContrast', new Uniform(1.04)], ['uExposure', new Uniform(1)], ['uGrain', new Uniform(0.012)],
+        ['uSat', new Uniform(1.1)], ['uContrast', new Uniform(1.04)], ['uExposure', new Uniform(1)], ['uGrain', new Uniform(0.005)],
         ['uTime', new Uniform(0)], ['uVig', new Uniform(0.55)], ['uTint', new Uniform(new Color(1, 1, 1))],
         ['uVigColor', new Uniform(new Color(0.78, 0.62, 0.66))], ['uLift', new Uniform(new Color(0.02, 0.012, 0.03))],
       ]),
@@ -49,7 +52,9 @@ export class Post {
     this.tone = new ToneMappingEffect({ mode: ToneMappingMode.NEUTRAL });
     this.grade = new GradeEffect();
     this.fxaa = new FXAAEffect();
-    this.pass = new EffectPass(camera, this.bloom, this.tone, this.grade, ...(msaa ? [] : [this.fxaa]));
+    // FXAA has to come first in the merged pass: it reads its neighbours from the raw input buffer, so after the grade it
+    // would mix graded and raw values and paste raw (ungraded) pixels wherever their difference crossed its threshold
+    this.pass = new EffectPass(camera, ...(msaa ? [] : [this.fxaa]), this.bloom, this.tone, this.grade);
     this.composer.addPass(this.pass);
   }
   setSize(w: number, h: number) { this.composer.setSize(w, h); }

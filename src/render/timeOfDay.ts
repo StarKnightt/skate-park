@@ -5,7 +5,10 @@ export interface EnvState {
   sunDir: Vector3; // direction of the sun disc / sky glow
   lightDir: Vector3; // shadow casting light (sun or moon)
   lightColor: Color; lightIntensity: number;
+  /** sky ambient for toon materials: hemiSky = zenith, skySun / skyAnti = horizon towards / away from the sun,
+   *  hemiGround = bounce from below; all scaled by hemiIntensity */
   hemiSky: Color; hemiGround: Color; hemiIntensity: number;
+  skySun: Color; skyAnti: Color;
   zenith: Color; mid: Color; horizon: Color;
   glow: Color; glowStrength: number;
   cloudLit: Color; cloudShade: Color;
@@ -15,6 +18,8 @@ export interface EnvState {
   rim: Color; rimStrength: number;
   exposure: number; bloom: number; saturation: number; contrast: number;
   warmth: Color; shadowIntensity: number; windows: number;
+  /** PCF radius in texels: long soft shadows in low sun, short crisp ones at noon */
+  shadowRadius: number;
 }
 
 const dir = (azDeg: number, elDeg: number) => {
@@ -28,62 +33,70 @@ export const PRESETS: EnvState[] = [
   {
     name: 'Golden hour',
     sunDir: dir(34, 9), lightDir: dir(34, 11),
-    lightColor: C('#ffc48a'), lightIntensity: 3.2,
-    hemiSky: C('#a9b0ee'), hemiGround: C('#f2b48e'), hemiIntensity: 1.02,
+    lightColor: C('#ffe0a0'), lightIntensity: 4.8,
+    hemiSky: C('#b8b2e8'), hemiGround: C('#bab4c4'), hemiIntensity: 1.4,
+    skySun: C('#ffc49c'), skyAnti: C('#b4b8f0'),
     zenith: C('#7f94d4'), mid: C('#eca9b3'), horizon: C('#ffbf82'),
     glow: C('#ffd08e'), glowStrength: 1.0,
     cloudLit: C('#ffe0b8'), cloudShade: C('#c49cc0'),
     fog: C('#f6c49e'), fogNear: 70, fogFar: 620,
     deep: C('#4a76a6'), shallow: C('#6cc3b8'),
     lamps: 0, stars: 0,
-    rim: C('#ffc890'), rimStrength: 0.85,
-    exposure: 1.0, bloom: 0.55, saturation: 1.12, contrast: 1.04,
+    rim: C('#ffb070'), rimStrength: 1.0,
+    exposure: 1.0, bloom: 0.55, saturation: 1.06, contrast: 1.05,
     warmth: C('#fff3e6'), shadowIntensity: 1.0, windows: 0.15,
+    shadowRadius: 3.2,
   },
   {
     name: 'Sunset',
     sunDir: dir(30, 1.8), lightDir: dir(30, 4.5),
-    lightColor: C('#ff9c6e'), lightIntensity: 2.2,
-    hemiSky: C('#a7a6f0'), hemiGround: C('#e49a82'), hemiIntensity: 1.3,
+    lightColor: C('#ffac62'), lightIntensity: 4.8,
+    hemiSky: C('#b0a0e0'), hemiGround: C('#c4acb4'), hemiIntensity: 1.25,
+    skySun: C('#ffa882'), skyAnti: C('#a09ce8'),
     zenith: C('#5e6cb0'), mid: C('#ee8ea2'), horizon: C('#ff9a62'),
     glow: C('#ffa774'), glowStrength: 1.25,
     cloudLit: C('#ffb994'), cloudShade: C('#a585bf'),
     fog: C('#f3a68d'), fogNear: 60, fogFar: 560,
     deep: C('#3f5f97'), shallow: C('#64a8b0'),
     lamps: 0.45, stars: 0.05,
-    rim: C('#ffa27c'), rimStrength: 1.0,
-    exposure: 1.02, bloom: 0.7, saturation: 1.15, contrast: 1.05,
-    warmth: C('#fff0e6'), shadowIntensity: 0.9, windows: 0.55,
+    rim: C('#ff9a66'), rimStrength: 1.1,
+    exposure: 1.02, bloom: 0.7, saturation: 1.08, contrast: 1.05,
+    warmth: C('#fff0e6'), shadowIntensity: 0.92, windows: 0.55,
+    shadowRadius: 3.8,
   },
   {
     name: 'Blue hour',
     sunDir: dir(26, -5), lightDir: dir(-30, 38),
-    lightColor: C('#a8b8ff'), lightIntensity: 1.05,
-    hemiSky: C('#8b95f2'), hemiGround: C('#8a74b2'), hemiIntensity: 1.45,
-    zenith: C('#28398a'), mid: C('#5258b6'), horizon: C('#d38ebd'),
-    glow: C('#f0a0b0'), glowStrength: 0.75,
-    cloudLit: C('#c8a8d8'), cloudShade: C('#5d5fa8'),
-    fog: C('#8f84c4'), fogNear: 55, fogFar: 520,
-    deep: C('#2b3d80'), shallow: C('#4a78a8'),
+    lightColor: C('#a4b2ee'), lightIntensity: 0.55,
+    hemiSky: C('#7480c4'), hemiGround: C('#6a6a88'), hemiIntensity: 1.05,
+    skySun: C('#a490d0'), skyAnti: C('#6e7ac8'),
+    zenith: C('#101e60'), mid: C('#2546b4'), horizon: C('#7e9ce6'),
+    glow: C('#d098c0'), glowStrength: 0.28,
+    cloudLit: C('#8a90d6'), cloudShade: C('#29347e'),
+    fog: C('#2c3a72'), fogNear: 55, fogFar: 520,
+    deep: C('#13245a'), shallow: C('#2b4d86'),
     lamps: 1.0, stars: 1.0,
-    rim: C('#bfc8ff'), rimStrength: 0.9,
-    exposure: 1.12, bloom: 1.0, saturation: 1.1, contrast: 1.02,
-    warmth: C('#f4f2ff'), shadowIntensity: 0.6, windows: 1.0,
+    rim: C('#c8d0ff'), rimStrength: 0.9,
+    exposure: 1.0, bloom: 1.0, saturation: 1.06, contrast: 1.05,
+    warmth: C('#f0f2ff'), shadowIntensity: 0.55, windows: 1.0,
+    shadowRadius: 2.5,
   },
   {
     name: 'Bright noon',
     sunDir: dir(-25, 62), lightDir: dir(-25, 62),
-    lightColor: C('#fff3df'), lightIntensity: 2.6,
-    hemiSky: C('#a8d4ff'), hemiGround: C('#e2cfa6'), hemiIntensity: 1.2,
-    zenith: C('#4c9fe8'), mid: C('#8ec8f4'), horizon: C('#d6ecf6'),
+    lightColor: C('#fff0d8'), lightIntensity: 2.4,
+    hemiSky: C('#a8c8f8'), hemiGround: C('#d0c4b0'), hemiIntensity: 1.05,
+    skySun: C('#d4e4ff'), skyAnti: C('#a4c0f0'),
+    zenith: C('#2f7fe0'), mid: C('#69b0f0'), horizon: C('#c4e2f4'),
     glow: C('#fff6e0'), glowStrength: 0.45,
-    cloudLit: C('#ffffff'), cloudShade: C('#b5c6e2'),
-    fog: C('#d5e8f2'), fogNear: 90, fogFar: 760,
-    deep: C('#2a7bbd'), shallow: C('#4cc8c8'),
+    cloudLit: C('#ffffff'), cloudShade: C('#aebfe0'),
+    fog: C('#cfe5f2'), fogNear: 90, fogFar: 760,
+    deep: C('#1b68b4'), shallow: C('#34bcc4'),
     lamps: 0, stars: 0,
-    rim: C('#ffffff'), rimStrength: 0.45,
-    exposure: 0.98, bloom: 0.35, saturation: 1.08, contrast: 1.04,
+    rim: C('#ffffff'), rimStrength: 0.4,
+    exposure: 0.9, bloom: 0.3, saturation: 1.12, contrast: 1.12,
     warmth: C('#ffffff'), shadowIntensity: 1.0, windows: 0.0,
+    shadowRadius: 1.3,
   },
 ];
 

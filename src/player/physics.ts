@@ -1,12 +1,12 @@
 import { Quaternion, Vector3, Matrix4 } from 'three';
 import type { CollisionWorld, Hit } from '../world/collision';
 import type { GrindLine } from '../world/park';
-import { clamp, carryVector, Spring } from '../core/util';
+import { clamp, carryVector, Spring, rng } from '../core/util';
 
 export type FlipDir = 'left' | 'right' | 'down' | 'up';
 export type FlipKind = 'kickflip' | 'heelflip' | 'shuvit' | 'treflip';
 export type Mode = 'ride' | 'air' | 'grind' | 'bail' | 'recover';
-export type BailKind = 'face' | 'back' | 'knock' | 'roll';
+export type BailKind = 'face' | 'back' | 'knock' | 'roll' | 'wall';
 
 export interface SkateInput {
   steer: number; // -1 left .. 1 right
@@ -29,18 +29,206 @@ export const emptyInput = (): SkateInput => ({
 
 export interface SkateEvent { type: string; [k: string]: any }
 
+/** Collision surface id of invisible barriers (fences): they block and bounce, they never cause a bail. */
+export const SURF_BARRIER = 9;
+
 const G = 9.81;
 const Y = new Vector3(0, 1, 0);
+const TRUCK = 0.18;
+export const KICKTURN_T = 0.44;
+/** Ollie pop speed: a quick tap pops ~1.85 m/s (0.38 s of air), a full crouch (>= 0.3 s) ~2.8 m/s (0.57 s). */
+const POP_MIN = 1.85, POP_MAX = 2.8;
 const FLIPS: Record<FlipDir, { kind: FlipKind; dur: number; name: string; pts: number }> = {
-  left: { kind: 'kickflip', dur: 0.46, name: 'Kickflip', pts: 250 },
-  right: { kind: 'heelflip', dur: 0.46, name: 'Heelflip', pts: 250 },
-  down: { kind: 'shuvit', dur: 0.40, name: 'Pop Shove-It', pts: 200 },
-  up: { kind: 'treflip', dur: 0.58, name: 'Tre Flip', pts: 500 },
+  left: { kind: 'kickflip', dur: 0.2, name: 'Kickflip', pts: 250 },
+  right: { kind: 'heelflip', dur: 0.2, name: 'Heelflip', pts: 250 },
+  down: { kind: 'shuvit', dur: 0.19, name: 'Pop Shove-It', pts: 200 },
+  up: { kind: 'treflip', dur: 0.25, name: 'Tre Flip', pts: 500 },
 };
+/** Body collision spheres along the board normal (height, radius); the top one covers head and shoulders. */
+const BODY: [number, number][] = [[0.45, 0.25], [0.95, 0.26], [1.3, 0.29], [1.58, 0.31]];
 
-const _v = new Vector3(), _v2 = new Vector3(), _v3 = new Vector3(), _q = new Quaternion(), _m = new Matrix4();
+const _v = new Vector3(), _v2 = new Vector3(), _v3 = new Vector3(), _v4 = new Vector3(), _q = new Quaternion(), _m = new Matrix4();
 
-export interface FlipState { kind: FlipKind; name: string; pts: number; t: number; dur: number; done: boolean }
+export interface FlipState { kind: FlipKind; name: string; pts: number; t: number; dur: number; delay: number; done: boolean }
+
+// ------------------------------------------------------------------------------------------ bail board rigid body
+const BM = 2.4; // complete board (kg)
+const BCOM = 0.075; // centre of mass above the wheel contact plane
+const BINV_I = new Vector3(1 / 0.1336, 1 / 0.14, 1 / 0.01124); // about board X (pitch), Y (yaw), Z (roll)
+/** contact points (board space from the wheel-plane origin): x, y, z, wheel */
+const BPTS: number[][] = [
+  [0.094, 0, 0.18, 1], [-0.094, 0, 0.18, 1], [0.094, 0, -0.18, 1], [-0.094, 0, -0.18, 1],
+  [0.113, 0.027, 0.18, 0], [-0.113, 0.027, 0.18, 0], [0.113, 0.027, -0.18, 0], [-0.113, 0.027, -0.18, 0],
+  [0.09, 0.118, 0.25, 0], [-0.09, 0.118, 0.25, 0], [0.09, 0.118, -0.25, 0], [-0.09, 0.118, -0.25, 0],
+  // nose and tail kicks: upside down the board rests on them
+  [0.09, 0.149, 0.35, 0], [-0.09, 0.149, 0.35, 0], [0.09, 0.149, -0.35, 0], [-0.09, 0.149, -0.35, 0],
+  [0.06, 0.163, 0.385, 0], [-0.06, 0.163, 0.385, 0], [0.06, 0.163, -0.385, 0], [-0.06, 0.163, -0.385, 0],
+  [0, 0.168, 0.405, 0], [0, 0.168, -0.405, 0], [0, 0.152, 0.398, 0], [0, 0.152, -0.398, 0],
+  [0.105, 0.11, 0, 0], [-0.105, 0.11, 0, 0],
+];
+
+/** The board on its own after a bail: a small rigid body that tumbles, skids or rolls, then lies still. */
+export class BoardBody {
+  com = new Vector3();
+  q = new Quaternion();
+  v = new Vector3();
+  w = new Vector3();
+  asleep = false;
+  contacts = 0;
+  t = 0;
+  private restT = 0;
+  private tipT = 0;
+  private prev = new Vector3();
+  private qi = new Quaternion();
+  private a = new Vector3(); private b = new Vector3(); private c = new Vector3(); private d = new Vector3();
+  private e = new Vector3(); private f = new Vector3(); private g = new Vector3(); private h = new Vector3();
+  private i = new Vector3(); private j = new Vector3(); private r = new Vector3(); private dir = new Vector3();
+  private nAvg = new Vector3();
+  private pivot = new Vector3();
+
+  constructor(private world: CollisionWorld, private onClack: (v: number) => void) {}
+
+  init(rootPos: Vector3, q: Quaternion, v: Vector3, w: Vector3) {
+    this.q.copy(q);
+    this.com.set(0, BCOM, 0).applyQuaternion(q).add(rootPos);
+    this.v.copy(v); this.w.copy(w);
+    this.asleep = false; this.restT = 0; this.t = 0;
+  }
+
+  /** board root (wheel contact plane origin) in world space */
+  rootPos(out: Vector3) { return out.set(0, -BCOM, 0).applyQuaternion(this.q).add(this.com); }
+  get wheelsDown() { return _v.set(0, 1, 0).applyQuaternion(this.q).y >= 0; }
+
+  /** where the rider stands the board up again: ground point under the centre + nose direction on the ground */
+  ridePose(outPos: Vector3, outFwd: Vector3, outUp: Vector3) {
+    const h = this.world.raycast(_v.copy(this.com).add(_v2.set(0, 0.5, 0)), _v3.set(0, -1, 0), 2.5);
+    outUp.copy(h ? h.normal : Y);
+    outPos.copy(h ? h.point : this.com);
+    outFwd.set(0, 0, 1).applyQuaternion(this.q);
+    outFwd.addScaledVector(outUp, -outFwd.dot(outUp));
+    if (outFwd.lengthSq() < 1e-6) outFwd.set(1, 0, 0).applyQuaternion(this.q).cross(outUp);
+    outFwd.normalize();
+  }
+
+  private invI(v: Vector3, out: Vector3) {
+    this.qi.copy(this.q).invert();
+    out.copy(v).applyQuaternion(this.qi);
+    out.set(out.x * BINV_I.x, out.y * BINV_I.y, out.z * BINV_I.z);
+    return out.applyQuaternion(this.q);
+  }
+
+  private friction(r: Vector3, t: Vector3, s: number, maxJ: number) {
+    const rt = this.h.crossVectors(r, t);
+    const k = 1 / BM + t.dot(this.i.crossVectors(this.invI(rt, this.j), r));
+    const jt = clamp(-s / k, -maxJ, maxJ);
+    this.v.addScaledVector(t, jt / BM);
+    this.w.add(this.invI(rt, this.j).multiplyScalar(jt));
+  }
+
+  private impulse(r: Vector3, n: Vector3, wheel: boolean) {
+    const vp = this.a.crossVectors(this.w, r).add(this.v);
+    const vn = vp.dot(n);
+    if (vn >= 0) return;
+    const rn = this.b.crossVectors(r, n);
+    const k = 1 / BM + n.dot(this.c.crossVectors(this.invI(rn, this.d), r));
+    const e = vn < -1.4 ? 0.3 : 0;
+    const jn = (-(1 + e) * vn) / k;
+    this.v.addScaledVector(n, jn / BM);
+    this.w.add(this.invI(rn, this.d).multiplyScalar(jn));
+    if (vn < -1.6) this.onClack(-vn);
+    // Coulomb friction; wheels roll along the board and grip across it
+    vp.crossVectors(this.w, r).add(this.v);
+    const vt = this.e.copy(vp).addScaledVector(n, -vp.dot(n));
+    if (wheel) {
+      const roll = this.f.set(0, 0, 1).applyQuaternion(this.q);
+      roll.addScaledVector(n, -roll.dot(n));
+      if (roll.lengthSq() > 1e-6) {
+        roll.normalize();
+        const side = this.g.crossVectors(n, roll);
+        this.friction(r, roll, vt.dot(roll), 0.1 * jn);
+        this.friction(r, side, vt.dot(side), 0.75 * jn);
+        return;
+      }
+    }
+    const s = vt.length();
+    if (s > 1e-5) this.friction(r, vt.divideScalar(s), s, 0.45 * jn);
+  }
+
+  step(dt: number) {
+    if (this.asleep) return;
+    this.t += dt;
+    this.prev.copy(this.com);
+    this.v.y -= G * dt;
+    this.v.multiplyScalar(1 - 0.03 * dt);
+    this.com.addScaledVector(this.v, dt);
+    const wl = this.w.length();
+    if (wl > 1e-6) { _q.setFromAxisAngle(_v.copy(this.w).divideScalar(wl), wl * dt); this.q.premultiply(_q).normalize(); }
+    // sweep the centre so a fast board never tunnels through the floor or a wall
+    const dv = _v.subVectors(this.com, this.prev);
+    const dl = dv.length();
+    if (dl > 1e-6) {
+      const h = this.world.raycast(this.prev, dv.divideScalar(dl), dl + 0.05);
+      if (h && h.normal.dot(this.v) < 0) {
+        this.com.copy(h.point).addScaledVector(h.normal, 0.05);
+        this.v.addScaledVector(h.normal, -1.3 * this.v.dot(h.normal));
+      }
+    }
+    // contact points: a ray from the centre to each point finds the surfaces it sinks into
+    const up = _v4.set(0, 1, 0).applyQuaternion(this.q);
+    this.contacts = 0;
+    this.nAvg.set(0, 0, 0);
+    this.pivot.set(0, 0, 0);
+    for (let it = 0; it < 2; it++) {
+      for (const p of BPTS) {
+        const r = this.r.set(p[0], p[1] - BCOM, p[2]).applyQuaternion(this.q);
+        const len = r.length();
+        const dir = this.dir.copy(r).divideScalar(len);
+        const h = this.world.raycast(this.com, dir, len);
+        if (!h) continue;
+        const n = h.normal;
+        const depth = (len - h.distance) * Math.max(0.2, -dir.dot(n));
+        if (it === 0) { this.contacts++; this.nAvg.add(n); this.pivot.add(this.com).add(r); }
+        if (depth > 0.0015) this.com.addScaledVector(n, (depth - 0.001) * 0.7);
+        this.impulse(r, n, p[3] === 1 && up.dot(n) > 0.6);
+      }
+    }
+    if (this.contacts) {
+      this.nAvg.normalize();
+      this.pivot.divideScalar(this.contacts);
+      this.w.multiplyScalar(Math.exp(-2.5 * dt));
+      const c = up.dot(this.nAvg);
+      const target = c >= 0 ? this.nAvg : _v2.copy(this.nAvg).negate();
+      const axis = _v.crossVectors(up, target);
+      const s = axis.length();
+      const vs = this.v.length(), ws = this.w.length();
+      let ang = 0;
+      if (Math.abs(c) < 0.75 && vs < 0.8) {
+        // a board left on its edge falls over onto the wheels or the grip, pivoting on the edge it stands on
+        this.tipT += dt;
+        ang = Math.min(Math.asin(Math.min(1, s)), (1.2 + 9 * this.tipT) * dt);
+        this.w.multiplyScalar(Math.exp(-6 * dt)); this.v.multiplyScalar(Math.exp(-3 * dt));
+      } else {
+        this.tipT = 0;
+        if (this.contacts >= 2 && vs < 0.4 && ws < 3) {
+          // nearly still and nearly flat: rocking dies out and it settles onto the ground
+          this.v.multiplyScalar(Math.exp(-5 * dt)); this.w.multiplyScalar(Math.exp(-7 * dt));
+          ang = Math.min(Math.asin(Math.min(1, s)), 0.8 * dt);
+        }
+      }
+      if (ang > 1e-6 && s > 1e-6) {
+        _q.setFromAxisAngle(axis.divideScalar(s), ang);
+        this.q.premultiply(_q).normalize();
+        _v3.subVectors(this.com, this.pivot).applyQuaternion(_q);
+        this.com.copy(this.pivot).add(_v3);
+      }
+    } else { this.w.multiplyScalar(Math.exp(-0.3 * dt)); this.tipT = 0; }
+    // rest
+    const still = this.contacts >= 2 && this.tipT === 0 && this.v.length() < 0.08 && this.w.length() < 0.4;
+    this.restT = still ? this.restT + dt : 0;
+    if (this.restT > 0.35 || this.t > 9) { this.asleep = true; this.v.set(0, 0, 0); this.w.set(0, 0, 0); }
+    if (this.com.y < -30) { this.com.copy(this.prev).setY(0.2); this.v.set(0, 0, 0); }
+  }
+}
 
 /**
  * Kinematic skateboard controller. `pos` is the contact point of the wheels on the surface,
@@ -66,6 +254,7 @@ export class SkatePhysics {
   manual = { active: false, balance: 0, bvel: 0, time: 0, nose: false };
   kickturn = { t: -1, dir: 1 };
   wobble = 0; // seconds of landing wobble remaining
+  wobbleDur = 0.9;
   bonk = 0;
   landImpulse = 0; // for absorb animation
   brakeAmt = 0;
@@ -76,6 +265,10 @@ export class SkatePhysics {
   airYaw = 0;
   flip: FlipState | null = null;
   popped = false;
+  popT = -1; // sim time of the last pop
+  airPredT = 0.5; // predicted air time at take-off (s)
+  landT = -10; // sim time of the last landing
+  landImpact = 0;
   vert: null | { wallN: Vector3; q0: Quaternion; qPeak: Quaternion; q1: Quaternion; t: number; T: number; sign: number } = null;
   boardQ = new Quaternion(); // board orientation in the air
   predicted: { normal: Vector3; tti: number; point: Vector3 } | null = null;
@@ -89,7 +282,7 @@ export class SkatePhysics {
   grindCooldown = 0;
 
   // bail
-  bail: null | { kind: BailKind; t: number; body: Vector3; bodyVel: Vector3; heading: number; boardPos: Vector3; boardVel: Vector3; boardQ: Quaternion; boardW: Vector3 } = null;
+  bail: null | { kind: BailKind; reason: string; t: number; body: Vector3; bodyVel: Vector3; heading: number; board: BoardBody } = null;
 
   events: SkateEvent[] = [];
   lastGround: Hit | null = null;
@@ -105,13 +298,20 @@ export class SkatePhysics {
     this.up.set(0, 1, 0);
     this.fwd.set(Math.sin(heading), 0, Math.cos(heading));
     this.flip = null; this.grind = null; this.bail = null; this.vert = null;
-    this.manual.active = false; this.kickturn.t = -1; this.wobble = 0; this.pushT = -1;
+    this.manual.active = false; this.kickturn.t = -1; this.wobble = 0; this.pushT = -1; this.crouchTime = 0;
+    this.popT = -1; this.landT = -10; this.fakie = false;
     const h = this.world.raycast(_v.copy(p).addScaledVector(Y, 1.5), _v2.set(0, -1, 0), 4);
     if (h) { this.pos.copy(h.point); this.up.copy(h.normal); }
   }
 
   /** travel direction sign relative to the nose */
   get travelSign() { return this.vel.dot(this.fwd) >= 0 ? 1 : -1; }
+
+  /** progress of the board rotation of the current flip (0 before the flick, 1 at the catch) */
+  flipProgress() {
+    const f = this.flip;
+    return f ? clamp((f.t - f.delay) / f.dur, 0, 1) : 1;
+  }
 
   step(dt: number, inp: SkateInput) {
     this.time += dt;
@@ -131,6 +331,11 @@ export class SkatePhysics {
       case 'recover': break;
     }
     this.speed = this.vel.length();
+  }
+
+  private surfaceAt(face: number) {
+    const idx = this.world.geometry.index!.array;
+    return this.world.surfaces[idx[face * 3]] ?? 0;
   }
 
   // ---------------------------------------------------------------------------------------- ground
@@ -191,12 +396,12 @@ export class SkatePhysics {
     if (this.pushT >= 0) {
       this.pushT += dt;
       const PUSH_DUR = 0.78;
-      if (this.pushT > 0.22 && this.pushT < 0.5 && canPush) {
+      if (this.pushT > 0.24 && this.pushT < 0.52 && canPush) {
         const sNow = this.vel.length();
         const gain = 2.4 * Math.pow(clamp(1 - sNow / 8.6, 0, 1), 1.15) + 0.15;
         this.vel.addScaledVector(travel, (gain / 0.28) * dt);
       }
-      if (this.pushT >= PUSH_DUR || !canPush && this.pushT < 0.22) { this.pushT = -1; this.pushCooldown = 0.05; }
+      if (this.pushT >= PUSH_DUR || !canPush && this.pushT < 0.24) { this.pushT = -1; this.pushCooldown = 0.05; }
     }
     // pumping transitions (hold W while going downhill on a transition)
     if (inp.push && this.up.y < 0.97 && this.up.y > 0.2) {
@@ -224,22 +429,29 @@ export class SkatePhysics {
     this.vel.copy(this.fwd).multiplyScalar(vf).addScaledVector(lat, Math.exp(-16 * dt));
     if (vf < -0.35) this.fakie = true; else if (vf > 0.35) this.fakie = false;
 
-    // ---- kickturn at the top of a transition when speed runs out
+    // ---- kickturn at the top of a transition when speed runs out: the nose lifts and the board
+    // swings around its back wheels, so the back truck stays where it is
     if (this.kickturn.t >= 0) {
+      const ease = (x: number) => x * x * (3 - 2 * x);
+      const k0 = ease(clamp(this.kickturn.t / KICKTURN_T, 0, 1));
       this.kickturn.t += dt;
+      const k1 = ease(clamp(this.kickturn.t / KICKTURN_T, 0, 1));
       this.vel.multiplyScalar(Math.exp(-6 * dt));
-      if (this.kickturn.t >= 0.34) {
-        _q.setFromAxisAngle(this.up, Math.PI * this.kickturn.dir);
+      const dAng = Math.PI * this.kickturn.dir * (k1 - k0);
+      if (dAng !== 0) {
+        const pivot = _v.copy(this.pos).addScaledVector(this.fwd, -TRUCK);
+        _q.setFromAxisAngle(this.up, dAng);
         this.fwd.applyQuaternion(_q);
-        this.kickturn.t = -1;
-        this.emit('kickturn');
+        this.pos.copy(pivot).addScaledVector(this.fwd, TRUCK);
       }
+      if (this.kickturn.t >= KICKTURN_T) { this.kickturn.t = -1; this.emit('kickturn'); }
     } else if (this.up.y < 0.8 && this.up.y > 0.05 && s < 0.55 && !this.fakie) {
       // riding forward up a transition and running out of speed: pivot on the tail to face downhill
       const uphill = _v.set(0, 1, 0).addScaledVector(this.up, -this.up.y).normalize();
       if (this.fwd.dot(uphill) > 0.6 && this.vel.dot(uphill) > -0.15 && !this.manual.active) {
         this.kickturn.t = 0;
         this.kickturn.dir = inp.steer < 0 ? 1 : -1;
+        this.emit('kickturnStart', { dir: this.kickturn.dir });
       }
     }
 
@@ -258,7 +470,7 @@ export class SkatePhysics {
       m.bvel += (m.balance * 2.2 + (Math.sin(this.time * 2.3) * 0.25) - inp.lean * 2.6) * dt;
       m.bvel *= Math.exp(-1.5 * dt);
       m.balance += m.bvel * dt;
-      if (Math.abs(m.balance) > 1) { this.endManual(); this.wobble = 0.5; this.emit('manualFail'); }
+      if (Math.abs(m.balance) > 1) { this.endManual(); this.startWobble(0.75); this.emit('manualFail'); }
     }
 
     // ---- integrate
@@ -273,6 +485,8 @@ export class SkatePhysics {
     this.collideBody(dt);
   }
 
+  private startWobble(d: number) { this.wobble = d; this.wobbleDur = d; }
+
   private endManual() {
     if (!this.manual.active) return;
     this.manual.active = false;
@@ -285,27 +499,39 @@ export class SkatePhysics {
     if (s > 5.2) { this.toBail('face', 'curb'); return; }
     // bonk: bounce back and wobble
     this.vel.multiplyScalar(-0.25);
-    this.bonk = 0.4; this.wobble = 0.6;
+    this.bonk = 0.4; this.startWobble(0.6);
     this.pos.addScaledVector(this.vel, 0.03);
     this.emit('bonk');
   }
 
   private pop(inp: SkateInput) {
-    const charge = clamp(this.crouchTime / 0.32, 0, 1);
-    const popV = 3.15 + 1.45 * charge;
+    const charge = clamp((this.crouchTime - 0.06) / 0.24, 0, 1);
+    const popV = POP_MIN + (POP_MAX - POP_MIN) * charge;
     const dir = _v.copy(this.up).multiplyScalar(0.7).addScaledVector(Y, 0.3).normalize();
     this.endManual();
     this.vel.addScaledVector(dir, popV);
     this.toAir(true);
-    if (inp.flip) this.startFlip(inp.flip);
-    this.emit('pop', { charge, flip: this.flip?.name });
+    this.takeoff();
+    if (inp.flip) this.startFlip(inp.flip, this.airPredT, false);
+    this.emit('pop', { charge, flip: this.flip?.name, airT: +this.airPredT.toFixed(3) });
     this.crouchTime = 0;
   }
 
-  startFlip(d: FlipDir) {
+  /** remember the pop time and the predicted air time (drives the explicit air animation curves) */
+  private takeoff() {
+    this.popT = this.time;
+    this.predictLanding();
+    this.airPredT = this.predicted ? Math.max(0.2, this.predicted.tti) : (2 * Math.max(0.6, this.vel.y)) / G;
+  }
+
+  startFlip(d: FlipDir, airT: number, inAir: boolean) {
     const f = FLIPS[d];
-    this.flip = { kind: f.kind, name: f.name, pts: f.pts, t: 0, dur: f.dur, done: false };
-    this.emit('flip', { kind: f.kind });
+    let dur = f.dur, delay = 0;
+    // the front foot flicks once it has slid up to the nose; the catch comes ~0.15 s before touchdown
+    if (!inAir) delay = clamp(airT - 0.15 - dur, 0.035, 0.2);
+    else dur = Math.min(dur, Math.max(0.14, airT - 0.1));
+    this.flip = { kind: f.kind, name: f.name, pts: f.pts, t: 0, dur, delay, done: false };
+    this.emit('flip', { kind: f.kind, dur: +dur.toFixed(3), delay: +delay.toFixed(3) });
   }
 
   // ---------------------------------------------------------------------------------------- air
@@ -340,7 +566,12 @@ export class SkatePhysics {
       this.vert = { wallN: wallN.clone(), q0, qPeak, q1, t: 0, T: Math.max(0.4, T), sign };
       this.emit('vertAir');
     }
-    if (!popped) this.emit('leaveGround');
+    if (!popped) {
+      this.popT = -1;
+      this.predictLanding();
+      this.airPredT = this.predicted ? this.predicted.tti : 0.6;
+      this.emit('leaveGround');
+    }
   }
 
   pushHeld = false;
@@ -348,10 +579,13 @@ export class SkatePhysics {
 
   private airStep(dt: number, inp: SkateInput) {
     this.airTime += dt;
-    if (inp.airTrick && !this.flip && this.airTime > 0.04) this.startFlip(inp.airTrick);
+    if (inp.airTrick && !this.flip && this.airTime > 0.04) {
+      const left = this.predicted ? this.predicted.tti : 0;
+      if (left > 0.2) this.startFlip(inp.airTrick, left, true);
+    }
     if (this.flip && !this.flip.done) {
       this.flip.t += dt;
-      if (this.flip.t >= this.flip.dur) { this.flip.t = this.flip.dur; this.flip.done = true; }
+      if (this.flip.t >= this.flip.delay + this.flip.dur) { this.flip.t = this.flip.delay + this.flip.dur; this.flip.done = true; this.emit('flipDone', { kind: this.flip.kind }); }
     }
     this.vel.y -= G * dt;
     this.vel.multiplyScalar(1 - 0.0008 * this.vel.length() * dt);
@@ -418,6 +652,15 @@ export class SkatePhysics {
       const dir = _v3.copy(disp).divideScalar(len);
       const hit = this.world.raycast(_v.copy(this.pos).addScaledVector(dir, -0.02), dir, len + 0.04);
       if (hit && hit.normal.dot(this.vel) < 0) {
+        if (hit.surface === SURF_BARRIER) {
+          // invisible fence: bounce off, keep flying
+          const vn = this.vel.dot(hit.normal);
+          this.vel.addScaledVector(hit.normal, -1.35 * vn).multiplyScalar(0.85);
+          this.pos.copy(hit.point).addScaledVector(hit.normal, 0.03);
+          this.emit('bonk');
+          this.collideBody(dt);
+          return;
+        }
         this.pos.copy(hit.point);
         this.land(hit);
         return;
@@ -438,7 +681,7 @@ export class SkatePhysics {
       const seg = new Vector3().subVectors(np, p);
       const l = seg.length();
       const h = l > 1e-6 ? this.world.raycast(p, seg.divideScalar(l), l + 0.02) : null;
-      if (h) { this.predicted = { normal: h.normal, tti: t, point: h.point }; return; }
+      if (h && h.surface !== SURF_BARRIER) { this.predicted = { normal: h.normal, tti: t + (h.distance / Math.max(l, 1e-6)) * step, point: h.point }; return; }
       p.copy(np); v.y -= G * step;
     }
     this.predicted = null;
@@ -461,7 +704,7 @@ export class SkatePhysics {
       yawErr = Math.min(fT.angleTo(d), fT.clone().negate().angleTo(d));
     }
     const f = this.flip;
-    const flipProg = f ? f.t / f.dur : 1;
+    const flipProg = this.flipProgress();
     const deg = 180 / Math.PI;
     let quality: 'clean' | 'wobble' | 'bail' = 'clean';
     if (upErr * deg > 55 || yawErr * deg > 52 || flipProg < 0.72 || impact > 11.5) quality = 'bail';
@@ -486,11 +729,12 @@ export class SkatePhysics {
     this.vel.copy(vt).multiplyScalar(quality === 'wobble' ? 0.86 : 0.97);
     this.mode = 'ride';
     this.landImpulse = clamp(impact / 6, 0.25, 1.2);
-    if (quality === 'wobble') this.wobble = 0.9;
+    this.landT = this.time;
+    this.landImpact = impact;
+    if (quality === 'wobble') this.startWobble(1.2);
     this.flip = null;
     this.emit('land', { quality, impact, airTime, spin, popped: this.popped, flip: f, fakie: this.fakie, vert: wasVert, surface: hit.surface,
       upErr: Math.round(upErr * deg), yawErr: Math.round(yawErr * deg) });
-    // landing straight into a manual
     this.surface = hit.surface;
   }
 
@@ -498,6 +742,8 @@ export class SkatePhysics {
   private tryGrind(fromGround: boolean) {
     let best: { line: GrindLine; seg: number; u: number; d: number } | null = null;
     const p = this.pos;
+    // highest point this jump will reach (a pop that falls a little short is still pulled onto the rail at its peak)
+    const peakY = p.y + Math.max(0, this.vel.y) ** 2 / (2 * G);
     for (const line of this.world.grindLines) {
       if (fromGround && line.kind === 'rail') continue;
       const n = line.pts.length;
@@ -510,7 +756,14 @@ export class SkatePhysics {
         const cp = _v3.copy(a).addScaledVector(ab, u);
         const dy = p.y - cp.y;
         const lat = Math.hypot(p.x - cp.x, p.z - cp.z);
-        const okY = fromGround ? dy > -0.3 && dy < 0.12 : dy > -0.32 && dy < 0.7 && this.vel.y < 2.5;
+        let okY: boolean;
+        if (fromGround) okY = dy > -0.3 && dy < 0.12;
+        else {
+          okY = dy < 0.7 && this.vel.y < 2.5 && (
+            dy > -0.06 || // at or above the line
+            (peakY < cp.y - 0.04 && this.vel.y < 0.8 && dy > -0.3) || // can't quite reach it: snap at the peak
+            (this.vel.y < -0.2 && dy > -0.2)); // falling past it
+        }
         if (!okY || lat > (fromGround ? 0.5 : 0.62)) continue;
         const d = lat + Math.abs(dy) * 0.5;
         if (!best || d < best.d) best = { line, seg: i, u, d };
@@ -596,7 +849,7 @@ export class SkatePhysics {
     if (inp.ollie) {
       // pop off the rail (back into the ramp for copings)
       const inward = g.line.inward ? g.line.inward[Math.min(g.seg, g.line.inward.length - 1)] : null;
-      this.vel.copy(tanDir).multiplyScalar(g.speed).addScaledVector(Y, 3.4);
+      this.vel.copy(tanDir).multiplyScalar(g.speed).addScaledVector(Y, 2.7);
       if (inward && g.line.kind === 'coping') this.vel.addScaledVector(inward, 1.4);
       this.endGrind(true, inp);
       return;
@@ -605,8 +858,9 @@ export class SkatePhysics {
       // fall off to the side we lean to
       const side = new Vector3().crossVectors(Y, tanDir).normalize().multiplyScalar(Math.sign(g.balance || 1));
       this.vel.copy(tanDir).multiplyScalar(Math.max(g.speed, 0.4)).addScaledVector(side, 1.1).addScaledVector(Y, 0.6);
+      const off = Math.abs(g.balance) > 1.15;
       this.endGrind(false, inp);
-      if (Math.abs(g.balance) > 1.15) this.wobble = 0.8;
+      if (off) this.startWobble(0.8);
       return;
     }
     // advance along the polyline
@@ -654,17 +908,39 @@ export class SkatePhysics {
     this.fwd.copy(fwdH); this.up.copy(Y);
     this.pos.addScaledVector(Y, 0.04);
     if (popped) {
-      if (inp.flip) this.startFlip(inp.flip);
-      this.emit('pop', { charge: 0.5, flip: this.flip?.name, fromGrind: true });
+      this.takeoff();
+      if (inp.flip) this.startFlip(inp.flip, this.airPredT, false);
+      this.emit('pop', { charge: 0.5, flip: this.flip?.name, fromGrind: true, airT: +this.airPredT.toFixed(3) });
+    } else {
+      this.popT = -1;
+      this.predictLanding();
+      this.airPredT = this.predicted ? this.predicted.tti : 0.5;
     }
   }
 
   // ---------------------------------------------------------------------------------------- collisions
   private collideBody(dt: number) {
-    const hs = [0.42, 0.95, 1.42];
-    for (const h of hs) {
+    // look a little ahead first: the bail starts before the upper body reaches the wall, so nothing leans into it
+    const look = clamp(this.vel.length() * 0.012, 0, 0.09);
+    if (this.mode !== 'grind' && this.vel.lengthSq() > 16) {
+      let hitN: Vector3 | null = null, high = false;
+      for (const [h, r] of BODY) {
+        const c = _v.copy(this.pos).addScaledVector(this.up, h).addScaledVector(this.vel, look / Math.max(1, this.vel.length()));
+        const cp = this.world.closestPoint(c, r);
+        if (!cp) continue;
+        const sep = _v2.subVectors(c, cp.point);
+        const d = sep.length();
+        if (d < 1e-5) continue;
+        sep.divideScalar(d);
+        if (sep.dot(this.up) > 0.55) continue; // ground under us
+        if (this.surfaceAt(cp.faceIndex) === SURF_BARRIER) continue;
+        if (-this.vel.dot(sep) > 4.2) { hitN ??= sep.clone(); if (h > 0.9) high = true; }
+      }
+      // chest-high obstacle: hit it and snap back; a low wall trips the rider over it
+      if (hitN) { if (high) this.toBail('wall', 'wall', hitN.setY(0).normalize()); else this.toBail('face', 'trip'); return; }
+    }
+    for (const [h, r] of BODY) {
       const c = _v.copy(this.pos).addScaledVector(this.up, h);
-      const r = 0.24;
       const cp = this.world.closestPoint(c, r);
       if (!cp) continue;
       const sep = _v2.subVectors(c, cp.point);
@@ -672,13 +948,17 @@ export class SkatePhysics {
       if (d < 1e-5) continue;
       sep.divideScalar(d);
       if (sep.dot(this.up) > 0.55) continue; // ground under us
+      const barrier = this.surfaceAt(cp.faceIndex) === SURF_BARRIER;
       this.pos.addScaledVector(sep, r - d);
       const vn = this.vel.dot(sep);
       if (vn < 0) {
-        if (-vn > 4.2 && this.mode !== 'grind') { this.toBail('back', 'wall', sep.clone()); return; }
-        this.vel.addScaledVector(sep, -vn * 1.25);
-        this.vel.multiplyScalar(0.75);
-        if (-vn > 1.2) { this.bonk = 0.3; this.wobble = Math.max(this.wobble, 0.4); this.emit('bonk'); }
+        if (-vn > 4.2 && this.mode !== 'grind' && !barrier) {
+          if (h > 0.9) this.toBail('wall', 'wall', sep.clone().setY(0).normalize()); else this.toBail('face', 'trip');
+          return;
+        }
+        this.vel.addScaledVector(sep, -vn * (barrier ? 1.4 : 1.25));
+        this.vel.multiplyScalar(barrier ? 0.85 : 0.75);
+        if (-vn > 1.2) { this.bonk = 0.3; this.startWobble(Math.max(this.wobble, 0.45)); this.emit('bonk', { barrier }); }
       }
     }
     void dt;
@@ -687,87 +967,95 @@ export class SkatePhysics {
   // ---------------------------------------------------------------------------------------- bail
   toBail(kind: BailKind, reason: string, wallN?: Vector3) {
     if (this.mode === 'bail' || this.mode === 'recover') return;
-    const heading = Math.atan2(this.vel.x, this.vel.z);
-    const hspeed = Math.hypot(this.vel.x, this.vel.z);
-    const bQ = this.basisQuat(this.fwd, this.up);
-    this.bail = {
-      kind, t: 0,
-      body: this.pos.clone(),
-      bodyVel: wallN ? this.vel.clone().projectOnPlane(wallN).multiplyScalar(0.3).addScaledVector(wallN, 1.2) : this.vel.clone().multiplyScalar(0.55),
-      heading: wallN ? Math.atan2(-wallN.x, -wallN.z) : hspeed > 0.5 ? heading : Math.atan2(this.fwd.x, this.fwd.z),
-      boardPos: this.pos.clone().addScaledVector(this.up, 0.06),
-      boardVel: this.vel.clone().multiplyScalar(0.95).add(new Vector3((Math.random() - 0.5) * 1.5, 1.6, (Math.random() - 0.5) * 1.5)),
-      boardQ: bQ,
-      boardW: new Vector3((Math.random() - 0.5) * 14, (Math.random() - 0.5) * 8, (Math.random() - 0.5) * 14),
-    };
+    if (wallN && wallN.lengthSq() < 0.5) wallN = undefined;
+    const r = rng(Math.floor(this.time * 997) + 11);
+    const bQ = this.mode === 'air' ? this.boardQ.clone() : this.basisQuat(this.fwd, this.up);
+    const hv = _v.copy(this.vel).setY(0);
+    const hs = hv.length();
+    // the rider faces the toe side (board -X); toe and heel falls keep that facing, rolls go with the travel
+    const toe = new Vector3(-1, 0, 0).applyQuaternion(bQ).setY(0);
+    if (toe.lengthSq() < 1e-4) toe.set(0, 0, 1);
+    toe.normalize();
+    let heading = Math.atan2(toe.x, toe.z);
+    if (kind === 'roll' && hs > 0.5) heading = Math.atan2(hv.x, hv.z);
+    if (kind === 'wall' && wallN) heading = Math.atan2(-wallN.x, -wallN.z);
+    const bodyVel = wallN
+      ? this.vel.clone().projectOnPlane(wallN).multiplyScalar(0.25).addScaledVector(wallN, 1.3).setY(Math.max(0, this.vel.y) * 0.3)
+      : this.vel.clone().multiplyScalar(0.7);
+    // the board separates: it carries on into the wall and kicks back, or shoots out from under the feet
+    const board = new BoardBody(this.world, (v) => this.emit('boardClack', { v: +v.toFixed(2) }));
+    let bv: Vector3, bw: Vector3;
+    const heel = new Vector3(1, 0, 0).applyQuaternion(bQ).setY(0).normalize();
+    if (wallN) {
+      bv = this.vel.clone().multiplyScalar(0.85).add(new Vector3(0, 0.5, 0));
+      bw = new Vector3((r() - 0.5) * 6, (r() - 0.5) * 9, (r() - 0.5) * 10);
+    } else if (reason === 'curb' || reason === 'trip') {
+      // the wheels stop dead against the obstacle and the board bounces back out from under the feet
+      bv = this.vel.clone().setY(0).multiplyScalar(-0.38).addScaledVector(heel, (r() - 0.5) * 1.2).add(new Vector3(0, 1.0, 0));
+      bw = new Vector3(-6 - r() * 4, (r() - 0.5) * 4, (r() - 0.5) * 6).applyQuaternion(bQ);
+    } else {
+      const away = kind === 'face' ? 1 : -1; // falling over the toes kicks the board out behind the heels
+      bv = this.vel.clone().multiplyScalar(0.62).addScaledVector(heel, away * (0.7 + r() * 0.7)).add(new Vector3(0, 0.9 + r() * 0.8, 0));
+      bw = new Vector3((r() - 0.5) * 3, (r() - 0.5) * 7, (r() > 0.5 ? 1 : -1) * (5 + r() * 9)).applyQuaternion(bQ);
+    }
+    board.init(this.pos, bQ, bv, bw);
+    this.bail = { kind, reason, t: 0, body: this.pos.clone(), bodyVel, heading, board };
     this.mode = 'bail';
-    this.flip = null; this.grind = null; this.vert = null; this.endManual();
+    this.flip = null; this.grind = null; this.vert = null; this.endManual(); this.kickturn.t = -1; this.pushT = -1;
     this.emit('bail', { kind, reason });
   }
 
   private bailStep(dt: number) {
     const b = this.bail!;
     b.t += dt;
-    // body slides / falls
+    // body slides / falls, keeping its momentum for a moment
     b.bodyVel.y -= G * dt;
     const disp = _v.copy(b.bodyVel).multiplyScalar(dt);
-    const h = this.world.raycast(_v2.copy(b.body).add(new Vector3(0, 0.6, 0)), _v3.set(0, -1, 0), 0.6 + Math.max(0.05, -disp.y) + 0.05);
+    const h = this.world.raycast(_v2.copy(b.body).add(_v3.set(0, 0.6, 0)), _v4.set(0, -1, 0), 0.6 + Math.max(0.05, -disp.y) + 0.05);
     if (h && b.body.y + disp.y <= h.point.y + 0.001) {
       b.body.y = h.point.y;
       if (b.bodyVel.y < 0) b.bodyVel.y = 0;
       // slide friction along the ground (gravity on slopes still pulls)
-      const gT = new Vector3(0, -G, 0).addScaledVector(h.normal, G * h.normal.y);
+      const gT = _v3.set(0, -G, 0).addScaledVector(h.normal, G * h.normal.y);
       b.bodyVel.addScaledVector(gT, dt * 0.6);
       const s = b.bodyVel.length();
-      if (s > 1e-4) b.bodyVel.multiplyScalar(Math.max(0, s - 5.5 * dt) / s);
+      const fr = b.t < 0.9 ? 3.0 : 7.5;
+      if (s > 1e-4) b.bodyVel.multiplyScalar(Math.max(0, s - fr * dt) / s);
       b.bodyVel.addScaledVector(h.normal, -b.bodyVel.dot(h.normal));
       b.body.addScaledVector(b.bodyVel, dt);
     } else b.body.add(disp);
-    // keep the body out of walls
-    const cp = this.world.closestPoint(_v.copy(b.body).add(new Vector3(0, 0.5, 0)), 0.35);
-    if (cp) {
-      const sep = _v2.subVectors(_v.copy(b.body).add(new Vector3(0, 0.5, 0)), cp.point);
+    // keep the fallen body out of walls (hips and shoulders)
+    for (const [hh, rr] of [[0.35, 0.42], [0.95, 0.36]]) {
+      const c = _v.copy(b.body).add(_v3.set(0, hh, 0));
+      const cp = this.world.closestPoint(c, rr);
+      if (!cp) continue;
+      const sep = _v2.subVectors(c, cp.point);
       const d = sep.length();
-      if (d > 1e-5 && sep.y / d < 0.6) { sep.divideScalar(d); b.body.addScaledVector(sep, 0.35 - d); const vn = b.bodyVel.dot(sep); if (vn < 0) b.bodyVel.addScaledVector(sep, -vn); }
+      if (d > 1e-5 && sep.y / d < 0.6) {
+        sep.divideScalar(d);
+        b.body.addScaledVector(sep, rr - d);
+        const vn = b.bodyVel.dot(sep);
+        if (vn < 0) b.bodyVel.addScaledVector(sep, -vn * 1.2);
+      }
     }
-    // board tumbles away as a little rigid body
-    b.boardVel.y -= G * dt;
-    const bd = _v.copy(b.boardVel).multiplyScalar(dt);
-    const bl = bd.length();
-    if (bl > 1e-6) {
-      const hit = this.world.raycast(_v2.copy(b.boardPos), _v3.copy(bd).divideScalar(bl), bl + 0.06);
-      if (hit) {
-        b.boardPos.copy(hit.point).addScaledVector(hit.normal, 0.06);
-        const vn = b.boardVel.dot(hit.normal);
-        if (vn < 0) b.boardVel.addScaledVector(hit.normal, -vn * 1.3);
-        b.boardVel.multiplyScalar(0.72);
-        b.boardW.multiplyScalar(0.6);
-        if (Math.abs(vn) > 1.5) this.emit('boardClack', { v: Math.abs(vn) });
-        // settle flat
-        const bu = new Vector3(0, 1, 0).applyQuaternion(b.boardQ);
-        const target = bu.dot(hit.normal) >= 0 ? hit.normal : hit.normal.clone().negate();
-        _q.setFromUnitVectors(bu, bu.clone().lerp(target, 0.25).normalize());
-        b.boardQ.premultiply(_q);
-      } else b.boardPos.add(bd);
-    }
-    const w = b.boardW.length();
-    if (w > 1e-4) { _q.setFromAxisAngle(_v.copy(b.boardW).divideScalar(w), w * dt); b.boardQ.premultiply(_q).normalize(); }
-    b.boardW.multiplyScalar(Math.exp(-0.8 * dt));
+    b.board.step(dt);
     this.vel.copy(b.bodyVel);
     this.pos.copy(b.body);
   }
 
-  /** Called by the animation layer once the get-up clip finished and the board is back under the feet. */
-  finishRecover(pos: Vector3, heading: number) {
+  /** Called by the animation layer when the rider stands on the board again (it lies where it stopped). */
+  finishRecover(pos: Vector3, fwd: Vector3) {
     this.mode = 'ride';
     this.bail = null;
     this.vel.set(0, 0, 0);
-    const h = this.world.raycast(_v.copy(pos).add(new Vector3(0, 0.8, 0)), _v2.set(0, -1, 0), 2);
+    const h = this.world.raycast(_v.copy(pos).add(_v2.set(0, 0.6, 0)), _v3.set(0, -1, 0), 1.6);
     this.pos.copy(h ? h.point : pos);
     this.up.copy(h ? h.normal : Y);
-    this.fwd.set(Math.sin(heading), 0, Math.cos(heading)).addScaledVector(this.up, -0).normalize();
-    this.fwd.addScaledVector(this.up, -this.fwd.dot(this.up)).normalize();
-    this.wobble = 0; this.fakie = false;
+    this.fwd.copy(fwd).addScaledVector(this.up, -fwd.dot(this.up));
+    if (this.fwd.lengthSq() < 1e-6) this.fwd.set(1, 0, 0);
+    this.fwd.normalize();
+    this.wobble = 0; this.fakie = false; this.crouchTime = 0; this.pushT = -1; this.kickturn.t = -1;
+    this.flip = null; this.popT = -1; this.landT = -10;
   }
 
   // ---------------------------------------------------------------------------------------- helpers

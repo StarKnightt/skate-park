@@ -105,9 +105,12 @@ function plyTexture() {
 export class BoardView {
   root = new Group();
   deck = new Group();
+  deckMesh: Mesh;
   trucks: Group[] = [];
   wheels: Mesh[] = [];
   wheelAngle = 0;
+  /** deck matrix with pitch and truck lean but without flip roll / shove-it yaw / lift (where the feet hover during a flip) */
+  plainM = new Matrix4();
   constructor(deckTex: Texture) {
     deckTex.colorSpace = SRGBColorSpace;
     const gripM = toonMaterial({ map: gripTexture(), bands: 0.3, rim: 0.15, name: 'grip' });
@@ -115,6 +118,7 @@ export class BoardView {
     const plyM = toonMaterial({ map: plyTexture(), bands: 0.2, name: 'ply' });
     const deckMesh = new Mesh(deckGeometry(), [gripM, bottomM, plyM]);
     deckMesh.castShadow = true;
+    this.deckMesh = deckMesh;
     this.deck.add(deckMesh);
     const metal = toonMaterial({ color: 0xc9ccd2, bands: 0.6, spec: 0.9, shininess: 60, rim: 0.5, name: 'truck' });
     const bush = toonMaterial({ color: 0xf2b84b, bands: 0.5, name: 'bushing' });
@@ -170,6 +174,7 @@ export class BoardView {
     const pitchM = _p.makeTranslation(0, 0, pivotZ).multiply(_r.makeRotationX(-pitch)).multiply(_t.makeTranslation(0, 0, -pivotZ));
     // deck lean about its centre line (trucks counter-rotate)
     const leanM = _l.makeTranslation(0, cy, 0).multiply(_r.makeRotationZ(lean)).multiply(_t.makeTranslation(0, -cy, 0));
+    this.plainM.copy(pitchM).multiply(leanM);
     const full = this.deck.matrix.copy(pitchM).multiply(flipM).multiply(leanM);
     this.deck.matrixAutoUpdate = false;
     this.deck.matrixWorldNeedsUpdate = true;
@@ -177,15 +182,20 @@ export class BoardView {
     return full;
   }
 
+  /** after a 180 shove-it the nose and tail have swapped ends: turn only the (symmetric) deck mesh so the graphic stays put */
+  flipGraphic() {
+    this.deckMesh.rotation.y = this.deckMesh.rotation.y === 0 ? Math.PI : 0;
+  }
+
   spinWheels(dist: number) {
     this.wheelAngle += dist / WHEEL_R;
     for (const w of this.wheels) w.rotation.x = this.wheelAngle;
   }
 
-  /** world position of a point on the deck top (board space x,z) given the current deck matrix */
+  /** world position of a point on the deck top (board space x,z): on the posed deck, or on the un-flipped deck plane */
   deckPoint(x: number, z: number, out: Vector3, useDeck = true) {
     out.set(x, deckTopY(z, x), z);
-    if (useDeck) out.applyMatrix4(this.deck.matrix);
+    out.applyMatrix4(useDeck ? this.deck.matrix : this.plainM);
     return out.applyMatrix4(this.root.matrixWorld);
   }
 }

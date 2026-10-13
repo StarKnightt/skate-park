@@ -11,8 +11,13 @@ from functools import reduce
 import numpy as np
 from skimage import measure
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cloth_masks as cm
+from cloth_masks import smoothstep
+
 OUT = sys.argv[1]
 SK = json.load(open(sys.argv[2]))["bones"]
+LM = cm.Landmarks(SK)
 os.makedirs(OUT, exist_ok=True)
 
 
@@ -133,53 +138,163 @@ def part_head(p):
     ears = union(*[ellipsoid(p, [s * 0.095, 1.640, -0.012], [0.012, 0.030, 0.021], rot("z", s * 8) @ rot("x", 12))
                    for s in (1, -1)])
     d = smin(d, ears, 0.008)
-    neck = round_cone(p, np.array([0, 1.43, -0.032]), np.array([0, 1.585, -0.008]), 0.049, 0.046)
+    # neck: tapers from a wide base (flaring into the trapezius) to a slimmer top under the jaw
+    neck = round_cone(p, np.array([0, 1.445, -0.034]), np.array([0, 1.585, -0.012]), 0.056, 0.0405)
     d = smin(d, neck, 0.03)
+    for s in (1, -1):
+        trap = ellipsoid(p, [s * 0.047, 1.488, -0.042], [0.044, 0.022, 0.036])
+        d = smin(d, trap, 0.022)
+        scm = round_cone(p, np.array([s * 0.041, 1.578, -0.030]), np.array([s * 0.013, 1.480, 0.026]), 0.0105, 0.0090)
+        d = smin(d, scm, 0.014)
+    return d
+
+
+# ----------------------------------------------------------------------------- cap (six panels, set back on the head)
+CAP_C = np.array([0.0, 1.694, -0.010])        # crown centre
+CAP_R = rot("x", -8)                           # tilted back: front raised
+CAP_RAD = np.array([0.108, 0.118, 0.120])
+CAP_EDGE_P = np.array([0.0, 1.722, 0.12])      # sweatband plane: 1.722 at the front, 1.651 at the back
+CAP_EDGE_N = nunit([0.0, 1.0, -0.30])
+CAP_FRONT = np.array([0.0, 1.719, 0.108])
+
+
+def cap_local(p):
+    return (p - CAP_C) @ CAP_R
+
+
+def cap_edge_y(z):
+    return CAP_EDGE_P[1] - CAP_EDGE_N[2] / CAP_EDGE_N[1] * (z - CAP_EDGE_P[2])
+
+
+def cap_crown_solid(p):
+    d = ellipsoid(cap_local(p), np.zeros(3), CAP_RAD)
+    return smax(d, -plane(p, CAP_EDGE_P, CAP_EDGE_N), 0.004)
+
+
+def cap_opening(p):
+    """Snapback opening at the centre back (rounded arch above the edge), only behind z < -0.05."""
+    yb = cap_edge_y(-0.115)
+    r = 0.020
+    qx = np.abs(p[:, 0]) - (0.027 - r)
+    qy = p[:, 1] - (yb + 0.036 - r)
+    d2 = np.sqrt(np.maximum(qx, 0) ** 2 + np.maximum(qy, 0) ** 2) + np.minimum(np.maximum(qx, qy), 0) - r
+    return np.maximum(d2, p[:, 2] + 0.05)
+
+
+def cap_brim(p):
+    q = (p - CAP_FRONT) @ rot("x", -2)
+    y2 = q[:, 1] + 3.4 * q[:, 0] ** 2 + 0.9 * np.maximum(q[:, 2], 0) ** 2
+    zf = q[:, 2] + 0.014
+    k0 = np.sqrt((q[:, 0] / 0.098) ** 2 + (zf / 0.090) ** 2)
+    k1 = np.sqrt((q[:, 0] / 0.098 ** 2) ** 2 + (zf / 0.090 ** 2) ** 2)
+    ell = k0 * (k0 - 1) / np.maximum(k1, 1e-12)
+    brim = np.maximum(ell, -zf)
+    return smax(brim, np.abs(y2) - 0.0030, 0.002)
+
+
+def part_cap(p):
+    q = cap_local(p)
+    crown = ellipsoid(q, np.zeros(3), CAP_RAD)
+    # six panel seams (meridians every 60 deg, one at the front centre) + stitched eyelets
+    seam = np.minimum.reduce([np.abs(q @ np.array([np.cos(t), 0, -np.sin(t)])) for t in np.radians([0, 60, 120])])
+    crown = crown + 0.0014 * (1 - smoothstep(0.0, 0.0030, seam)) * smoothstep(-0.02, 0.01, q[:, 1])
+    for az in np.radians([90, 150, 210, 270]):
+        pol = np.radians(50)
+        e = np.array([np.sin(az) * np.sin(pol), np.cos(pol), np.cos(az) * np.sin(pol)]) * CAP_RAD
+        crown = crown + 0.0011 * (1 - smoothstep(0.0016, 0.0042, nrm(q - e)))
+    crown = smax(crown, -plane(p, CAP_EDGE_P, CAP_EDGE_N), 0.004)
+    d = smin(crown, cap_brim(p), 0.006)
+    d = smin(d, ellipsoid(q, np.array([0, CAP_RAD[1] - 0.0012, 0]), [0.0092, 0.0050, 0.0092]), 0.003)  # top button
+    d = smax(d, -cap_opening(p), 0.003)
+    # snapback strap across the bottom of the opening, flush with the crown surface, with snap studs
+    yb = cap_edge_y(-0.115)
+    shell = np.abs(ellipsoid(q, np.zeros(3), CAP_RAD) + 0.0012) - 0.0022
+    strap = np.maximum.reduce([shell, np.abs(p[:, 1] - (yb + 0.0068)) - 0.0068, np.abs(p[:, 0]) - 0.034, p[:, 2] + 0.05])
+    d = smin(d, strap, 0.002)
+    for x in (-0.014, 0.0, 0.014):
+        zc = CAP_C[2] - CAP_RAD[2] * np.sqrt(max(0.0, 1 - ((yb + 0.0068 - CAP_C[1]) / CAP_RAD[1]) ** 2 - (x / CAP_RAD[0]) ** 2))
+        d = smin(d, sphere(p, np.array([x, yb + 0.0068, zc - 0.0006]), 0.0028), 0.0015)
     return d
 
 
 def part_hair(p):
-    ds = []
-    ds.append(ellipsoid(p, [0, 1.648, -0.078], [0.083, 0.052, 0.042]))
+    rng = np.random.default_rng(11)
+    x, y, z = p[:, 0], p[:, 1], p[:, 2]
+    # thin shell hugging the skull: above the ears, and behind them down to a nape hairline rising towards the ears
+    skull = ellipsoid(p, [0, 1.686, -0.007], [0.1035, 0.1135, 0.1125])
+    above_ears = smax(1.666 - y, z - 0.028, 0.004)
+    behind = smax(1.604 + 3.6 * x ** 2 - y, z + 0.036, 0.004)
+    ds = [smax(skull, np.minimum(above_ears, behind), 0.004)]
+
+    centre = np.array([0, 1.686, -0.007])
+
+    def lock(root, drop, out, r0, bend=0.55, flat=1.8):
+        """tapered two-segment lock, flattened against the head (ribbon-like)"""
+        n = nunit(root - centre)
+        q = p + (flat - 1.0) * ((p - root) @ n)[:, None] * n
+        mid = root + drop * bend + out * 0.3
+        tip = root + drop + out
+        ds.append(round_cone(q, root, mid, r0, r0 * 0.72))
+        ds.append(round_cone(q, mid, tip, r0 * 0.72, 0.0022))
+
     for s in (1, -1):
-        ds.append(ellipsoid(p, [s * 0.090, 1.680, -0.030], [0.022, 0.032, 0.058]))
-        # sideburn tufts in front of the ears
-        ds.append(round_cone(p, np.array([s * 0.093, 1.700, 0.018]), np.array([s * 0.099, 1.640, 0.030]), 0.017, 0.005))
-        # messy tufts at the back poking out under the cap
-        ds.append(round_cone(p, np.array([s * 0.055, 1.670, -0.098]), np.array([s * 0.072, 1.610, -0.104]), 0.022, 0.006))
-        ds.append(round_cone(p, np.array([s * 0.082, 1.680, -0.070]), np.array([s * 0.104, 1.630, -0.078]), 0.018, 0.005))
-        ds.append(round_cone(p, np.array([s * 0.020, 1.660, -0.105]), np.array([s * 0.024, 1.598, -0.112]), 0.022, 0.006))
-        ds.append(round_cone(p, np.array([s * 0.095, 1.700, -0.010]), np.array([s * 0.112, 1.660, -0.020]), 0.016, 0.004))
-    # bangs under the brim
-    for x, l in ((-0.052, 0.030), (-0.022, 0.038), (0.012, 0.034), (0.043, 0.028)):
-        ds.append(round_cone(p, np.array([x, 1.699, 0.083]), np.array([x + 0.010, 1.699 - l, 0.104]), 0.014, 0.0035))
-    d = sunion(0.012, *ds)
-    # never poke through the cap crown
-    crown = ellipsoid(p, [0, 1.690, -0.004], [0.112, 0.121, 0.124])
-    above = -plane(p, np.array([0, 1.698, 0.12]), [0, 0.979, -0.204])
-    return np.maximum(d, -np.maximum(crown, above))
+        # sideburn in front of the ear
+        lock(np.array([s * 0.094, 1.690, 0.022]), np.array([s * 0.002, -0.038, 0.004]), np.array([s * 0.003, 0, 0.002]), 0.0105)
+        # irregular clumps escaping under the cap edge above and behind the ear, hugging the head, tips flicking out
+        for z0 in np.linspace(0.006, -0.098, 7) + rng.uniform(-0.006, 0.006, 7):
+            y0 = cap_edge_y(z0) + 0.003
+            x0 = s * 0.100 * np.sqrt(max(0.15, 1 - ((z0 + 0.007) / 0.113) ** 2))
+            l = 0.020 + rng.uniform(0, 0.022) + 0.010 * (-z0 / 0.1)
+            lock(np.array([x0, y0, z0]), np.array([s * 0.002, -l, -0.006 + rng.uniform(-0.006, 0.004)]),
+                 np.array([s * (0.004 + rng.uniform(0, 0.006)), 0.002, -0.003]), 0.0105 + rng.uniform(0, 0.003))
+    # nape: clumps of uneven length hanging over the hairline, tips flicking out
+    for x0 in np.linspace(-0.068, 0.068, 9) + rng.uniform(-0.005, 0.005, 9):
+        z0 = -0.106 + 0.040 * (x0 / 0.070) ** 2
+        root = np.array([x0, cap_edge_y(z0) + 0.002, z0])
+        l = 0.026 + rng.uniform(0, 0.026) - 0.008 * abs(x0) / 0.07
+        lock(root, np.array([x0 * 0.10 + rng.uniform(-0.004, 0.004), -l, 0.003]),
+             np.array([x0 * 0.12, 0.002, -0.007 - rng.uniform(0, 0.008)]), 0.0115 + rng.uniform(0, 0.003), bend=0.62)
+    # fringe swept to one side under the brim
+    for x0, l in ((-0.040, 0.020), (-0.018, 0.026), (0.006, 0.024), (0.029, 0.017)):
+        root = np.array([x0, 1.713, 0.099])
+        lock(root, np.array([0.014, -l, 0.006]), np.array([0.008, 0.002, 0.004]), 0.0105, flat=2.0)
+    # tufts poking out through the snapback opening
+    yb = cap_edge_y(-0.115)
+    for x0 in (-0.012, 0.001, 0.013):
+        root = np.array([x0, yb + 0.020, -0.102])
+        lock(root, np.array([x0 * 0.5, -0.008, -0.009]), np.array([x0 * 0.4, 0.003, -0.012]), 0.0090, flat=1.3)
+    d = sunion(0.006, *ds)
+    # never poke through the cap (except through the snapback opening) or the brim
+    d = np.maximum(d, -smax(cap_crown_solid(p), -cap_opening(p), 0.002))
+    return np.maximum(d, -(cap_brim(p) - 0.0012))
 
 
-CAP_FRONT = np.array([0, 1.706, 0.112])
-
-
-def part_cap(p):
-    crown = ellipsoid(p, [0, 1.690, -0.004], [0.108, 0.117, 0.119])
-    cut = plane(p, np.array([0, 1.704, 0.12]), [0, 0.979, -0.204])
-    crown = smax(crown, -cut, 0.004)
-    # brim: curved plate, tilted slightly down, sides bent down
-    q = p - CAP_FRONT
-    q = q @ rot("x", 8)
-    y2 = q[:, 1] + 1.9 * q[:, 0] ** 2
-    zf = q[:, 2] + 0.012
-    k0 = np.sqrt((q[:, 0] / 0.099) ** 2 + (zf / 0.090) ** 2)
-    k1 = np.sqrt((q[:, 0] / 0.099 ** 2) ** 2 + (zf / 0.090 ** 2) ** 2)
-    ell = k0 * (k0 - 1) / np.maximum(k1, 1e-12)
-    brim = np.maximum(ell, -zf + 0.0)
-    brim = smax(brim, np.abs(y2) - 0.0038, 0.002)
-    d = smin(crown, brim, 0.006)
-    button = sphere(p, np.array([0, 1.806, -0.004]), 0.0115)
-    return smin(d, button, 0.004)
+# ----------------------------------------------------------------------------- tee (folds sculpted in the cloth_masks zones)
+def tee_folds(p):
+    x, y, z = p[:, 0], p[:, 1], p[:, 2]
+    disp = np.zeros(len(p))
+    # waist bunching: soft wavy rolls above the hem, strongest at the front and sides
+    ph = 2 * np.pi * (y - 0.97) / 0.036 + 2.4 * np.sin(9 * x + 4 * z) + 1.1 * np.sin(23 * x - 11 * z) + 0.6 * np.sin(41 * x + 17 * z)
+    disp += 0.0048 * cm.waist_zone(p) * (0.6 + 0.4 * np.sin(7 * x - 5 * z + 1.0)) * np.sin(ph)
+    for S in "LR":
+        s = SIDES[S][1]
+        # armpit drape: folds radiating from the armpit onto the chest and the back
+        q = p - LM.armpit(S)
+        r = nrm(q)
+        zone = (1 - smoothstep(0.03, 0.12, r)) * smoothstep(0.006, 0.03, r)
+        disp += 0.0040 * zone * np.sin(5 * np.arctan2(q[:, 1], q[:, 2]) + 1.3 * s)
+        # shoulders: shallow tension folds running from the collar towards the armpit, front and back
+        v = np.array([0.737, s * 0.676])
+        zs = (smoothstep(0.05, 0.08, s * x) * (1 - smoothstep(0.15, 0.19, s * x)) * smoothstep(1.32, 1.36, y)
+              * (1 - smoothstep(1.44, 1.48, y)) * smoothstep(0.03, 0.07, np.abs(z + 0.02)))
+        disp += 0.0024 * zs * np.sin(2 * np.pi * (x * v[0] + y * v[1]) / 0.030)
+        # sleeve creases: rings with a twist, stronger underneath, faded inside the cuff
+        e, dd = LM.sleeve_end(S)
+        t, rl, rd = cm.axis_coords(p, e, dd)
+        zone = smoothstep(0.022, 0.035, -t) * (1 - smoothstep(0.09, 0.14, -t)) * (rl < 0.1)
+        under = 0.45 + 0.55 * smoothstep(-0.2, 0.6, -rd[:, 1])
+        disp += 0.0030 * zone * under * np.sin(2 * np.pi * (-t) / 0.030 + 3 * rd[:, 2])
+    return disp
 
 
 def part_tee(p):
@@ -192,28 +307,37 @@ def part_tee(p):
         s = SIDES[S][1]
         trap = round_cone(p, np.array([s * 0.055, 1.452, -0.030]), np.array([s * 0.180, 1.428, -0.030]), 0.058, 0.064)
         d = smin(d, trap, 0.045)
-        adir = nunit(el - sh)
-        s_end = sh + adir * 0.135 + np.array([0, -0.006, 0])
+        s_end, adir = tee_sleeve_end(S)
         sleeve = round_cone(p, sh - adir * 0.04 + np.array([0, -0.004, 0]), s_end, 0.074, 0.062)
         sleeve = np.maximum(sleeve, plane(p, s_end, adir))
         d = smin(d, sleeve, 0.03)
-    d = smax(d, 0.968 - p[:, 1], 0.004)  # hem
-    # neck opening
-    d = smax(d, -ellipsoid(p, [0, 1.478, -0.020], [0.058, 0.030, 0.052]), 0.01)
-    return d
+    # back of the neckline: fill the dip between the shoulder pieces
+    d = smin(d, round_cone(p, np.array([-0.06, 1.455, -0.036]), np.array([0.06, 1.455, -0.036]), 0.056, 0.056), 0.03)
+    hem = cm.TEE_HEM_Y + 0.004 * np.sin(5 * np.arctan2(p[:, 0], p[:, 2]) + 0.7)
+    d = smax(d, hem - p[:, 1], 0.004)
+    # crew-neck opening: inside the collar ring, above the collar plane (low at the front, high at the back)
+    q = collar_local(p)
+    cut = np.maximum(np.sqrt(q[:, 0] ** 2 + (q[:, 2] / 0.92) ** 2) - 0.066, -(q[:, 1] - 0.002))
+    d = smax(d, -cut, 0.006)
+    return d + tee_folds(p)
+
+
+COLLAR_C = np.array([0.0, 1.478, -0.022])
+
+
+def collar_local(p):
+    return (p - COLLAR_C) @ rot("x", 16)
 
 
 def tee_sleeve_end(S):
-    sh, el, wr = arm_pts(S)
-    adir = nunit(el - sh)
-    return sh + adir * 0.135 + np.array([0, -0.006, 0]), adir
+    return LM.sleeve_end(S)
 
 
 def part_cream(p):
     """Collar + sleeve cuffs (cream ribbing)."""
-    q = (p - np.array([0, 1.468, -0.016])) @ rot("x", -14)
-    xz = np.sqrt(q[:, 0] ** 2 / 1.0 + (q[:, 2] / 0.92) ** 2) - 0.062
-    collar = np.sqrt(xz ** 2 + q[:, 1] ** 2) - 0.0125
+    q = collar_local(p)
+    xz = np.sqrt(q[:, 0] ** 2 + (q[:, 2] / 0.92) ** 2) - 0.0605
+    collar = np.sqrt(xz ** 2 + q[:, 1] ** 2) - 0.0122
     ds = [collar]
     for S in "LR":
         e, adir = tee_sleeve_end(S)
@@ -225,34 +349,49 @@ def part_cream(p):
 
 
 def part_arms(p, sides="LR"):
+    """T-pose arms (palms down): deltoid, biceps (front), triceps (back), a bony elbow with an inner crease,
+    a forearm bulge narrowing to a flat wrist, and hands with palm thickness, pads, knuckles, tapered fingers and thumb."""
     ds = []
+    F, U = np.array([0, 0, 1.0]), np.array([0, 1.0, 0])
     for S in sides:
         n, s = SIDES[S]
         sh, el, wr = arm_pts(S)
-        upper = round_cone(p, sh + np.array([-s * 0.03, 0, 0]), el, 0.047, 0.037)
-        fore = round_cone(scaled(p, el, [1, 1.22, 1]), el, wr, 0.038, 0.029)
-        fbulge = ellipsoid(p, el + (wr - el) * 0.28, [0.07, 0.034, 0.038])
-        arm = sunion(0.016, upper, fore, fbulge)
-        # hand
-        knuck = (J(n + "HandIndex1") + J(n + "HandMiddle1") + J(n + "HandRing1") + J(n + "HandPinky1")) / 4
-        hdir = nunit(knuck - wr)
-        hc = wr + (knuck - wr) * 0.52 + np.array([0, -0.002, 0])
-        # local frame: x=hdir, y=up-ish, z=across
-        yax = nunit(np.cross(np.array([0, 0, 1.0]), hdir)) * s
-        zax = np.cross(hdir, yax)
-        R = np.stack([hdir, yax, zax], 1)
-        palm = round_box(p, hc, [np.linalg.norm(knuck - wr) * 0.56, 0.0135, 0.041], 0.012, R)
-        fingers = []
-        for f, r0 in (("Index", 0.0092), ("Middle", 0.0096), ("Ring", 0.0090), ("Pinky", 0.0078)):
+        ua, fa = nunit(el - sh), nunit(wr - el)
+        upper = round_cone(p, sh - ua * 0.02, el, 0.046, 0.0300)
+        delt = ellipsoid(p, sh + ua * 0.040 + U * 0.008, [0.066, 0.050, 0.050])
+        biceps = ellipsoid(p, sh + ua * 0.158 + F * 0.010 - U * 0.002, [0.074, 0.0280, 0.0290])
+        triceps = ellipsoid(p, sh + ua * 0.118 - F * 0.011 + U * 0.003, [0.088, 0.0300, 0.0285])
+        olec = ellipsoid(p, el - F * 0.020 + U * 0.001, [0.015, 0.0130, 0.0110])
+        epis = union(ellipsoid(p, el + U * 0.0155, [0.012, 0.0090, 0.0105]), ellipsoid(p, el - U * 0.0150, [0.012, 0.0090, 0.0105]))
+        fore = round_cone(scaled(p, el, [1, 1.22, 1]), el, wr, 0.0300, 0.0222)
+        fbulge = ellipsoid(p, el + fa * 0.068 + U * 0.002, [0.082, 0.0300, 0.0350])
+        arm = sunion(0.013, upper, delt, biceps, triceps, olec, epis, fore, fbulge)
+        t, rl, rd = cm.axis_coords(p, el, nunit(ua + fa))
+        arm = arm + 0.0024 * np.exp(-(t / 0.0075) ** 2) * smoothstep(0.3, 0.9, rd[:, 2]) * (rl < 0.06)   # inner-elbow crease
+        # hand frame: x = towards the knuckles, y = back of the hand (up in the T-pose), z = towards the thumb/index side
+        f1 = {f: J(n + "Hand" + f + "1") for f in ("Index", "Middle", "Ring", "Pinky")}
+        knuck = sum(f1.values()) / 4
+        hx = nunit(knuck - wr)
+        hz0 = nunit(f1["Index"] - f1["Pinky"])
+        hy = nunit(-s * np.cross(hx, hz0))
+        hz = np.cross(hx, hy) * (1 if np.dot(np.cross(hx, hy), hz0) > 0 else -1)
+        R = np.stack([hx, hy, hz], 1)
+        Lp = np.linalg.norm(knuck - wr)
+        palm = round_box(p, wr + hx * (Lp * 0.50) + hy * 0.001, [Lp * 0.50, 0.0112, 0.0380], 0.0105, R)
+        heel = ellipsoid(p, wr + hx * 0.020 - hy * 0.004, [0.024, 0.0125, 0.030], R)
+        thenar = ellipsoid(p, wr + hx * 0.032 + hz * 0.021 - hy * 0.007, [0.027, 0.0130, 0.0175], R)
+        hypo = ellipsoid(p, wr + hx * 0.040 - hz * 0.025 - hy * 0.005, [0.032, 0.0110, 0.0125], R)
+        parts = [palm, heel, thenar, hypo]
+        for f, r0 in (("Index", 0.0097), ("Middle", 0.0101), ("Ring", 0.0095), ("Pinky", 0.0082)):
             pts = [J(n + "Hand" + f + str(i)) for i in range(1, 5)]
+            parts.append(sphere(p, pts[0] + hy * 0.0045, r0 * 0.95))                    # knuckle
             for i in range(3):
-                fingers.append(round_cone(p, pts[i], pts[i + 1], r0 * (1 - 0.07 * i), r0 * (1 - 0.07 * (i + 1))))
+                parts.append(round_cone(p, pts[i], pts[i + 1], r0 * (1 - 0.085 * i), r0 * (1 - 0.085 * (i + 1))))
         tp = [J(n + "HandThumb" + str(i)) for i in range(1, 5)]
         for i in range(3):
-            fingers.append(round_cone(p, tp[i], tp[i + 1], 0.0125 - 0.0012 * i, 0.0113 - 0.0012 * i))
-        thenar = ellipsoid(p, (tp[0] + tp[1]) / 2 + np.array([0, -0.004, 0]), [0.022, 0.014, 0.018])
-        hand = sunion(0.007, palm, thenar, *fingers)
-        ds.append(smin(arm, hand, 0.012))
+            parts.append(round_cone(p, tp[i], tp[i + 1], 0.0128 - 0.0011 * i, 0.0117 - 0.0011 * i))
+        hand = sunion(0.0065, *parts)
+        ds.append(smin(arm, hand, 0.010))
     return union(*ds)
 
 
@@ -274,16 +413,49 @@ def shin_radius_at(S, y):
     return 0.048 + (0.033 - 0.048) * min(max(t, 0), 1), kn + (an - kn) * t
 
 
+def seg_dist2(px_, py_, a, b):
+    """distance from 2D points to segment a-b"""
+    ab = b - a
+    t = np.clip(((px_ - a[0]) * ab[0] + (py_ - a[1]) * ab[1]) / (ab @ ab), 0, 1)
+    return np.hypot(px_ - (a[0] + t * ab[0]), py_ - (a[1] + t * ab[1]))
+
+
+def shorts_folds(p):
+    x, y, z = p[:, 0], p[:, 1], p[:, 2]
+    disp = np.zeros(len(p))
+    cr = LM.crotch()
+    q = p - cr
+    front = smoothstep(0.02, 0.07, z)
+    for S in "LR":
+        s = SIDES[S][1]
+        # front-hip whiskers fanning from the crotch towards the hip bone
+        zone = (1 - smoothstep(0.02, 0.085, nrm(p - LM.front_hip(S)))) * front * (s * x > 0)
+        disp += 0.0038 * zone * np.sin(8 * np.arctan2(q[:, 1], s * q[:, 0]) + 1.0)
+        # above the knee: ripples around the leg (front and back), faded inside the hem cuff
+        e, dd = LM.shorts_hem(S)
+        t, rl, rd = cm.axis_coords(p, e, dd)
+        zone = smoothstep(0.038, 0.052, -t) * (1 - smoothstep(0.085, 0.15, -t)) * (rl < 0.13) * (s * x > 0)
+        az = np.arctan2(rd[:, 2], rd[:, 0] * s)
+        ph = 2 * np.pi * (-t) / 0.036 + 3.0 * rd[:, 0] * s + 2.0 * rd[:, 2] + 1.7 * np.sin(5 * az + s) + 1.3 * s
+        disp += 0.0042 * zone * (0.35 + 0.65 * np.abs(rd[:, 2])) * (0.65 + 0.35 * np.sin(3 * az - 1.0)) * np.sin(ph)
+        # slash pocket openings on the front hips
+        pk = seg_dist2(x, y, np.array([s * 0.088, 1.022]), np.array([s * 0.140, 0.930]))
+        disp += 0.0013 * (1 - smoothstep(0.0, 0.0024, pk)) * smoothstep(-0.01, 0.03, z)
+    # crotch: short radial creases front and back
+    disp += 0.0022 * (1 - smoothstep(0.02, 0.075, nrm(q))) * np.sin(10 * np.arctan2(q[:, 2], q[:, 0]))
+    # raised waistband + fly J-seam
+    disp -= 0.0016 * smoothstep(1.019, 1.025, y)
+    fly = (1 - smoothstep(0.0, 0.0022, np.abs(x - 0.013))) * smoothstep(0.905, 0.915, y) * (1 - smoothstep(1.012, 1.019, y))
+    disp += 0.0011 * fly * front
+    return disp
+
+
 def part_shorts(p):
     pel = ellipsoid(p, [0, 0.975, 0.006], [0.162, 0.128, 0.118])
     legs = []
     for S in "LR":
-        s = SIDES[S][1]
-        hip, kn, an, toe, toe_end = leg_pts(S)
-        top = np.array([s * 0.092, 0.94, 0.010])
-        end = hip + (kn - hip) * 0.79 + np.array([s * 0.004, 0, 0])
-        ldir = nunit(end - top)
-        leg = round_cone(p, top, end, 0.100, 0.088)
+        end, ldir = shorts_hem(S)
+        leg = round_cone(p, LM.shorts_top(S), end, 0.100, 0.088)
         legs.append(np.maximum(leg, plane(p, end, ldir)))
     d = smin(pel, union(*legs), 0.05)
     d = smax(d, p[:, 1] - 1.055, 0.004)
@@ -291,15 +463,11 @@ def part_shorts(p):
     for s in (1, -1):
         pk = round_box(p, np.array([s * 0.072, 0.985, -0.116]), [0.042, 0.048, 0.008], 0.006, rot("y", s * 10) @ rot("x", 8))
         d = smin(d, pk, 0.004)
-    return d
+    return d + shorts_folds(p)
 
 
 def shorts_hem(S):
-    s = SIDES[S][1]
-    hip, kn, an, toe, toe_end = leg_pts(S)
-    top = np.array([s * 0.092, 0.94, 0.010])
-    end = hip + (kn - hip) * 0.79 + np.array([s * 0.004, 0, 0])
-    return end, nunit(end - top)
+    return LM.shorts_hem(S)
 
 
 def part_shorts_cuff(p):
@@ -453,15 +621,15 @@ def mesh_part(name, fn, bmin, bmax, h):
 # colours are sRGB hex; material "vc" uses vertex colour, "face" uses the painted face texture
 PARTS = [
     # name, fn, bbox, voxel, colour, material, target tris
-    ("head", part_head, ([-0.13, 1.40, -0.14], [0.13, 1.83, 0.15]), 0.0022, "#e9b48f", "face", 7000),
-    ("hair", part_hair, ([-0.14, 1.55, -0.14], [0.14, 1.75, 0.13]), 0.0022, "#3b2618", "vc", 2600),
-    ("cap", part_cap, ([-0.13, 1.62, -0.14], [0.13, 1.83, 0.22]), 0.0022, "#e5b03b", "vc", 3200),
-    ("tee", part_tee, ([-0.40, 0.94, -0.16], [0.40, 1.53, 0.14]), 0.0042, "#2f8f86", "vc", 5200),
+    ("head", part_head, ([-0.13, 1.40, -0.14], [0.13, 1.83, 0.15]), 0.0022, "#e9b48f", "face", 7500),
+    ("hair", part_hair, ([-0.135, 1.56, -0.15], [0.135, 1.75, 0.125]), 0.0018, "#4a2e1c", "vc", 5200),
+    ("cap", part_cap, ([-0.125, 1.63, -0.14], [0.125, 1.83, 0.21]), 0.0016, "#e5b03b", "vc", 6500),
+    ("tee", part_tee, ([-0.40, 0.94, -0.16], [0.40, 1.53, 0.14]), 0.0030, "#2f8f86", "vc", 9000),
     ("cream", part_cream, ([-0.40, 1.36, -0.12], [0.40, 1.50, 0.08]), 0.0025, "#f1e6cc", "vc", 1800),
-    ("armL", lambda p: part_arms(p, "L"), ([0.13, 1.30, -0.11], [0.95, 1.50, 0.10]), 0.0024, "#e9b48f", "vc", 3500),
-    ("armR", lambda p: part_arms(p, "R"), ([-0.95, 1.30, -0.11], [-0.13, 1.50, 0.10]), 0.0024, "#e9b48f", "vc", 3500),
+    ("armL", lambda p: part_arms(p, "L"), ([0.13, 1.30, -0.11], [0.95, 1.50, 0.10]), 0.0019, "#e9b48f", "vc", 5600),
+    ("armR", lambda p: part_arms(p, "R"), ([-0.95, 1.30, -0.11], [-0.13, 1.50, 0.10]), 0.0019, "#e9b48f", "vc", 5600),
     ("legs", part_legs, ([-0.24, 0.05, -0.12], [0.24, 0.98, 0.11]), 0.0045, "#e9b48f", "vc", 2400),
-    ("shorts", part_shorts, ([-0.27, 0.48, -0.15], [0.27, 1.07, 0.15]), 0.0042, "#d2bd8e", "vc", 3600),
+    ("shorts", part_shorts, ([-0.27, 0.48, -0.15], [0.27, 1.07, 0.15]), 0.0030, "#d2bd8e", "vc", 7500),
     ("shortscuff", part_shorts_cuff, ([-0.26, 0.50, -0.12], [0.26, 0.66, 0.12]), 0.0032, "#c4ad7c", "vc", 1200),
     ("socks", part_socks, ([-0.22, 0.06, -0.11], [0.22, 0.33, 0.07]), 0.0032, "#f6f3ec", "vc", 1400),
     ("stripes", part_stripes, ([-0.22, 0.24, -0.10], [0.22, 0.29, 0.06]), 0.0022, "#d2463a", "vc", 600),
@@ -472,12 +640,14 @@ PARTS = [
 
 if __name__ == "__main__":
     only = set(sys.argv[3:])
+    meta_path = os.path.join(OUT, "parts.json")
+    old = {m["name"]: m for m in json.load(open(meta_path))} if os.path.exists(meta_path) else {}
     meta = []
     for name, fn, (bmin, bmax), h, col, mat, target in PARTS:
         if only and name not in only:
-            continue
-        tris = mesh_part(name, fn, bmin, bmax, h)
+            tris = old.get(name, {}).get("tris", 0)
+        else:
+            tris = mesh_part(name, fn, bmin, bmax, h)
         meta.append({"name": name, "color": col, "material": mat, "target_tris": target, "tris": int(tris)})
-    if not only:
-        json.dump(meta, open(os.path.join(OUT, "parts.json"), "w"), indent=1)
+    json.dump(meta, open(meta_path, "w"), indent=1)
     print("done")
