@@ -3,7 +3,8 @@
 // (true 60 fps) -> constant 60 fps with key / trick captions. Pause menu: page-level CDP screencast (HTML menu included,
 // compositor timestamps) -> constant 60 fps. Pointer lock is emulated in the page (the test window never takes focus).
 //   bash tools/heavy.sh M2 node tools/capture/rt_clips.mjs [--only f_flips,pause_menu,easy_cruise,bail_bowl]
-// -> E:/shots/skate-park/pass-04/clips/rt_feat_*.mp4 + sheets/rt_feat_*.jpg; takes, logs, report.json in realtime/media_feat/
+// -> E:/shots/skate-park/pass-05/clips/rt_feat_*.mp4 + sheets/rt_feat_*.jpg; takes, logs, report.json in realtime/media_feat/
+//    (MEDIA_OUT=<dir> replaces E:/shots/skate-park/pass-05, e.g. for dry runs)
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -13,7 +14,7 @@ const args = process.argv.slice(2);
 const opt = (k, d) => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : d; };
 const ONLY = opt('only', '') ? opt('only', '').split(',') : null;
 const BASE = 'http://127.0.0.1:5188/?test&mute';
-const P4 = 'E:/shots/skate-park/pass-04';
+const P4 = process.env.MEDIA_OUT || 'E:/shots/skate-park/pass-05';
 const WORK = path.join(P4, 'realtime', 'media_feat'), CLIPS = path.join(P4, 'clips'), SHEETS = path.join(P4, 'sheets');
 for (const d of [WORK, CLIPS, SHEETS]) fs.mkdirSync(d, { recursive: true });
 const REPORT = path.join(WORK, 'report.json');

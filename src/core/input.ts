@@ -22,8 +22,8 @@ const DZ = 0.12;
 const DRAG_YAW = 0.006, DRAG_PITCH = 0.004, LOCK_PITCH = 0.8, SPIKE = 500;
 /** right stick: rate caps (rad/s), time to full rate and to stop (s) */
 const STICK_YAW = Math.PI, STICK_PITCH = (100 * Math.PI) / 180, STICK_RAMP = 0.15, STICK_STOP = 0.06;
-/** pop charge floors: F quick pop, Easy ollie, Easy rolling F */
-const QUICK_POP = 0.35, EASY_POP = 0.7, EASY_F_POP = 0.5;
+/** pop charge floors: F quick pop (Pro and Easy, ~0.54 s of air), Easy ollie; automatic crouch before a rolling F pop (s) */
+const QUICK_POP = 0.85, EASY_POP = 0.7, QUICK_T = 0.1;
 /** Easy: shortest crouch before a tapped ollie pops (s), cruise band (m/s), keyboard steer scale */
 const TAP_T = 0.1, CRUISE = 4.3, CRUISE_LOW = 3.8, EASY_STEER = 0.8;
 /** auto-ride takes over again after this long without player input while rolling (s) */
@@ -100,6 +100,8 @@ export class Input {
   private scriptPrev: Partial<Record<string, boolean>> = {};
   private keyOrder: Record<string, number> = {}; private order = 0;
   private wasCrouch = false; private touchOllieWas = false; private swallow = false; private tapT = -1;
+  /** rolling F: time into the automatic crouch (-1 = none) and the flip picked at the press */
+  private quickT = -1; private quickDir: FlipDir = 'left';
   /** touch swipe direction of the last OLLIE release, kept until the (possibly delayed) pop */
   private relFlip: FlipDir | null = null;
   private airLatch: FlipDir | null = null; private airLatchT = 0; private cycle = 0;
@@ -237,7 +239,7 @@ export class Input {
       // nothing samples while paused: presses made in the menu must not fire on resume
       this.pressedEdge.clear(); this.padDown.clear();
       this.touch.ollieReleased = this.touch.grindPressed = this.touch.trickPressed = this.touch.ollieCancel = false;
-      this.wasCrouch = false; this.tapT = -1; this.airLatch = null;
+      this.wasCrouch = false; this.tapT = -1; this.airLatch = null; this.quickT = -1;
     }
     this.readPad();
     const t = this.touch;
@@ -377,7 +379,7 @@ export class Input {
     if (easy && crouchPress) {
       if (air) { flip ??= 'cycle'; this.swallow = true; crouch = false; }
       else if (mode === 'grind') { inp.ollie = true; this.swallow = true; crouch = false; }
-      else if (ground) this.tapT = 0;
+      else if (ground) { this.tapT = 0; inp.windup = true; }
     }
     // Easy tap: crouch at least TAP_T, then pop (holding longer charges as usual)
     if (this.tapT >= 0) {
@@ -393,6 +395,9 @@ export class Input {
       let used = true;
       if (air) {
         if (this.ph?.flip) used = false; else { this.airLatch = dir; this.airLatchT = AIR_LATCH; }
+      } else if (ground && this.quickT >= 0) used = false;
+      else if (ground && !crouch && !this.wasCrouch && !this.ph?.manual.active) {
+        this.quickT = 0; this.quickDir = dir; inp.windup = true;
       } else {
         inp.ollie = true; inp.flip = dir;
         if (ground) {
@@ -401,10 +406,27 @@ export class Input {
             if (easy) inp.popCharge = EASY_POP;
             if (crouch) this.swallow = true;
             crouch = false; this.tapT = -1;
-          } else inp.popCharge = easy ? EASY_F_POP : QUICK_POP;
+          } else inp.popCharge = QUICK_POP;
         }
       }
       if (used && flip === 'cycle') this.cycle++;
+    }
+    // rolling F: crouch QUICK_T as if Space were held, then pop with the flip picked at the press
+    if (this.quickT >= 0) {
+      if (ground) {
+        this.quickT += dt; active = true;
+        if (this.quickT < QUICK_T - 1e-6) crouch = true;
+        else {
+          inp.ollie = true; inp.flip = this.quickDir; inp.popCharge = QUICK_POP;
+          if (crouch) this.swallow = true;
+          crouch = false; this.tapT = -1; this.quickT = -1;
+        }
+      } else {
+        // rolled off an edge or locked into a grind during the crouch: flip there
+        if (air && !this.ph?.flip) { this.airLatch = this.quickDir; this.airLatchT = AIR_LATCH; }
+        else if (mode === 'grind') { inp.ollie = true; inp.flip = this.quickDir; }
+        this.quickT = -1;
+      }
     }
     inp.crouch = crouch;
     if (!inp.ollie && !air) {

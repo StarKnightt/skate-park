@@ -232,15 +232,25 @@ export class Ocean {
           #include <colorspace_fragment>
         }`,
     });
-    // the ocean starts north of the beach (never under the park: the bowls are deeper than sea level)
-    const g = new PlaneGeometry(6000, 3200, 140, 90);
-    g.rotateX(-Math.PI / 2);
-    g.translate(0, 0, -50 - 1600);
-    this.mesh = new Mesh(g, this.mat);
+    this.mesh = new Mesh(Ocean.grid(140, 90), this.mat);
     this.mesh.position.y = level;
     this.mesh.receiveShadow = false;
   }
   setNoise(oct: number, waves: number) { setDefines(this.mat, { NOISE_OCT: oct, OCEAN_WAVES: waves }); }
+  /** the ocean starts north of the beach (never under the park: the bowls are deeper than sea level) */
+  private static grid(sx: number, sz: number) {
+    const g = new PlaneGeometry(6000, 3200, sx, sz);
+    g.rotateX(-Math.PI / 2);
+    g.translate(0, 0, -50 - 1600);
+    return g;
+  }
+  /** vertex grid of the swell (segments along x, z) */
+  setGrid(sx: number, sz: number) {
+    const p = (this.mesh.geometry as PlaneGeometry).parameters;
+    if (p.widthSegments === sx && p.heightSegments === sz) return;
+    this.mesh.geometry.dispose();
+    this.mesh.geometry = Ocean.grid(sx, sz);
+  }
   apply(e: EnvState) {
     const u = this.mat.uniforms;
     u.uDeep.value.copy(e.deep); u.uShallow.value.copy(e.shallow); u.uSky.value.copy(e.zenith).lerp(e.mid, 0.4);

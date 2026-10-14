@@ -5,7 +5,7 @@
 // rider spot is flat open ground near the bail, nothing is inside the park geometry.
 //   node tools/sim/build_src.mjs tools/sim/.build-d && node tools/sim/recovery_sim.mjs [N random] [fast]
 globalThis.location = { search: '' };
-const B = new URL('./.build-d/', import.meta.url).href;
+const B = new URL(process.env.SIMB ?? './.build-d/', import.meta.url).href;
 const { Vector3 } = await import('three');
 const { buildPark } = await import(B + 'world/park.js');
 const { CollisionWorld } = await import(B + 'world/collision.js');
@@ -124,7 +124,7 @@ for (const c of cases.filter((c) => !process.env.ONLY || c.name === process.env.
   if (!g || !R.standable(world, stand)) stand = R.findStandSpot(world, body, 4) ?? body;
   const rest = { pos: new Vector3(), fwd: new Vector3(), up: new Vector3() };
   bl.board.ridePose(rest.pos, rest.fwd, rest.up);
-  const plan = R.planRecovery(world, stand, rest, FAST ? { maxWalk: 1.2, face: hd, tight: true } : { maxWalk: 5 });
+  const plan = R.planRecovery(world, stand, rest, FAST ? (R.quickPlan ? R.quickPlan(rest.fwd) : { maxWalk: 1.2, face: hd, tight: true }) : { maxWalk: 5 });
   stats[plan.why === 'walk' ? 'walk' : plan.why.startsWith('here') ? 'here' : 'relocate']++;
   if (process.env.ONLY) console.log('plan', plan.why, 'ride', plan.ride.toArray().map((v) => v.toFixed(2)).join(','), 'path', plan.path.length, 'stand', stand.toArray().map((v) => v.toFixed(2)).join(','));
   if (plan.relocate) whyMoved[plan.why.split(' ').slice(1).join(' ')] = (whyMoved[plan.why.split(' ').slice(1).join(' ')] ?? 0) + 1;
@@ -135,7 +135,7 @@ for (const c of cases.filter((c) => !process.env.ONLY || c.name === process.env.
     const level = Math.abs(plan.ride.y - from.y) > 0.3;
     const route = level ? R.groundRoute(world, from, plan.ride) : null;
     if (level) { levelMoves++; if (route) rolls++; }
-    if (route) bl.board.rollTo(route, plan.fwd, FAST ? Math.min(0.75, Math.max(0.45, route.len / 6)) : Math.min(1.8, Math.max(0.7, route.len / 3.2)));
+    if (route) bl.board.rollTo(route, plan.fwd, FAST && !R.quickPlan ? Math.min(0.75, Math.max(0.45, route.len / 6)) : Math.min(1.8, Math.max(0.7, route.len / 3.2)));
     else bl.board.moveTo(plan.ride, plan.fwd, plan.up, 0.6);
     for (let i = 0; i < 300 && bl.board.gliding; i++) ph.step(STEP, inp);
     const rp = new Vector3(), rf = new Vector3(), ru = new Vector3();
@@ -151,7 +151,8 @@ for (const c of cases.filter((c) => !process.env.ONLY || c.name === process.env.
   check(!R.onTop(world, plan.ride), 'ride spot on top of a ledge / pad / funbox', c, ` (${plan.why})`);
   const far = Math.hypot(plan.ride.x - bailAt.x, plan.ride.z - bailAt.z);
   const farBody = Math.hypot(plan.ride.x - body.x, plan.ride.z - body.z);
-  check(far < 7.5 || farBody < 5.5, 'ride spot far from the bail', c, ` ${far.toFixed(1)} m from the bail, ${farBody.toFixed(1)} m from the body (${plan.why})`);
+  // quick recovery: the board stays where it came to rest and he walks to it (up to quickPlan's maxWalk)
+  check(far < 7.5 || farBody < (FAST && R.quickPlan ? R.quickPlan(rest.fwd).maxWalk + 0.8 : 5.5), 'ride spot far from the bail', c, ` ${far.toFixed(1)} m from the bail, ${farBody.toFixed(1)} m from the body (${plan.why})`);
   farMax = Math.max(farMax, far); farBodyMax = Math.max(farBodyMax, farBody);
   // independent re-check of the walk (finer sampling): walkable, small steps, room to stand
   // (a steep reading must cover two sub-samples in a row, ~2.5 cm: the foot of a bank flush with the plaza is a sliver)

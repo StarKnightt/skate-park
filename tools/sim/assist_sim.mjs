@@ -2,7 +2,7 @@
 // landing assist. Each case runs with the assist off (Pro) and on.
 //   node tools/sim/build_src.mjs tools/sim/.build-d && node tools/sim/assist_sim.mjs
 globalThis.location = { search: '' };
-const B = new URL('./.build-d/', import.meta.url).href;
+const B = new URL(process.env.SIMB ?? './.build-d/', import.meta.url).href;
 const { Vector3, Quaternion } = await import('three');
 const { buildPark } = await import(B + 'world/park.js');
 const { CollisionWorld } = await import(B + 'world/collision.js');

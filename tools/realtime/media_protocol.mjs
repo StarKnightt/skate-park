@@ -163,7 +163,12 @@ try {
       if (ONLY && !ONLY.includes(scen)) continue;
       // the first view after load compiles shaders / uploads textures (one ~100 ms frame): warm it up unlogged;
       // and every scenario is dry-run once first (views that only come into sight later in a scenario stall the same way)
-      if (!warm) { await setup(s); await wait(900); warm = true; }
+      if (!warm) {
+        await setup(s); await wait(900); warm = true;
+        // the page's first MediaRecorder takes ~1 s to start: run it once here, or the first recorded scenario's keys
+        // start that much later after its teleport (another line: --only bowl_carve flew out of the bowl)
+        if (RECORD) { await page.evaluate(() => window.__recStart()); await wait(1500); await page.evaluate(() => window.__recStop()); }
+      }
       if (!flag('nowarm')) {
         await setup(s); await wait(150);
         const tw = Date.now();

@@ -186,12 +186,12 @@ function beside(ride: Vector3, fwd: Vector3, up: Vector3) {
 }
 
 /** stand beside a board lying at ride: either nose direction, whichever side has room and a walk from `stand` */
-function stepOnFrom(world: CollisionWorld, stand: Vector3, ride: Vector3, fwd: Vector3, up: Vector3, maxWalk: number) {
+function stepOnFrom(world: CollisionWorld, stand: Vector3, ride: Vector3, fwd: Vector3, up: Vector3, maxWalk: number, dy = 0.08) {
   for (const sgn of [1, -1]) {
     const f = fwd.clone().multiplyScalar(sgn);
     const { target, faceYaw } = beside(ride, f, up);
     const g = groundAt(world, target.x, target.z, ride.y, 0.3, 0.4);
-    if (!g || levelness(world, g) < WALK_NY || Math.abs(g.point.y - ride.y) > 0.08 || !standClear(world, g.point)) continue;
+    if (!g || levelness(world, g) < WALK_NY || Math.abs(g.point.y - ride.y) > dy || !standClear(world, g.point)) continue;
     const w = walkPath(world, stand, g.point);
     if (!w.ok || pathLen(w.pts) > maxWalk) continue;
     return { fwd: f, target: g.point, faceYaw, path: w.pts };
@@ -201,6 +201,9 @@ function stepOnFrom(world: CollisionWorld, stand: Vector3, ride: Vector3, fwd: V
 
 export interface BoardRest { pos: Vector3; fwd: Vector3; up: Vector3 }
 
+/** quick recovery (assist): the board stays where it came to rest and he walks over to it (only moved where he can't) */
+export const quickPlan = (prefer: Vector3) => ({ maxWalk: 10, prefer, keep: true });
+
 /**
  * Plan the walk back after a bail. `stand` is where he stands up (already on walkable ground), `board` where the
  * board lies (ground point under it, nose direction, ground normal). He walks to it if it lies on flat ground he can
@@ -208,20 +211,21 @@ export interface BoardRest { pos: Vector3; fwd: Vector3; up: Vector3 }
  * `face` (his facing) makes the board land right in front of him when it is moved (quick recovery).
  */
 export function planRecovery(world: CollisionWorld, stand: Vector3, board: BoardRest | null,
-  o: { maxWalk?: number; face?: number; prefer?: Vector3; tight?: boolean } = {}): RecoveryPlan {
+  o: { maxWalk?: number; face?: number; prefer?: Vector3; tight?: boolean; keep?: boolean } = {}): RecoveryPlan {
   const maxWalk = o.maxWalk ?? 6;
   let miss = 'moving';
   if (board) {
     const { pos, fwd, up } = board;
-    let flat = up.y >= 0.94;
+    // keep: he also steps onto a board lying on the gentle foot of a bank or a bowl wall (it rolls off with him)
+    let flat = up.y >= (o.keep ? 0.92 : 0.94);
     for (const s of [0.38, -0.38]) {
       if (!flat) break;
       const h = groundAt(world, pos.x + fwd.x * s, pos.z + fwd.z * s, pos.y, 0.3, 0.4);
-      flat = !!h && h.normal.y >= WALK_NY && Math.abs(h.point.y - pos.y) <= 0.05;
+      flat = !!h && h.normal.y >= WALK_NY && Math.abs(h.point.y - pos.y) <= (o.keep ? 0.09 : 0.05);
     }
     const top = flat && onTop(world, pos);
     const room = flat && !top && standClear(world, _d.copy(pos).addScaledVector(up, 0.12));
-    const s = room ? stepOnFrom(world, stand, pos, fwd, up, maxWalk) : null;
+    const s = room ? stepOnFrom(world, stand, pos, fwd, up, maxWalk, o.keep ? 0.14 : 0.08) : null;
     if (s) return { stand: stand.clone(), ride: pos.clone(), fwd: s.fwd, up: up.clone(), target: s.target, faceYaw: s.faceYaw, relocate: false, path: s.path, why: 'walk' };
     miss = !flat ? 'not flat' : top ? 'on top' : !room ? 'no room' : 'no walk';
   }
@@ -252,8 +256,9 @@ export function planRecovery(world: CollisionWorld, stand: Vector3, board: Board
     }
     return null;
   };
-  // tilted on a transition or tucked against something: it just rolls off onto the flat next to it
-  const near = board && o.face === undefined && miss !== 'no walk' ? search(board.pos, 1.5, () => maxWalk, 'nudged ') : null;
+  // tilted on a transition or tucked against something: it just rolls off onto the flat next to it (keep: it moves as
+  // little as possible and he walks further instead)
+  const near = board && o.face === undefined && (o.keep || miss !== 'no walk') ? search(board.pos, o.keep ? 2.1 : 1.5, () => maxWalk, 'nudged ') : null;
   if (near) return near;
   const moved = search(stand, 6, (r) => Math.max(maxWalk, r + 1.5), 'moved ');
   if (moved) return moved;

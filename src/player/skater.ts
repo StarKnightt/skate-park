@@ -8,7 +8,7 @@ import { clamp, lerp, Spring } from '../core/util';
 import { MOBILE } from '../core/device';
 import { KICKTURN_T, PUSH, dropRootAng, type BailKind, type PhysView } from './physics';
 import { BoardView, deckTopY } from './board';
-import { planRecovery, standable, findStandSpot, walkPath, groundAt, groundRoute, levelness, WALK_NY, STEP_UP, STEP_DOWN, type RecoveryPlan } from './recovery';
+import { planRecovery, quickPlan, standable, findStandSpot, walkPath, groundAt, groundRoute, levelness, WALK_NY, STEP_UP, STEP_DOWN, type RecoveryPlan } from './recovery';
 
 const X = new Vector3(1, 0, 0), Y = new Vector3(0, 1, 0), Z = new Vector3(0, 0, 1);
 const ONE = new Vector3(1, 1, 1);
@@ -148,6 +148,8 @@ export class Skater {
   private xf = { from: new Pose(), t: 1, dur: 1 };
   private crouchS = new Spring(0, 16);
   private crouchIn = new Spring(0, 32);
+  /** time of the last 'windup' (short automatic crouch before a quick pop / tap ollie) */
+  private windupT = -10;
   private pushS = new Spring(0, 12);
   private manS = new Spring(0, 9);
   private grindS = new Spring(0, 11);
@@ -191,6 +193,8 @@ export class Skater {
   private fast = false; // this recovery is the quick one (assist)
   /** where the board goes back down and his walk to it (planned at the get-up, or once the board has stopped) */
   private plan: RecoveryPlan | null = null;
+  /** quick recovery: the board lies on a slope he can't step onto; it rolls down to his feet once he stands there */
+  private nudgeLater = false;
   private shakeW = 0;
   private snap: Map<Bone, { q: Quaternion; p: Vector3 }> | null = null;
   private snapW = 0;
@@ -665,6 +669,7 @@ export class Skater {
           break;
         }
         case 'leaveGround': this.crossfade(0.2); break;
+        case 'windup': this.windupT = this.time; break;
         case 'land':
           this.crossfade(0.06);
           if (e.quality === 'clean' && (e.popped || e.flip || e.vert || e.airTime > 0.3)) this.grinT = 1.1;
@@ -750,7 +755,7 @@ export class Skater {
     this.root.updateMatrixWorld(true);
   }
 
-  private rootS = { q: new Quaternion(), prev: new Quaternion(), w: new Vector3(), t: -1, d: new Quaternion(), wB: new Vector3() };
+  private rootS = { q: new Quaternion(), prev: new Quaternion(), w: new Vector3(), t: -1, d: new Quaternion(), wB: new Vector3(), fast: 0 };
   private vTti = 0.5;
   private vTtiT = -1;
   /**
@@ -762,20 +767,27 @@ export class Skater {
     const s = this.rootS, dt = this.time - s.t;
     if (s.t >= 0 && dt <= 0) return s.q;
     s.t = this.time;
-    if (dt > 0.1 || s.q.angleTo(rq) > 0.5) { s.q.copy(rq); s.prev.copy(rq); s.w.set(0, 0, 0); return s.q; }
     const d = s.d.copy(rq).multiply(_q.copy(s.prev).invert()); // this frame's board rotation (world): rq = d * prev
     if (d.w < 0) d.set(-d.x, -d.y, -d.z, -d.w);
     const sh = Math.hypot(d.x, d.y, d.z), ang = 2 * Math.atan2(sh, d.w);
-    s.wB.set(d.x, d.y, d.z).multiplyScalar(sh > 1e-9 ? ang / (sh * dt) : 0);
+    s.wB.set(d.x, d.y, d.z).multiplyScalar(sh > 1e-9 && dt > 0 ? ang / (sh * dt) : 0);
+    // the deck tipping fast (up onto the coping or the deck, a grind lock-in): the body tilts at <= 6 rad/s and may trail
+    // the board by up to ~0.45 rad meanwhile (feet stay on the deck through the IK); turns about the deck's up are free
+    const bu = _v2.set(0, 1, 0).applyQuaternion(rq);
+    const tB = _v3.copy(s.wB).addScaledVector(bu, -s.wB.dot(bu)).length();
+    s.fast = Math.max(s.fast * Math.exp(-Math.max(dt, 0) / 0.15), 0.35 * clamp((tB - 6) / 6, 0, 1));
+    if (dt > 0.1 || s.q.angleTo(rq) > 0.5 + 1.5 * s.fast) { s.q.copy(rq); s.prev.copy(rq); s.w.set(0, 0, 0); s.fast = 0; return s.q; }
     s.prev.copy(rq);
     s.w.lerp(s.wB, 1 - Math.exp(-dt / 0.035));
+    const wy = s.w.dot(bu), tilt = _v3.copy(s.w).addScaledVector(bu, -wy), tl = tilt.length();
+    if (tl > 6) s.w.copy(bu).multiplyScalar(wy).addScaledVector(tilt, 6 / tl);
     const wl = s.w.length();
     if (wl > 1e-9) s.q.premultiply(_q.setFromAxisAngle(_v.copy(s.w).divideScalar(wl), wl * dt));
-    s.q.slerp(rq, 1 - Math.exp(-dt / 0.12)).normalize();
+    s.q.slerp(rq, 1 - Math.exp(-dt / (0.12 + s.fast))).normalize();
     // soft limit on the body-board angle (C1, no corner when it engages), exact during a drop-in (its own eased pivot)
-    const e = s.q.angleTo(rq);
+    const e = s.q.angleTo(rq), lim = 0.1 + s.fast;
     if (this.inDropin) s.q.copy(rq);
-    else if (e > 0.1) s.q.slerp(rq, 1 - (0.1 + 0.06 * Math.tanh((e - 0.1) / 0.06)) / e);
+    else if (e > lim) s.q.slerp(rq, 1 - (lim + 0.06 * Math.tanh((e - lim) / 0.06)) / e);
     return s.q;
   }
   private inDropin = false;
@@ -798,9 +810,11 @@ export class Skater {
     const spd = ph.speed, spdF = clamp(spd / 9, 0, 1);
     const onTrans = ph.mode === 'ride' && ph.up.y < 0.965;
     // ---- context weights
-    // two springs in a row: the hips start sinking without a jolt when the crouch key goes down
-    const crouchIn = this.crouchIn.update(this.inCrouch && ph.mode === 'ride' && ph.kickturn.t < 0 && !ph.manual.active ? 1 : 0, dt);
-    const crouch = this.crouchS.update(crouchIn, dt);
+    // two springs in a row: the hips start sinking without a jolt when the crouch key goes down; a 0.1 s wind-up (quick
+    // pop, tap ollie) needs them faster to show a crouch at all (~20 cm by its 5th frame at 60 fps instead of 4 cm)
+    const fastC = this.time - this.windupT < 0.3;
+    const crouchIn = this.crouchIn.update(this.inCrouch && ph.mode === 'ride' && ph.kickturn.t < 0 && !ph.manual.active ? 1 : 0, dt, fastC ? 72 : 32);
+    const crouch = this.crouchS.update(crouchIn, dt, fastC ? 40 : 16);
     const push = this.pushS.update(ph.pushT >= 0 ? 1 : 0, dt);
     const man = this.manS.x;
     const gr = this.grindS.update(g ? 1 : 0, dt);
@@ -1378,7 +1392,7 @@ export class Skater {
     this.fallEnd = Math.min(end, this.clips.get(clip)?.duration ?? end);
     this.setExpr('grimace');
     this.idleT = 0; this.fid.kind = '';
-    this.plan = null; this.walk = null;
+    this.plan = null; this.walk = null; this.nudgeLater = false;
     this.stepDur = this.fast ? 0.3 : 0.45;
   }
 
@@ -1428,8 +1442,9 @@ export class Skater {
 
   /**
    * Decide where the board goes back down and his walk to it (src/player/recovery.ts). It stays where it lies if he can
-   * walk to it on flat ground; otherwise it hops over to open flat ground near him (quick recovery: right in front of
-   * him). Waits for a board that is still moving unless forced.
+   * walk to it on flat ground; otherwise it hops over to open flat ground near him (quick recovery: as close to where it
+   * lies as he can walk to). Waits for a board that is still moving unless forced; the quick recovery never plans
+   * around a board that is still going (he goes after it instead, it never comes to him).
    */
   private tryPlan(ph: PhysView, stand: Vector3, yaw: number, force: boolean) {
     const bb = ph.bail?.board;
@@ -1438,18 +1453,26 @@ export class Skater {
     if (moving && !force) return false;
     const rest = { pos: new Vector3(), fwd: new Vector3(), up: new Vector3() };
     bb.ridePose(rest.pos, rest.fwd, rest.up);
-    const usable = !bb.gliding && (!moving || (bb.v.length() < 0.3 && bb.w.length() < 2));
-    const plan = planRecovery(ph.world, stand, usable ? rest : null,
-      this.fast ? { maxWalk: 1.2, face: yaw, prefer: rest.fwd, tight: true } : { maxWalk: 5, prefer: rest.fwd });
-    if (plan.relocate) {
-      // to another level (deck <-> bowl): it rolls there along the ground (over the coping, down or up the wall)
-      const from = bb.rootPos(new Vector3());
-      const route = Math.abs(plan.ride.y - from.y) > 0.3 ? groundRoute(ph.world, from, plan.ride) : null;
-      if (route) bb.rollTo(route, plan.fwd, this.fast ? clamp(route.len / 6, 0.45, 0.75) : clamp(route.len / 3.2, 0.7, 1.8));
-      else bb.moveTo(plan.ride, plan.fwd, plan.up, this.fast ? 0.42 : 0.6);
-    } else if (moving) bb.asleep = true;
+    const usable = !bb.gliding && (!moving || (bb.v.length() < 0.3 && bb.w.length() < 2 && !(this.fast && (bb.tipping || rest.up.y < 0.97))));
+    if (this.fast && !usable) return false;
+    void yaw;
+    const plan = planRecovery(ph.world, stand, usable ? rest : null, this.fast ? quickPlan(rest.fwd) : { maxWalk: 5, prefer: rest.fwd });
+    this.nudgeLater = this.fast && plan.relocate && plan.why.startsWith('nudged');
+    if (plan.relocate && !this.nudgeLater) this.moveBoard(ph, plan, false);
+    else if (moving) bb.asleep = true;
     this.plan = plan;
     return true;
+  }
+
+  private moveBoard(ph: PhysView, plan: RecoveryPlan, atFeet: boolean) {
+    const bb = ph.bail?.board;
+    if (!bb) return;
+    // to another level (deck <-> bowl): it rolls there along the ground (over the coping, down or up the wall); off a
+    // slope right at his feet it rolls down to them
+    const from = bb.rootPos(new Vector3());
+    const route = atFeet || Math.abs(plan.ride.y - from.y) > 0.3 ? groundRoute(ph.world, from, plan.ride) : null;
+    if (route) bb.rollTo(route, plan.fwd, atFeet ? clamp(route.len / 2.6, 0.4, 0.9) : clamp(route.len / 3.2, 0.7, 1.8));
+    else bb.moveTo(plan.ride, plan.fwd, plan.up, atFeet ? 0.5 : 0.6);
   }
 
   private applyPlan() {
@@ -1497,15 +1520,15 @@ export class Skater {
     const w = this.walk!;
     const bb = ph.bail?.board;
     if (!this.plan) {
-      // the board is still moving: watch it for a moment, then plan anyway
+      // the board is still moving: watch it for a moment, then plan anyway (quick recovery: go after it until it stops)
       w.wait += dt;
-      if (this.tryPlan(ph, this.root.position, w.yaw, w.wait > 1)) this.applyPlan(); else this.planWalk(ph);
+      if (this.tryPlan(ph, this.root.position, w.yaw, w.wait > 1 || this.fast)) this.applyPlan(); else this.planWalk(ph);
     } else if (w.blocked > 0.4) {
       // something is in the way after all: plan again from here
       w.blocked = 0; this.plan = null;
       if (this.tryPlan(ph, this.root.position, w.yaw, true)) this.applyPlan();
     }
-    const waiting = !this.plan || !!bb?.gliding;
+    const waiting = (!this.plan && !this.fast) || !!bb?.gliding;
     const fast = this.fast ? 1.7 : 1;
     const p = this.root.position;
     const to = _v.set(w.target.x - p.x, 0, w.target.z - p.z);
@@ -1525,14 +1548,15 @@ export class Skater {
     } else {
       // last steps: shuffle onto the spot while turning to face the board
       w.speed = Math.max(0, w.speed - 3 * dt);
-      if (dist > 1e-4) p.addScaledVector(to.divideScalar(dist), Math.min(dist, Math.max(0.3 * fast, w.speed) * dt));
+      if (dist > 1e-4 && this.plan) p.addScaledVector(to.divideScalar(dist), Math.min(dist, Math.max(0.3 * fast, w.speed) * dt));
     }
     const gh = ph.world.raycast(_v2.set(p.x, p.y + 0.6, p.z), _v3.set(0, -1, 0), 2);
     if (gh) p.y += (gh.point.y - p.y) * (1 - Math.exp(-14 * dt));
     this.root.quaternion.setFromAxisAngle(Y, w.yaw);
     if (this.action) this.action.timeScale = Math.max(near || Math.abs(dy) > 0.2 ? 0.55 : waiting ? 0.25 : 0.3, w.speed / WALK_SPEED);
-    const arrived = dist < 0.04 && Math.abs(wrapA(w.faceYaw - w.yaw)) < 0.1;
-    if (arrived || this.phaseT > 9) this.startStepOn(ph);
+    const arrived = !!this.plan && !bb?.gliding && dist < 0.04 && Math.abs(wrapA(w.faceYaw - w.yaw)) < 0.1;
+    if (arrived && this.nudgeLater) { this.nudgeLater = false; this.moveBoard(ph, this.plan!, true); }
+    else if (arrived || this.phaseT > 9) this.startStepOn(ph);
   }
 
   private startStepOn(ph: PhysView) {

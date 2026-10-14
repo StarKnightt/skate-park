@@ -1,7 +1,7 @@
 import {
   Color, Fog, Group, HemisphereLight, Mesh, PCFShadowMap, PerspectiveCamera, PlaneGeometry, Quaternion, Scene,
   SRGBColorSpace, Texture, TextureLoader, Vector3, WebGLRenderer, NoToneMapping, MathUtils, DoubleSide, SpotLight,
-  type LOD, type WebGLRenderTarget, type Object3D,
+  type LOD, type WebGLRenderTarget, Object3D, SkinnedMesh, BufferGeometry, BufferAttribute,
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
@@ -113,6 +113,7 @@ export class Game {
     setToonMobile(this.tierP.mobileShader);
     this.sky.setNoise(this.tierP.noiseOct);
     this.ocean.setNoise(this.tierP.noiseOct, this.tierP.oceanWaves);
+    this.ocean.setGrid(...this.tierP.oceanGrid);
     shared.uLampCount.value = this.tierP.lampPools;
     // adaptive quality ignores the first seconds after the start, a resume and a return to the tab
     this.pauseListeners.push((p) => { if (!p) this.adaptHold = 5; });
@@ -529,6 +530,18 @@ export class Game {
     const q = v.boardQ;
     // the drop-in pivot is a fast, exact rotation about the trailing wheels on the coping: no smoothing lag
     if (snap || v.dropin) this.boardSmoothQ.copy(q); else this.boardSmoothQ.slerp(q, 1 - Math.exp(-40 * dt));
+    // in the air the deck's up axis turns at most 6 rad/s (a short vert air off the coping keyframes the deck to the sky in
+    // ~0.1 s); spins about the deck's own axis are not limited
+    const bUp = this.boardUp.set(0, 1, 0).applyQuaternion(this.boardSmoothQ);
+    if (!snap && v.mode === 'air' && this.prevMode === 'air') {
+      const a = this.boardUpPrev.angleTo(bUp), m = 6 * dt, ax = this.boardAx.crossVectors(this.boardUpPrev, bUp);
+      if (a > m && ax.lengthSq() > 1e-12) {
+        ax.normalize();
+        this.boardSmoothQ.premultiply(this.boardFixQ.setFromUnitVectors(bUp, this.boardTo.copy(this.boardUpPrev).applyAxisAngle(ax, m)));
+        bUp.set(0, 1, 0).applyQuaternion(this.boardSmoothQ);
+      }
+    }
+    this.boardUpPrev.copy(bUp);
     // catching a rail / ledge snaps the physics onto it (drawn without interpolation): ease that jump out over a few frames
     if (snap) this.boardVisOff.set(0, 0, 0);
     else if ((this.prevMode === 'air' || this.prevMode === 'ride') && v.mode === 'grind') {
@@ -551,6 +564,11 @@ export class Game {
     }
   }
   boardVisOff = new Vector3();
+  boardUp = new Vector3(0, 1, 0);
+  boardUpPrev = new Vector3(0, 1, 0);
+  boardAx = new Vector3();
+  boardTo = new Vector3();
+  boardFixQ = new Quaternion();
   prevMode = 'ride';
   prevPos = new Vector3();
   prevVel = new Vector3();
@@ -648,11 +666,15 @@ export class Game {
     try {
       sh.autoUpdate = n <= 1;
       if (n > 1 && ++this.sunFrame >= n) { this.sunFrame = 0; sh.needsUpdate = true; }
+      const ls = this.lampSpot.shadow;
+      this.hero.lampCasts = this.lampSpot.castShadow && (ls.autoUpdate || ls.needsUpdate);
       this.hero.update(this.renderer, s, this.skater.hipsWorld(this.hipsV), this.board.root);
       this.post.render(dt);
     } finally {
       s.matrixWorldAutoUpdate = true;
     }
+    // staggered people animate on the frames between sun shadow renders
+    this.scenery.people.busy = n > 1 && this.sunFrame + 1 >= n;
   }
 
   private frame(t: number) {
@@ -776,21 +798,66 @@ export class Game {
     setToonMobile(T.mobileShader);
     this.sky.setNoise(T.noiseOct);
     this.ocean.setNoise(T.noiseOct, T.oceanWaves);
+    this.ocean.setGrid(...T.oceanGrid);
     this.setPeople(T);
     void MathUtils;
   }
-  private setPeople(T: Tier) { this.scenery.people.setProfile?.(T.people); }
+  private setPeople(T: Tier) {
+    this.scenery.people.setProfile?.(T.people);
+    if (this.hero.hasStandIns) this.hero.useStandIns(T.mobileShader);
+    else if (T.mobileShader) void this.heroStandIns();
+  }
+  /** the mobile tiers draw the skater's first distance level into his shadow map (the crowd's baked lists fit his mesh) */
+  private async heroStandIns() {
+    const ppl = this.scenery.people;
+    if (!(await ppl.loaded) || !ppl.baked || this.hero.hasStandIns) return;
+    const b = ppl.baked, parts: SkinnedMesh[] = [];
+    this.skater.root.traverse((o) => { if ((o as SkinnedMesh).isSkinnedMesh) parts.push(o as SkinnedMesh); });
+    if (parts.length !== b.parts.length || parts.some((m, k) => m.geometry.getAttribute('position').count !== b.parts[k].vertices
+      || m.geometry.index?.count !== b.parts[k].indices)) return;
+    const pairs = parts.map((m, k): [Object3D, Object3D] => {
+      const g = new BufferGeometry();
+      for (const [n, a] of Object.entries(m.geometry.attributes)) g.setAttribute(n, a);
+      g.setIndex(new BufferAttribute(b.lists[0][k], 1));
+      const s = new SkinnedMesh(g, m.material);
+      s.bind(m.skeleton, m.bindMatrix);
+      s.position.copy(m.position); s.quaternion.copy(m.quaternion); s.scale.copy(m.scale);
+      s.frustumCulled = false; s.layers.disableAll();
+      m.parent!.add(s);
+      return [m, s];
+    });
+    this.hero.setStandIns(pairs, this.tierP.mobileShader);
+  }
   /** Static park and scenery stop composing their matrices every frame. Everything that moves keeps them: the skater
    *  and board, people, sky / clouds / ocean (follow the camera), the lights, the lamp glow and `userData.dynamic`. */
   private freezeStatic() {
     const keep = new Set<Object3D>([this.hero.root, this.scenery.people.group, this.sky.mesh, this.clouds.group, this.ocean.mesh,
       this.lampSpot, this.lampSpot.target, this.lampGlow, this.sun, this.hemi]);
-    const walk = (o: Object3D) => {
-      if (keep.has(o) || o.userData.dynamic) return;
+    // returns true for a subtree with nothing moving in it
+    const walk = (o: Object3D): boolean => {
+      if (keep.has(o) || o.userData.dynamic) return false;
       o.updateMatrix();
       o.matrixAutoUpdate = false;
-      for (const c of o.children) walk(c);
+      let still = true;
+      for (const c of o.children) still = walk(c) && still;
+      return still;
     };
     walk(this.scene);
+    // the per-frame matrix walk skips whole still subtrees (computed once here; a moved parent still walks them)
+    for (const o of this.scene.children) {
+      if (keep.has(o) || o.userData.dynamic) continue;
+      const still: Object3D[] = [];
+      const find = (n: Object3D): boolean => {
+        const sub = n.children.map(find);
+        const ok = !keep.has(n) && !n.userData.dynamic && sub.every(Boolean);
+        if (!ok) n.children.forEach((c, i) => { if (sub[i]) still.push(c); });
+        return ok;
+      };
+      if (find(o)) still.push(o);
+      for (const n of still) {
+        n.updateMatrixWorld(true);
+        n.updateMatrixWorld = (force?: boolean) => { if (force) Object3D.prototype.updateMatrixWorld.call(n, force); };
+      }
+    }
   }
 }

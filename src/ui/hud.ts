@@ -159,6 +159,7 @@ export class Hud {
   private modeT = MODE_LABEL_SECONDS;
   private titled = false;
   private promptOn = false;
+  private soundLater = false;
   private sleepTimer = 0;
   onTimeOfDay: () => void = () => {};
   onSound: () => void = () => {};
@@ -177,7 +178,7 @@ export class Hud {
       <div class="hint"></div>
       <div class="modelabel show"></div>
       <div class="lockpill hide">${MOUSE}<span>Click to look around · Esc for menu</span></div>
-      <div class="titlecard"><div><div class="tt">Golden Hour Skatepark</div><div class="ts">${touch ? 'Tap to ride' : 'press any key or tap to ride'}</div></div></div>
+      <div class="titlecard"><div><div class="tt">Golden Hour Skatepark</div><div class="ts">${touch ? 'Tap to ride' : 'press any key or click to ride'}</div></div></div>
       <div class="topbar">
         <button class="pill tod" title="Time of day (T)">${SUN}<span>Golden hour</span></button>
         <button class="pill icon snd" title="Sound">${SOUND}</button>
@@ -278,9 +279,14 @@ export class Hud {
     this.hintEl.classList.add('hide', 'now');
     document.body.classList.add('hints-off');
   }
-  /** small "click for sound" prompt: a few seconds, or until the first key / click / tap */
-  soundPrompt() { this.toast('Click or press a key for sound', 3.5); this.promptOn = true; }
+  /** small "click for sound" prompt: a few seconds, or until the first key / click / tap. One prompt at a time: under the
+   *  title card it waits for the card to go, and a key or click (which starts the sound with the ride) drops it */
+  soundPrompt() {
+    if (this.titled) { this.soundLater = true; return; }
+    this.toast('Click or press a key for sound', 3.5); this.promptOn = true;
+  }
   private dismissPrompt() {
+    this.soundLater = false;
     if (!this.promptOn) return;
     this.promptOn = false; this.toastT = 0; this.toastEl.classList.add('hide');
   }
@@ -299,7 +305,11 @@ export class Hud {
     this.titled = on;
     this.titleEl.classList.toggle('show', on);
     this.root.classList.toggle('titled', on);
-    if (was && !on) { this.showHint(); this.showModeLabel(); this.lockHint(); }
+    if (on && this.promptOn) { this.dismissPrompt(); this.soundLater = true; }
+    if (was && !on) {
+      this.showHint(); this.showModeLabel(); this.lockHint();
+      if (this.soundLater) { this.soundLater = false; this.soundPrompt(); }
+    }
   }
 
   update(dt: number) {

@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 run = sys.argv[1]
 ENC = '--noencode' not in sys.argv
-P4 = 'E:/shots/skate-park/pass-04'
+P4 = os.environ.get('MEDIA_OUT', 'E:/shots/skate-park/pass-05')
 CL, SH = os.path.join(P4, 'clips', 'realtime'), os.path.join(P4, 'sheets', 'realtime')
 os.makedirs(CL, exist_ok=True)
 os.makedirs(SH, exist_ok=True)

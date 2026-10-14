@@ -444,7 +444,12 @@ export function buildParkDetail(park: ParkData): Group {
         toonMaterial({ vertexColors: true, side: DoubleSide, bands: 0.45, wrap: 0.6, rim: 0.45, name: 'planterPlants' }));
     }
     if (!leaves.empty) add(leaves.geometry(), foliageMaterial()).name = 'planterBushes';
-    if (agaves.length) add(mergeGeometries(agaves), agaveMaterial()).name = 'planterAgaves';
+    if (agaves.length) {
+      const m = add(mergeGeometries(agaves), agaveMaterial());
+      m.name = 'planterAgaves';
+      // thin blades at grazing sun receive a mosaic of triangles from the per-triangle receiver-plane / slope bias
+      m.receiveShadow = false;
+    }
   }
   if (d.sails.length) {
     const s = new Soup();

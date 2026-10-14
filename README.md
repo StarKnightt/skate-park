@@ -61,12 +61,26 @@ of back in. Mouse sensitivity and invert-Y are in the pause menu.
 | Start · Back · LT | pause menu · respawn · time of day | the same |
 
 #### Touch (phones and tablets, portrait or landscape)
-- **Pro:** left virtual stick (up pushes, down brakes, sideways steers) · OLLIE: hold to crouch, release to pop; swipe
-  left / right / down / up as you release for kickflip / heelflip / shove-it / tre flip · GRIND and MANUAL buttons.
-- **Easy / Auto-ride:** stick (steer; he cruises, up for more speed, down slows down and stops) · OLLIE: tap to pop ·
-  TRICK: flip trick, cycling the flips · AUTO: auto-ride on / off (lit while it drives). Grinds are automatic, so there
-  is no GRIND button.
-- **Every mode:** drag anywhere else to look around · the pause button sits top left · time of day, sound and help top right.
+- **Pro:** floating stick: put your thumb down anywhere in the lower-left area and the stick appears under it (up
+  pushes, down brakes, sideways steers) · OLLIE: hold to crouch, release to pop; a short swipe left / right / down / up
+  as you release gives kickflip / heelflip / shove-it / tre flip (a drifting thumb or a long slide is a plain ollie) ·
+  GRIND and MANUAL buttons.
+- **Easy / Auto-ride:** the same floating stick (steer; he cruises, up for more speed, down slows down and stops) ·
+  OLLIE: tap to pop · TRICK: flip trick, cycling the flips · AUTO: auto-ride on / off (lit while it drives). Grinds are
+  automatic, so there is no GRIND button.
+- **Every mode:** drag anywhere else to look around · the pause button sits top left · time of day, sound and help top
+  right · a system gesture (notification shade, app switcher) never makes him jump.
+
+#### Phones and tablets
+- **Fullscreen / install:** on Android, Chrome's "Install app" (or "Add to Home screen") plays it fullscreen from its
+  own icon; on iPhone and iPad, Safari → Share → Add to Home Screen (the pause menu shows this tip where the browser has
+  no fullscreen). The fullscreen switch in the pause menu works wherever the browser allows it.
+- **Lighter graphics tier** by default on phones and tablets (simpler shadows refreshed every other frame, no bloom, a
+  smaller crowd with nearer detail levels, lighter sky and sea); it adapts to the device: effects go first, the
+  resolution never drops below one rendered pixel per CSS pixel, and a steady 30 fps is only the last resort. Pause
+  menu → Graphics overrides it.
+- It pauses (and goes quiet) when you switch apps or lock the phone, keeps the screen awake while you ride or watch
+  auto-ride, and the sound starts with your first tap. Portrait uses a wider camera; landscape shows the most.
 
 #### Pause menu
 Esc, gamepad Start, the touch pause button or the menu pill (top right on desktop) open it: the game freezes and the
@@ -96,7 +110,8 @@ The GitHub Pages workflow is `.github/workflows/deploy.yml` (pnpm build → acti
 ### URL parameters
 `?mode=easy|auto|pro` control mode for this visit (not saved) · `?sens=<x>` / `?invertY` mouse look ·
 `?fps=30` frame cap · `?quality=0|1|2` force quality (auto by default) · `?time=sunset|blue|noon` start time ·
-`?touch` force touch controls · `?mute` · `?debug` / `?test` expose `window.__skate` (teleport, setTime, scripted
+`?touch` force touch controls · `?mobile` phone / tablet graphics tier and its adaptation on any device · `?mute` ·
+`?debug` / `?test` expose `window.__skate` (teleport, setTime, scripted
 input, manual frame stepping `manual(true)` + `advance(n)`, camera views, state, event log) for deterministic
 recordings — see `src/debug/testHooks.ts` and `tools/capture/` (under `?test` the default mode is Pro, no attract;
 add `&attract` to see the start screen). Real-time smoothness protocol: `tools/realtime/README.md`.
@@ -129,9 +144,15 @@ add `&attract` to see the start screen). Real-time smoothness protocol: `tools/r
 - **Look:** stylised wrap / banded lighting patched into Lambert materials, warm sun with 2-cascade soft shadows
   (three.js `SunLight` addon), violet hemisphere fill, painterly gradient sky with brushy cirrus, hand-painted cloud
   billboards, stylised ocean with a glittering sun path and shore foam, wind-swayed procedural palms, warm grade and
-  vignette. Four time-of-day presets blend smoothly. Quality adapts to the frame rate.
+  vignette. Four time-of-day presets blend smoothly. Quality tiers live in `src/render/quality.ts` (desktop high, the
+  mobile tier and its low fallback); the adaptation judges the 90th-percentile frame time and turns features off before
+  it touches the resolution.
+- **Loading:** the skater GLB loads first (meshopt-compressed, only the clips the game plays); the crowd (baked detail
+  levels, no runtime simplifier) streams in after the game is playable and is compiled before it appears. Installable
+  as a web app (`public/manifest.webmanifest`).
 - **Audio:** Web Audio: wheel-roll loops per surface (concrete / wooden boardwalk) pitched and filtered by speed,
-  pop, landings, board clacks, metal and concrete grind loops, waves, seagulls and a gentle ukulele loop.
+  pop, landings, board clacks, metal and concrete grind loops, waves, seagulls and a gentle ukulele loop. Each sound
+  starts as soon as its own file is decoded; the music streams through an audio element into the same mix.
 
 ## Credits
 
@@ -149,6 +170,9 @@ add `&attract` to see the start screen). Real-time smoothness protocol: `tools/r
 | seagulls.mp3 | Seagull on beach | squashy555 | https://freesound.org/people/squashy555/sounds/353416/ |
 | music.mp3 | ukulele | _steef | https://freesound.org/people/_steef/sounds/173122/ |
 | bail_thud.mp3 | Body fall_02 | deleted_user_2104797 | https://freesound.org/people/deleted_user_2104797/sounds/346694/ |
+
+Since pass 5 the shipped files (except music.mp3) are trimmed to the parts the game plays and re-encoded (mostly mono),
+by `tools/assets/audio_trim.sh` from the originals above.
 
 ### Textures
 | Asset | Author | Source | License |
@@ -172,10 +196,17 @@ character mesh is used. Raw FBX files are not part of this repository.
 
 Pass-3 additions (drop-in, a dedicated high-resolution shadow for the skater, painted leaf-clump foliage, the lit kiosk
 interior, the charcoal grip texture) are all generated in code; no new third-party assets were added.
+Since pass 5 `skater.glb` carries only the clips the game plays (the stomach fall, air flail, knocked-down get-up, ledge
+wobble, regain-balance and relaxed idle were dropped), and the crowd reuses the skater's mesh, so `people.glb` holds
+only the crowd's clips and its baked detail levels.
+
+### App icons
+`public/icons/*` (home-screen and install icons) are original artwork drawn by `tools/assets/make_icons.py` for this
+project; no third-party assets.
 
 ### Libraries and tools
 three.js (MIT) · three-mesh-bvh (MIT) · postprocessing (Zlib) · Vite (MIT) · TypeScript (Apache-2.0) ·
-glTF-Transform (MIT) · meshoptimizer decoder + simplifier (MIT, people LODs) · Nunito font via @fontsource (SIL OFL 1.1) · Blender (GPL, build
+glTF-Transform (MIT) · meshoptimizer decoder + simplifier (MIT; the simplifier bakes the crowd's detail levels offline) · Nunito font via @fontsource (SIL OFL 1.1) · Blender (GPL, build
 tool only) · NumPy, SciPy, scikit-image, Pillow (build tools only) · Playwright (capture tool only).
 
 ### Skills consulted

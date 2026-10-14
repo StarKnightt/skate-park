@@ -48,8 +48,26 @@ export class HeroShadow {
   boardIn = true;
   /** the skater and board live in this nested scene (at the origin, inside the main scene): the map pass draws only it */
   root = new Scene();
+  /** a lamp spot shadow is being rendered this frame: the skater and board must cast (else they are only drawn
+   *  collapsed into the sun cascades, so they leave the shadow passes altogether) */
+  lampCasts = true;
   private sunCams: Camera[] = [];
   private boardMeshes: Object3D[] = [];
+  private casters: Object3D[] = [];
+  private boardCasters: Object3D[] = [];
+  private cast(skater: boolean, board: boolean) {
+    for (const m of this.casters) m.castShadow = skater;
+    for (const m of this.boardCasters) m.castShadow = board;
+  }
+  private standIns: [Object3D, Object3D][] = [];
+  /** lighter stand-ins (full mesh, stand-in) of the skater's meshes, drawn into the map instead when `useStandIns` */
+  setStandIns(pairs: [Object3D, Object3D][], on: boolean) { this.standIns = pairs; this.useStandIns(on); }
+  useStandIns(on: boolean) {
+    for (const [full, lite] of this.standIns) {
+      if (on) { full.layers.disable(HERO_LAYER); lite.layers.set(HERO_LAYER); } else { full.layers.enable(HERO_LAYER); lite.layers.disableAll(); }
+    }
+  }
+  get hasStandIns() { return this.standIns.length > 0; }
   private clear = new Color();
   private M = new Matrix4();
 
@@ -90,8 +108,8 @@ export class HeroShadow {
     const skipBoard = (_r: unknown, object: Object3D, _c: unknown, shadowCamera: Camera) => {
       if (this.active && this.boardIn && this.sunCams.includes(shadowCamera)) object.modelViewMatrix.copy(COLLAPSE);
     };
-    skater.traverse((o) => { if ((o as Mesh).isMesh) { o.layers.enable(HERO_LAYER); (o as any).onBeforeShadow = skipSun; } });
-    board.traverse((o) => { if ((o as Mesh).isMesh) { this.boardMeshes.push(o); (o as any).onBeforeShadow = skipBoard; } });
+    skater.traverse((o) => { if ((o as Mesh).isMesh) { o.layers.enable(HERO_LAYER); (o as any).onBeforeShadow = skipSun; if (o.castShadow) this.casters.push(o); } });
+    board.traverse((o) => { if ((o as Mesh).isMesh) { this.boardMeshes.push(o); (o as any).onBeforeShadow = skipBoard; if (o.castShadow) this.boardCasters.push(o); } });
     for (const l of lights) l.layers.enable(HERO_LAYER);
     skater.parent?.add(this.root);
     this.root.add(skater, board);
@@ -101,7 +119,7 @@ export class HeroShadow {
    *  world matrices must be current (the pass does not update them) */
   update(renderer: WebGLRenderer, _scene: Scene, hips: Vector3, board: Object3D) {
     const info = shared.uHeroInfo.value;
-    if (!this.active) { info.z = 0; return; }
+    if (!this.active) { info.z = 0; this.cast(true, true); return; }
     const L = _l.copy(shared.uSunDir.value).normalize();
     // the camera basis of lookAt(eye = centre + L, target = centre)
     _x.crossVectors(Math.abs(L.y) > 0.99 ? FWD : UP, L).normalize();
@@ -113,6 +131,7 @@ export class HeroShadow {
     this.boardIn = need <= 2.6;
     if (this.boardIn && need > R) R = need;
     for (const m of this.boardMeshes) { if (this.boardIn) m.layers.enable(HERO_LAYER); else m.layers.disable(HERO_LAYER); }
+    this.cast(this.lampCasts, this.lampCasts || !this.boardIn);
     // snap the box to its texel grid so still shadows (the board on the ground) do not crawl while he sways
     const ts = (2 * R) / this.size;
     const cx = hips.dot(_x), cy = hips.dot(_y);

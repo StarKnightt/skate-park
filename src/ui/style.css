@@ -97,6 +97,12 @@ body.pm .hud:not(.touchui) .topbar .menu { display: flex; }
 .titlecard .ts { margin-top: 10px; font-weight: 800; font-size: clamp(13px, 1.6vw, 17px); color: var(--cream);
   text-shadow: 0 1px 0 rgba(90, 40, 40, .3); animation: tc-pulse 2.4s ease-in-out infinite; }
 @keyframes tc-pulse { 0%, 100% { opacity: .95; } 50% { opacity: .5; } }
+/* desktop: the follow camera keeps him centred, so the title sits in the sky above him, in the pause card's cream and coral */
+.hud:not(.touchui) .titlecard { place-items: start center; padding-top: max(40px, 11vh);
+  background: radial-gradient(ellipse 46% 24% at 50% 19%, rgba(59, 42, 47, .2), transparent 72%); }
+.hud:not(.touchui) .titlecard .tt { font-size: clamp(30px, min(6vw, 9.5vh), 64px);
+  text-shadow: 0 2px 0 var(--coral), 0 4px 3px rgba(255, 123, 87, .45), 0 0 26px rgba(255, 139, 106, .4); }
+.hud:not(.touchui) .titlecard .ts { margin-top: 8px; text-shadow: 0 1px 0 rgba(255, 123, 87, .9), 0 1px 8px rgba(150, 64, 52, .45); }
 .hud.titled .hint, .hud.titled .lockpill, .hud.titled .modelabel { opacity: 0; visibility: hidden; }
 
 .toast { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); font-weight: 800; font-size: 13px; color: var(--ink);

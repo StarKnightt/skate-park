@@ -23,6 +23,8 @@ export interface SkateInput {
   lean: number; // -1 back .. 1 forward
   /** minimum pop charge 0..1 for this ollie (F-key quick pop, Easy-mode tap ollie); the crouch time can only raise it */
   popCharge?: number;
+  /** event: a short automatic crouch starts (F quick pop, Easy tap ollie): the pose drops faster than for a held crouch */
+  windup?: boolean;
 }
 
 export const emptyInput = (): SkateInput => ({
@@ -125,9 +127,11 @@ export class BoardBody {
   asleep = false;
   contacts = 0;
   t = 0;
+  /** rolling resistance scale (quick recovery: it rolls to a stop sooner, closer to where he gets up) */
+  drag = 1;
   private restT = 0;
   private anchor = new Vector3(); private anchorQ = new Quaternion(); private anchorT = 0;
-  private tipT = 0;
+  private tipT = 0; private tipSide = 0; private creepT = 0;
   private prev = new Vector3();
   private qi = new Quaternion();
   private a = new Vector3(); private b = new Vector3(); private c = new Vector3(); private d = new Vector3();
@@ -142,13 +146,15 @@ export class BoardBody {
     this.q.copy(q);
     this.com.set(0, BCOM, 0).applyQuaternion(q).add(rootPos);
     this.v.copy(v); this.w.copy(w);
-    this.asleep = false; this.restT = 0; this.t = 0; this.glide = null;
+    this.asleep = false; this.restT = 0; this.t = 0; this.glide = null; this.tipT = 0; this.tipSide = 0; this.creepT = 0;
     this.anchor.copy(this.com); this.anchorQ.copy(this.q); this.anchorT = 0;
   }
 
   /** board root (wheel contact plane origin) in world space */
   rootPos(out: Vector3) { return out.set(0, -BCOM, 0).applyQuaternion(this.q).add(this.com); }
   get wheelsDown() { return _v.set(0, 1, 0).applyQuaternion(this.q).y >= 0; }
+  /** falling over off its edge (not yet lying flat) */
+  get tipping() { return this.tipSide !== 0; }
 
   /** where the rider stands the board up again: ground point under the centre + nose direction on the ground */
   ridePose(outPos: Vector3, outFwd: Vector3, outUp: Vector3) {
@@ -310,21 +316,29 @@ export class BoardBody {
       this.pivot.divideScalar(this.contacts);
       this.w.multiplyScalar(Math.exp(-2.5 * dt));
       const c = up.dot(this.nAvg);
-      const target = c >= 0 ? this.nAvg : _v2.copy(this.nAvg).negate();
+      // the side it falls to is picked once (the way it leans, or already rolls) and kept until it lies flat
+      if (Math.abs(c) >= (this.tipSide ? 0.97 : 0.75)) this.tipSide = 0;
+      else if (!this.tipSide) this.tipSide = c + 0.08 * _v2.crossVectors(this.w, up).dot(this.nAvg) >= 0 ? 1 : -1;
+      const target = (this.tipSide || (c >= 0 ? 1 : -1)) > 0 ? this.nAvg : _v2.copy(this.nAvg).negate();
       const axis = _v.crossVectors(up, target);
       const s = axis.length();
       const vs = this.v.length(), ws = this.w.length();
       let ang = 0;
-      if (Math.abs(c) < 0.75 && vs < 0.8) {
-        // a board left on its edge falls over onto the wheels or the grip, pivoting on the edge it stands on
+      if (this.tipSide) {
+        // a board on its edge never balances or skids along on its rail: it falls over onto the nearer flat side (wheels
+        // or grip) within a few frames, pivoting on the edge it stands on; rail friction can't roll it back up
         this.tipT += dt;
-        ang = Math.min(Math.asin(Math.min(1, s)), (1.2 + 9 * this.tipT) * dt);
-        this.w.multiplyScalar(Math.exp(-6 * dt)); this.v.multiplyScalar(Math.exp(-3 * dt));
+        ang = Math.min(Math.asin(Math.min(1, s)), (3 + 32 * this.tipT) * dt);
+        this.w.multiplyScalar(Math.exp(-6 * dt)); this.v.multiplyScalar(Math.exp(-(vs < 0.8 ? 3 : 1) * dt));
+        if (s > 1e-6) { const wa = this.w.dot(_v3.copy(axis).divideScalar(s)); if (wa < 0) this.w.addScaledVector(_v3, -wa); }
       } else {
         this.tipT = 0;
-        // slow rolls die out (rolling resistance and small bumps) instead of creeping on for seconds
-        if (this.contacts >= 2 && vs < 0.6) this.v.multiplyScalar(Math.exp(-1.2 * dt));
-        if (this.contacts >= 2 && vs < 0.4 && ws < 3) {
+        // slow rolls die out (rolling resistance and small bumps) instead of creeping on for seconds; quick recovery: not
+        // on a slope, where it rolls on down to the flat
+        const settle = this.drag === 1 || this.nAvg.y > 0.95;
+        if (this.contacts >= 2 && vs < 0.6 * this.drag && settle) this.v.multiplyScalar(Math.exp(-1.2 * this.drag * dt));
+        else if (this.contacts >= 2) this.v.multiplyScalar(Math.exp(-0.8 * (this.drag - 1) * dt));
+        if (this.contacts >= 2 && vs < 0.4 && ws < 3 && settle) {
           // nearly still and nearly flat: rocking dies out and it settles onto the ground
           this.v.multiplyScalar(Math.exp(-5 * dt)); this.w.multiplyScalar(Math.exp(-7 * dt));
           ang = Math.min(Math.asin(Math.min(1, s)), 0.8 * dt);
@@ -343,7 +357,9 @@ export class BoardBody {
     // contact jitter on a kick or creeping against a wall: it has stopped as far as anyone can see
     if (this.com.distanceTo(this.anchor) > 0.02 || this.q.angleTo(this.anchorQ) > 0.05) { this.anchor.copy(this.com); this.anchorQ.copy(this.q); this.anchorT = 0; }
     else this.anchorT += dt;
-    if (this.restT > 0.35 || this.anchorT > 0.6 || this.t > 9) { this.asleep = true; this.v.set(0, 0, 0); this.w.set(0, 0, 0); }
+    // quick recovery: creeping a few cm/s at the foot of a slope is just as stopped (on steeper ground it rolls on down)
+    this.creepT = this.drag > 1 && (still || (this.contacts >= 2 && this.nAvg.y > 0.85 && this.v.length() < 0.12 && this.w.length() < 1)) ? this.creepT + dt : 0;
+    if (((this.restT > 0.35 || this.anchorT > 0.6 || this.creepT > 0.5 || this.t > 9) && this.tipT === 0) || this.t > 12) { this.asleep = true; this.v.set(0, 0, 0); this.w.set(0, 0, 0); }
     if (this.com.y < -30) { this.com.copy(this.prev).setY(0.2); this.v.set(0, 0, 0); }
   }
 }
@@ -517,6 +533,8 @@ export class SkatePhysics {
     this.slope = 1 - this.up.y;
 
     // crouch / ollie charge
+    // a wind-up drops a push whose foot hasn't planted yet (W + F tre flip): he pops from the board, not mid-stroke
+    if (inp.windup) { this.emit('windup'); if (this.pushT >= 0 && this.pushT < PUSH.T0) this.pushT = -1; }
     this.crouch.update(inp.crouch ? 1 : 0, dt);
     if (inp.crouch) this.crouchTime += dt; else if (!inp.ollie) this.crouchTime = 0;
 
@@ -590,9 +608,13 @@ export class SkatePhysics {
       if (Math.abs(sIn - this.steerS) < 1e-4) this.steerRamp = false;
     } else this.steerS += (sIn - this.steerS) * (1 - Math.exp(-dt / 0.03));
     // turn rate limited by the lateral acceleration (radius v^2/A_LAT above ~3.3 m/s on the flat; on a banked wall the
-    // surface carries part of the turn: + g*sin(bank)), more when crouched, less in a manual
+    // surface carries part of the turn: + g*sin(bank)), more when crouched, less in a manual. From ~53 deg of bank (fully
+    // by ~72) gravity works against a turn that holds or raises the line, so steering can't hold him level along the
+    // steep top of a wall: the line peaks and falls back
     s = this.vel.length();
-    const aLat = A_LAT + G * Math.sqrt(Math.max(0, 1 - this.up.y * this.up.y));
+    const sinB = Math.sqrt(Math.max(0, 1 - this.up.y * this.up.y));
+    const gUp = Math.max(0, Math.sign(this.steerS) * gT.dot(_v3.crossVectors(this.up, travel)));
+    const aLat = Math.max(0, A_LAT + G * sinB - 2 * gUp * clamp((sinB - 0.8) / 0.15, 0, 1));
     const turnRate = this.steerS * Math.min(TURN_MAX, aLat / Math.max(s, 1.2))
       * (1 + 0.15 * clamp((this.crouch.x - 0.3) / 0.4, 0, 1)) * (this.manual.active ? 0.55 : 1);
     if (Math.abs(turnRate) > 1e-4 && this.kickturn.t < 0) {
@@ -1355,6 +1377,7 @@ export class SkatePhysics {
       bw = new Vector3((r() - 0.5) * 3, (r() - 0.5) * 7, (r() > 0.5 ? 1 : -1) * (5 + r() * 9)).applyQuaternion(bQ);
     }
     board.init(this.pos, bQ, bv, bw);
+    if (this.assist.fastRecover) board.drag = 3;
     this.bail = { kind, reason, t: 0, body: this.pos.clone(), bodyVel, heading, board, still: 0, checked: false, standAt: null };
     this.mode = 'bail';
     this.flip = null; this.grind = null; this.vert = null; this.dropin = null; this.endManual(); this.kickturn.t = -1; this.pushT = -1;

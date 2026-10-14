@@ -20,8 +20,12 @@ const BARRIER = 9; // invisible fence quads: the camera passes through them
 const SKATER_H = 1.62; // board to cap top in the riding stance
 const DOWN = new Vector3(0, -1, 0);
 const _a = new Vector3(), _b = new Vector3(), _c = new Vector3(), _d = new Vector3(), _e = new Vector3();
-const _r = new Vector3(), _o = new Vector3(), _f = new Vector3();
+const _r = new Vector3(), _o = new Vector3(), _f = new Vector3(), _g = new Vector3(), _h = new Vector3();
 const lerpAngle = (a: number, b: number, t: number) => a + wrapAngle(b - a) * t;
+// blocked view: yaw offsets and camera rises tried, and the highest the rise may take it (never top-down)
+const AVOID_YAW = [0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05, 1.4, -1.4, 1.75, -1.75, 2.1, -2.1];
+const AVOID_RISE = [0, 0.3, 0.6];
+const MAX_ELEV = 0.85;
 
 interface Bowl {
   poly: { x: number; z: number }[]; lipY: number; floorY: number; cx: number; cz: number;
@@ -62,13 +66,13 @@ export class CameraRig {
   private frameN = 0;
   private camY = 1.7;
   private distS = new Spring(4.2, 2.5);
-  private colDist = 99;
+  private colS = new Spring(99, 7); private blockedT = 0;
   private floorY = 0;
   private wSide = 0; private sideSign = 1; private dropW = 0;
   private wPend = 0; private pendDir = new Vector3(1, 0, 0); private pendLastT = -99; private pendTurn = new Vector3();
   private travel = new Vector3(); private travelOk = false; private steepAcc = 0;
   private wall = new Vector3(); private swingSign = 1;
-  private avoid = 0; private avoidPick = 0;
+  private avoid = 0; private avoidPick = 0; private avoidE = 0; private avoidPickE = 0;
   private lead = new Vector3();
   private bowls: Bowl[] = [];
   private segs: Seg[] = [];
@@ -80,7 +84,7 @@ export class CameraRig {
   private spS = new Spring(0, 1.6);
   private wallPush = new Vector3(); private groundLift = 0;
   /** last frame's internals, for capture diagnostics */
-  info = { side: 0, pend: 0, swing: 0, avoid: 0, wantD: 0, d: 0, clear: 0, floor: 0, yT: 0, elev: 0, bowl: false, bw: 0, carve: 0, drop: 0, base: 0, goal: 0 };
+  info = { side: 0, pend: 0, swing: 0, avoid: 0, rise: 0, wantD: 0, d: 0, clear: 0, clear0: 0, fov: 0, floor: 0, yT: 0, elev: 0, bowl: false, bw: 0, carve: 0, drop: 0, base: 0, goal: 0 };
 
   constructor(public cam: PerspectiveCamera, private world: CollisionWorld) {
     for (const l of world.grindLines) {
@@ -185,7 +189,13 @@ export class CameraRig {
     if (hv > 1.2 && !down && (steep < 0.6 || this.carveW > 0.5)) {
       const want = Math.atan2(s.vel.x, s.vel.z);
       const reversed = Math.abs(wrapAngle(want - this.heading)) > 1.9 && this.wPend < 0.98;
-      this.heading = dampAngle(this.heading, want, reversed ? 0.35 : air ? 1.2 : 2.6, dt);
+      // left ahead of him while he rides toward a wall (it would end up between him and the wall): come round behind him
+      let rev = 0.35;
+      if (reversed) {
+        const h = this.blockedT > 0 || this.wPend > 0.3 ? null : this.ray(focus, _r.set(s.vel.x / hv, 0, s.vel.z / hv), this.distS.x + 1.5);
+        rev = this.blockedT > 0 || (h && h.normal.y < 0.8) ? lerp(0.35, 1.8, smoothstep(0, 0.15, this.blockedT + 0.1)) : 0.35;
+      }
+      this.heading = dampAngle(this.heading, want, reversed ? rev : air ? 1.2 : 2.6, dt);
     }
     this.idleT += dt;
     if (this.recentering) {
@@ -312,8 +322,7 @@ export class CameraRig {
     if (snap) this.spS.set(s.speed); else this.spS.update(s.speed, dt);
     const sp = clamp(this.spS.x / 10, 0, 1);
     this.fovS.update((portrait ? 74 : 56) + sp * 8, dt);
-    if (Math.abs(cam.fov - this.fovS.x) > 0.01) { cam.fov = this.fovS.x; cam.updateProjectionMatrix(); }
-    const tH = Math.tan((cam.fov * Math.PI) / 360);
+    const tH = Math.tan((this.fovS.x * Math.PI) / 360);
     const sizeFrac = portrait ? 0.22 - 0.03 * sp : 0.37 - 0.05 * sp;
     // vert / back-and-forth: closer, the tucked skater in the air should still fill about a third of the frame
     let wantD = SKATER_H / (2 * tH * sizeFrac) * (1 - 0.15 * this.wPend) + (air && !s.vert ? 0.25 : 0) + (down ? 0.4 : 0);
@@ -366,22 +375,33 @@ export class CameraRig {
       yawT = this.bodySideOn(yawT, elev, s.up, this.wBowl * (1 - smoothstep(0.15, 0.5, Math.abs(this.userYaw))));
     }
 
-    // ---- clearance: if walls / ramps block the view, swing to a clear direction before pulling in
-    const want = yawT + this.avoid;
-    let avoidT = pinned || orbit ? 0 : this.avoid; // test views (camYaw / orbit) keep their exact angle
-    if (!pinned && !orbit && (this.losClear(L, want, elev, D + 0.3) < D * 0.8 || Math.abs(this.avoid) > 0.01)) {
+    // ---- clearance: walls / ramps blocking the view now or within ~0.3 s (riding past a wall end, a bowl wall curving
+    // in behind the camera): swing out or rise to a clear direction early; pulling the boom in is the last resort
+    const auto = !pinned && !orbit; // test views (camYaw / orbit) keep their exact angle
+    const Lp = this.aheadOf(L, s.vel);
+    const want = yawT + this.avoid, wantE = Math.min(elev + this.avoidE, Math.max(elev, MAX_ELEV));
+    let avoidT = auto ? this.avoid : 0, riseT = auto ? this.avoidE : 0;
+    if (auto && (this.clear2(L, Lp, want, wantE, D + 0.3) < D * 0.8 || this.colS.x < D - 0.1
+      || Math.abs(this.avoid) > 0.01 || this.avoidE > 0.01)) {
       let best = -1e9;
-      for (const o of [0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05, 1.4, -1.4]) {
-        const c = this.losClear(L, yawT + o, elev, D + 0.3);
-        let score = Math.min(c, D) / D - 0.22 * Math.abs(o) + (o === this.avoidPick ? 0.06 : 0);
-        // crossing to the other side would sweep the camera through the blocked view
-        if (o * this.avoid < 0 && Math.abs(this.avoid) > 0.15) score -= 0.3;
-        if (score > best) { best = score; avoidT = o; }
+      for (const e of AVOID_RISE) {
+        const el = Math.min(elev + e, Math.max(elev, MAX_ELEV));
+        if (e && el < elev + 0.5 * e) break; // already about as high as it may go
+        for (const o of AVOID_YAW) {
+          const c = this.clear2(L, Lp, yawT + o, el, D + 0.3);
+          let score = Math.min(c, D) / D - 0.22 * Math.abs(o) - 0.3 * e + (o === this.avoidPick && e === this.avoidPickE ? 0.06 : 0);
+          // crossing to the other side would sweep the camera through the blocked view
+          if (o * this.avoid < 0 && Math.abs(this.avoid) > 0.15) score -= 0.3;
+          if (score > best) { best = score; avoidT = o; riseT = e; }
+        }
+        if (best > 0.9) break;
       }
-      this.avoidPick = avoidT;
+      this.avoidPick = avoidT; this.avoidPickE = riseT;
     }
     // escape an obstruction quickly, ease back behind the skater slowly
     this.avoid = snap ? avoidT : damp(this.avoid, avoidT, Math.abs(avoidT) < Math.abs(this.avoid) ? 1.5 : 4, dt);
+    this.avoidE = snap ? riseT : damp(this.avoidE, riseT, riseT < this.avoidE ? 1.2 : 3, dt);
+    if (auto) elev = Math.min(elev + this.avoidE, Math.max(elev, MAX_ELEV));
     const yawGoal = yawT + this.avoid;
     // the heading follow is damped; the player's look offset goes on top as is
     const autoGoal = yawGoal - this.userYaw, a0 = this.autoYaw;
@@ -396,15 +416,29 @@ export class CameraRig {
 
     const ce = Math.cos(elev), se = Math.sin(elev);
     const dir = _c.set(Math.sin(this.yaw) * ce, se, Math.cos(this.yaw) * ce);
-    const clear = this.losThick(L, dir, D + 0.3);
+    const clearNow = this.losThick(L, dir, D + 0.3);
+    const clear = Lp ? Math.min(clearNow, this.losThick(Lp, dir, D + 0.3)) : clearNow;
     const allowed = Math.max(0.6, clear - 0.28);
-    this.colDist = snap || allowed < this.colDist ? allowed : damp(this.colDist, allowed, 3.5, dt);
-    const d = Math.min(D, this.colDist);
+    this.blockedT = snap ? 0 : clear < 0.8 * D ? this.blockedT + dt : Math.max(0, this.blockedT - 2 * dt);
+    // the boom eases in (quicker while something already hides him) and back out: never a cut
+    const cs = this.colS;
+    if (snap) cs.set(allowed);
+    else {
+      if (cs.x > D + 0.02) { cs.x = D + 0.02; cs.v = Math.min(cs.v, 0); }
+      cs.update(allowed, dt, allowed > cs.x ? 3.5 : clearNow - 0.28 < cs.x ? 12 : 7);
+    }
+    const d = Math.max(0.6, Math.min(D, cs.x));
+    // a pulled-in boom must not crop him: widen the view so cap to board fits in about two thirds of the frame height
+    const kS = smoothstep(0.05, 0.6, D - d);
+    const fovC = kS > 0 ? Math.min(Math.max(this.fovS.x, 80), (360 / Math.PI) * Math.atan(1.3 / d)) : 0;
+    const fov = Math.max(this.fovS.x, lerp(this.fovS.x, fovC, kS));
+    if (Math.abs(cam.fov - fov) > 0.01) { cam.fov = fov; cam.updateProjectionMatrix(); }
+    const tHf = Math.tan((fov * Math.PI) / 360);
     this.pos.copy(L).addScaledVector(dir, d);
     this.pitch = elev; this.dist = d;
     const inf = this.info;
-    inf.side = this.wSide; inf.pend = this.wPend; inf.swing = swing; inf.avoid = this.avoid; inf.wantD = D; inf.d = d;
-    inf.clear = clear; inf.floor = fl; inf.yT = yT; inf.elev = elev; inf.bowl = !!bowl;
+    inf.side = this.wSide; inf.pend = this.wPend; inf.swing = swing; inf.avoid = this.avoid; inf.rise = this.avoidE; inf.wantD = D; inf.d = d;
+    inf.clear = clear; inf.clear0 = clearNow; inf.fov = fov; inf.floor = fl; inf.yT = yT; inf.elev = elev; inf.bowl = !!bowl;
     inf.bw = this.wBowl; inf.carve = this.carveW; inf.drop = drop; inf.base = base; inf.goal = yawGoal;
 
     // keep a margin from walls beside the camera and stay above the local ground (both eased: no snaps)
@@ -430,9 +464,9 @@ export class CameraRig {
     cam.position.copy(this.pos);
     cam.lookAt(L);
     if (!orbit) {
-      // composition: skater centre just below the middle of the frame
-      cam.rotateX(Math.atan((portrait ? 0.11 : 0.15) * tH));
-      this.frameGuard(s, focus, tH, down, dt, snap);
+      // composition: skater centre just below the middle of the frame (centred while the boom is pulled in)
+      cam.rotateX(Math.atan((portrait ? 0.11 : 0.15) * tHf * (1 - kS)));
+      this.frameGuard(s, focus, tHf, down, dt, snap);
     } else this.guardS.set(0);
   }
 
@@ -468,6 +502,24 @@ export class CameraRig {
       h = h2;
     }
     return h;
+  }
+
+  /** where the look target will be in ~0.3 s, kept in free space (a ramp or wall ahead stops it short) */
+  private aheadOf(L: Vector3, vel: Vector3): Vector3 | null {
+    const a = _g.set(vel.x, 0, vel.z);
+    let len = a.length() * 0.3;
+    if (len < 0.15) return null;
+    a.normalize();
+    len = Math.min(len, 2);
+    const h = this.ray(L, a, len + 0.3);
+    if (h) len = h.distance - 0.3;
+    return len < 0.15 ? null : _h.copy(L).addScaledVector(a, len);
+  }
+
+  /** clear boom length from the look target now and from where it will be shortly */
+  private clear2(L: Vector3, Lp: Vector3 | null, yaw: number, elev: number, max: number) {
+    const c = this.losClear(L, yaw, elev, max);
+    return Lp && c > 0.3 * max ? Math.min(c, this.losClear(Lp, yaw, elev, max)) : c;
   }
 
   private losClear(L: Vector3, yaw: number, elev: number, max: number) {

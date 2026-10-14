@@ -316,28 +316,21 @@ export class FoliageBuilder {
   }
 }
 
-/** blade cross-section (side, thickness) in units of the half width / half thickness: a shallow channel on top, a keel below */
-const BLADE: [number, number][] = [[-1, 0.25], [-0.55, 0.13], [0, 0.07], [0.55, 0.13], [1, 0.25], [0.55, -0.62], [0, -1], [-0.55, -0.62]];
-const AG = { base: new Color('#9cba97'), mid: new Color('#6f9a8a'), tip: new Color('#4e6d5e'), spine: new Color('#3f3426'), wax: new Color('#bcd2bf') };
+/** blade cross-section (side, thickness) in units of the half width / half thickness: a shallow channel on top, a keel below.
+ *  The margins are doubled (top / keel) so each face keeps its own smooth normals and the edge between them stays sharp. */
+const BLADE: [number, number][] = [[-1, 0.25], [-0.55, 0.13], [0, 0.07], [0.55, 0.13], [1, 0.25], [1, 0.25], [0.55, -0.62], [0, -1], [-0.55, -0.62], [-1, 0.25]];
+const BLADE_SEAM = BLADE.map(([x, y], r) => { const [x2, y2] = BLADE[(r + 1) % BLADE.length]; return x === x2 && y === y2; });
+const AG = { base: new Color('#9cba97'), mid: new Color('#6f9a8a'), tip: new Color('#4e6d5e'), spine: new Color('#3f3426') };
 const _Y = new Vector3(0, 1, 0), _c = new Color();
 
 /**
  * Agave rosette around the origin (s = size): three whorls of thick, smooth blades that rise from the core, bow outwards
- * and taper to a dark spine, painted pale at the base, glaucous along the blade, darker to the tip, with a waxy margin.
+ * and taper to a dark spine, painted pale at the base, glaucous along the blade, darker to the tip and at the margins.
  */
 export function agaveGeo(s: number, rnd: () => number): BufferGeometry {
   const pos: number[] = [], col: number[] = [], idx: number[] = [];
-  const NS = 9, NR = BLADE.length;
+  const NS = FOLIAGE_DENSITY < 1 ? 5 : 9, NR = BLADE.length;
   const whorls: [number, number, number, number][] = [[7, 1.0, 0.42, 0.2], [5, 0.8, 0.86, 0.12], [4, 0.56, 1.2, 0.05]];
-  const fa = new Vector3(), fb = new Vector3(), fn = new Vector3(), out = new Vector3();
-  const tri = (a: number, b: number, c: number, sp: Vector3, tg: Vector3) => {
-    const v = (i: number, o: Vector3) => o.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
-    v(a, out); v(b, fa).sub(out); v(c, fb).sub(out);
-    fn.crossVectors(fa, fb);
-    out.add(v(b, fa)).add(v(c, fb)).multiplyScalar(1 / 3).sub(sp);
-    out.addScaledVector(tg, -out.dot(tg));
-    if (fn.dot(out) >= 0) idx.push(a, b, c); else idx.push(a, c, b);
-  };
   let k = 0;
   for (const [n, lenK, rise, r0] of whorls) {
     for (let i = 0; i < n; i++, k++) {
@@ -364,24 +357,25 @@ export function agaveGeo(s: number, rnd: () => number): BufferGeometry {
         BLADE.forEach(([sx, nx], r) => {
           const q = P[j].clone().addScaledVector(S, sx * w).addScaledVector(N, nx * h);
           pos.push(q.x, q.y, q.z);
-          const edge = r === 0 || r === 4, below = nx < 0;
+          const edge = Math.abs(sx) === 1, below = r >= NR / 2;
           const m = tone * core * (below ? 0.84 : 1.04);
-          const cr = edge ? _c.r + (AG.wax.r - _c.r) * 0.45 : _c.r, cg = edge ? _c.g + (AG.wax.g - _c.g) * 0.45 : _c.g, cb = edge ? _c.b + (AG.wax.b - _c.b) * 0.45 : _c.b;
+          const cr = edge ? _c.r + (AG.spine.r - _c.r) * 0.3 : _c.r, cg = edge ? _c.g + (AG.spine.g - _c.g) * 0.3 : _c.g, cb = edge ? _c.b + (AG.spine.b - _c.b) * 0.3 : _c.b;
           col.push(cr * m, cg * m, cb * m);
         });
       }
       const tip = pos.length / 3;
       pos.push(P[NS].x, P[NS].y, P[NS].z);
       col.push(AG.spine.r, AG.spine.g, AG.spine.b);
-      const mid = new Vector3();
+      // the section runs clockwise in (S, N) and N = S x T, so (a, b, next ring) faces outwards on every side, the flat
+      // margin strips included
       for (let j = 0; j < NS - 1; j++) {
-        mid.copy(P[j]).add(P[j + 1]).multiplyScalar(0.5);
         for (let r = 0; r < NR; r++) {
+          if (BLADE_SEAM[r]) continue;
           const a = base + j * NR + r, b = base + j * NR + ((r + 1) % NR);
-          tri(a, b, b + NR, mid, T[j]); tri(a, b + NR, a + NR, mid, T[j]);
+          idx.push(a, b, b + NR, a, b + NR, a + NR);
         }
       }
-      for (let r = 0; r < NR; r++) tri(base + (NS - 1) * NR + r, base + (NS - 1) * NR + ((r + 1) % NR), tip, P[NS - 1], T[NS - 1]);
+      for (let r = 0; r < NR; r++) if (!BLADE_SEAM[r]) idx.push(base + (NS - 1) * NR + r, base + (NS - 1) * NR + ((r + 1) % NR), tip);
     }
   }
   const g = new BufferGeometry();

@@ -1,7 +1,7 @@
 import {
   AnimationAction, AnimationClip, AnimationMixer, BackSide, Box3, BoxGeometry, BufferAttribute, BufferGeometry, CanvasTexture, Color, DoubleSide,
   FrontSide, Group, LOD, Mesh, MeshDepthMaterial, MeshLambertMaterial, Object3D, SkinnedMesh, Sphere, SRGBColorSpace, Texture, Vector3,
-  type Material,
+  type Material, type Skeleton,
 } from 'three';
 import type { GLTF, GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as skeletonClone } from 'three/examples/jsm/utils/SkeletonUtils.js';
@@ -28,8 +28,9 @@ export function loadCrowd(loader: GLTFLoader, url: string, skater: Promise<GLTF>
 }
 
 /** crowd cost: people shown and animated (nearest the park first), LOD switch distance factor, animation rate (Hz, 0 =
- *  every frame), sun / lamp shadow casting */
-export interface PeopleProfile { count: number; lodScale: number; mixerHz: number; castShadow: boolean }
+ *  every frame), sun / lamp shadow casting, nearest distance level drawn, one animation phase per person (kept off the
+ *  frames that render the sun shadow, see `busy`) */
+export interface PeopleProfile { count: number; lodScale: number; mixerHz: number; castShadow: boolean; minLod: number; stagger: boolean }
 
 /** Part colours of our skater pipeline (tools/character parts, sRGB) used to recognise each part in people.glb. */
 const PARTS: Record<string, string> = {
@@ -213,6 +214,8 @@ function poseSphere(sm: SkinnedMesh): Sphere {
 interface Person {
   holder: Group; mixer: AnimationMixer; spot: Spot; s: number; dir: 1 | -1; turn: number; len: number; cum: number[];
   board: Object3D | null; lod: LOD | null; casters: Mesh[]; rank: number;
+  /** stagger: own mixer clock; moved: bones posed since the last matrix walk; ver: matrix walks so far */
+  acc: number; moved: boolean; ver: number;
 }
 
 /** Small, simple, gently moving people: clones of our own rig (the skater's mesh, people.glb clips), recoloured per instance. */
@@ -227,9 +230,17 @@ export class People {
   private refs: Color[] = [];
   private refNames: string[] = [];
   private faceMap: Texture | null = null;
-  private profile: PeopleProfile = { count: Infinity, lodScale: 1, mixerHz: 30, castShadow: true };
+  private profile: PeopleProfile = { count: Infinity, lodScale: 1, mixerHz: 30, castShadow: true, minLod: 0, stagger: false };
+  /** set by the game: the coming frame renders the sun shadow (staggered mixers wait a frame) */
+  busy = false;
+  /** the baked distance levels (index lists per part of the skater's mesh), once built */
+  baked: LodLists | null = null;
 
-  constructor(private ground: (x: number, z: number) => number) { this.group.name = 'people'; this.crowd.name = 'crowd'; }
+  constructor(private ground: (x: number, z: number) => number) {
+    this.group.name = 'people'; this.crowd.name = 'crowd';
+    // static containers at the origin: their matrices never force a walk through every person
+    this.group.matrixAutoUpdate = false; this.crowd.matrixAutoUpdate = false;
+  }
 
   load(src: Promise<CrowdSource>) { return (this.loaded = this.build(src)); }
 
@@ -292,6 +303,7 @@ export class People {
       || parts.some((m, k) => m.geometry.getAttribute('position').count !== baked.parts[k].vertices || m.geometry.index!.count !== baked.parts[k].indices)) {
       throw new Error('baked levels were made for another mesh (re-run tools/assets/slim_glb.sh)');
     }
+    this.baked = baked;
     const body = parts.find((m) => !(m.material as MeshLambertMaterial).map) ?? parts[0];
     const mesh = (g: BufferGeometry, from: SkinnedMesh, name: string) => {
       const sm = new SkinnedMesh(g, from.material);
@@ -320,13 +332,16 @@ export class People {
   }
 
   private applyProfile() {
-    const { count, lodScale, castShadow } = this.profile;
+    const { count, lodScale, castShadow, minLod, stagger, mixerHz } = this.profile;
     for (const p of this.items) {
       const on = p.rank < count;
       p.holder.visible = on;
       if (p.board) p.board.visible = on;
-      p.lod?.levels.forEach((lv, l) => { lv.distance = LODS[l].d * lodScale; });
+      // hidden people leave the scene graph: no traversal at all
+      for (const o of [p.holder, p.board]) if (o && on !== (o.parent === this.crowd)) { if (on) this.crowd.add(o); else this.crowd.remove(o); }
+      p.lod?.levels.forEach((lv, l) => { lv.distance = l > 0 && l <= minLod ? 0 : LODS[l].d * lodScale; });
       for (const m of p.casters) m.castShadow = castShadow;
+      if (stagger && mixerHz > 0) p.acc = ((p.rank * 0.618034) % 1) / mixerHz;
     }
   }
 
@@ -503,10 +518,26 @@ export class People {
       const lod = (model.getObjectByName('personLod') as LOD | undefined) ?? null;
       const cum = [0];
       if (spot.path) for (let k = 1; k < spot.path.length; k++) cum.push(cum[k - 1] + Math.hypot(spot.path[k][0] - spot.path[k - 1][0], spot.path[k][1] - spot.path[k - 1][1]));
-      this.items.push({
+      const it: Person = {
         holder, mixer, spot, s: spot.path ? (i * 7.3) % cum[cum.length - 1] : 0, dir: i % 2 ? -1 : 1, turn: 0, len: cum[cum.length - 1], cum,
-        board, lod, casters, rank: near.indexOf(i),
-      });
+        board, lod, casters, rank: near.indexOf(i), acc: 0, moved: true, ver: 0,
+      };
+      this.items.push(it);
+      board?.traverse((o) => { o.updateMatrix(); o.matrixAutoUpdate = false; });
+      if (!spot.path) {
+        // someone standing or sitting only changes when its mixer runs: no matrix walk and no skin upload in between
+        holder.updateMatrix(); holder.matrixAutoUpdate = false;
+        model.updateMatrix(); model.matrixAutoUpdate = false;
+        const walk = model.updateMatrixWorld.bind(model);
+        model.updateMatrixWorld = (force?: boolean) => { if (force || it.moved) { it.moved = false; it.ver++; walk(force); } };
+        const skels = new Set<Skeleton>();
+        model.traverse((o) => { const sm = o as SkinnedMesh; if (sm.isSkinnedMesh) skels.add(sm.skeleton); });
+        for (const sk of skels) {
+          const upd = sk.update.bind(sk);
+          let seen = -1;
+          sk.update = () => { if (seen !== it.ver) { seen = it.ver; upd(); } };
+        }
+      }
     });
   }
 
@@ -531,10 +562,20 @@ export class People {
       p.holder.position.set(x, p.spot.y ?? this.ground(x, z), z);
       if (p.turn === 0) p.holder.rotation.y = Math.atan2((b[0] - a[0]) * p.dir, (b[1] - a[1]) * p.dir);
     }
-    this.acc += dt;
     const hz = this.profile.mixerHz;
+    if (this.profile.stagger && hz > 0) {
+      // each person on its own phase (a flat cost per frame), none on a frame that renders the sun shadow
+      for (const p of this.items) {
+        if (!p.holder.visible) continue;
+        p.acc += dt;
+        if (p.acc < 1 / hz - 1e-4 || (this.busy && p.acc < 2 / hz - 1e-4)) continue;
+        p.mixer.update(p.acc); p.acc = 0; p.moved = true;
+      }
+      return;
+    }
+    this.acc += dt;
     if (hz > 0 && this.acc < 1 / hz - 1e-4) return;
-    for (const p of this.items) if (p.holder.visible) p.mixer.update(this.acc);
+    for (const p of this.items) if (p.holder.visible) { p.mixer.update(this.acc); p.moved = true; }
     this.acc = 0;
   }
 }
