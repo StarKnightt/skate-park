@@ -9,7 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "capture": "node tools/capture/capture.mjs"
+    "capture": "node tools/capture/run.mjs"
   },
   "dependencies": {
     "@fontsource/nunito": "^5.3.0",

@@ -6,7 +6,7 @@ cd /c/Code/skate-park
 P5=E:/shots/skate-park/pass-05
 LIVE=https://starknightt.github.io/skate-park/
 H="bash tools/heavy.sh lead"
-T=E:/shots/skate-park/mobile-qa/tools
+T=tools/mobile-qa
 L=$P5/dev/finish
 mkdir -p "$L"
 echo "start $(date +%T)"

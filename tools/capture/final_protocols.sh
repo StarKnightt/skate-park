@@ -13,7 +13,7 @@ nohup pnpm exec vite preview --port 5189 > "$P5/dev/preview.log" 2>&1 &
 echo $! > "$P5/dev/preview.pid"
 for i in 1 2 3 4 5 6 7 8 9 10; do curl -sf -o /dev/null http://127.0.0.1:5189/skate-park/ && break; sleep 1; done
 echo "preview up $(date +%T)"
-( MQA_OUT="$P5/mobile/$TAG" bash E:/shots/skate-park/mobile-qa/tools/run_all.sh http://127.0.0.1:5189/skate-park/ > "$P5/mobile/run_all_$TAG.log" 2>&1; echo "run_all done $(date +%T)" >> "$P5/mobile/run_all_$TAG.log" ) &
+( MQA_OUT="$P5/mobile/$TAG" bash tools/mobile-qa/run_all.sh http://127.0.0.1:5189/skate-park/ > "$P5/mobile/run_all_$TAG.log" 2>&1; echo "run_all done $(date +%T)" >> "$P5/mobile/run_all_$TAG.log" ) &
 sleep 20
 bash tools/heavy.sh lead node tools/realtime/rt_protocol.mjs --name final_200 --only flat_side,push,bowl_carve,halfpipe,kickflip > "$P5/realtime/final_200.log" 2>&1
 bash tools/heavy.sh lead node tools/realtime/rt_protocol.mjs --name final_sweep60 --sweep 60 --only flat_side,kickflip > "$P5/realtime/final_sweep60.log" 2>&1

@@ -2,7 +2,7 @@
 
 Motion and feel reviews are uncapped real-time runs in headed Chrome on the portrait second monitor (DISPLAY2, window at 1930,20; never x < 1920), with real
 keyboard and mouse events and one log row per displayed frame. Frame-stepped captures are for stills only. Every browser
-run goes through the heavy-job lock. Outputs go under `E:/shots/skate-park/pass-04/realtime/<run>/` by default.
+run goes through the heavy-job lock. Outputs go under `E:/shots/skate-park/pass-05/realtime/<run>/` by default (`--out` to change).
 
 ## Commands (run from C:\Code\skate-park)
 

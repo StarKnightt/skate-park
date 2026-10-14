@@ -2,7 +2,8 @@
 # Run a heavy job (browser test/recording, Blender, production build, ffmpeg) while holding the single global lock.
 # usage: bash tools/heavy.sh <owner> <command...>
 # Waits until no other heavy job runs. Breaks a stale lock older than 25 minutes.
-LOCK=/c/Code/skate-park/.agent-notes/heavy.lock
+LOCK="$(cd "$(dirname "$0")/.." && pwd)/.agent-notes/heavy.lock"
+mkdir -p "$(dirname "$LOCK")"
 owner="$1"; shift
 while ! mkdir "$LOCK" 2>/dev/null; do
   if [ -f "$LOCK/owner" ] && [ $(( $(date +%s) - $(stat -c %Y "$LOCK/owner") )) -gt 1500 ]; then
