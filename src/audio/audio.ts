@@ -24,6 +24,17 @@ export class AudioEngine {
     onSettings((s, k) => { if (k === 'musicVol' || k === 'sfxVol') this.setVolumes(s.musicVol, s.sfxVol); });
   }
 
+  /** call from every user gesture (pointerup / touchend / click / keydown): iOS starts or resumes audio only inside one */
+  gesture() {
+    const c = this.ctx;
+    if (!c || this.bgSuspended || c.state === 'running') return;
+    c.resume().catch(() => {});
+  }
+  /** page hidden: silence everything until resume() */
+  suspend() { this.bgSuspended = true; this.ctx?.suspend().catch(() => {}); }
+  resume() { this.bgSuspended = false; this.ctx?.resume().catch(() => {}); }
+  private bgSuspended = false;
+
   async start() {
     if (this.started) return;
     this.started = true;

@@ -25,6 +25,7 @@ import { Input, type AutoSource } from './core/input';
 import { settings, onSettings, type QualitySetting } from './core/settings';
 import { Hud, TouchControls } from './ui/hud';
 import { installPauseMenu } from './ui/pauseMenu';
+import { installPlatform } from './core/platform';
 import { AudioEngine } from './audio/audio';
 import { params, DEBUG, clamp } from './core/util';
 import { installTestHooks } from './debug/testHooks';
@@ -96,6 +97,8 @@ export class Game {
   /** paused: no simulation at all, the scene is redrawn at ~10 fps */
   paused = false;
   onPause?: (paused: boolean) => void;
+  /** more pause observers (platform.ts: wake lock); onPause stays the pause menu's */
+  pauseListeners: ((paused: boolean) => void)[] = [];
   qualityAuto = true;
   private pausedDrawT = 0;
 
@@ -254,6 +257,7 @@ export class Game {
     if (!touchMode && !params.has('mute')) this.hud.soundPrompt();
     this.renderer.setAnimationLoop((t) => this.frame(t));
     installPauseMenu(this);
+    installPlatform(this);
     // start screen: he skates the park by himself under the title card until the first input
     if (!DEBUG || params.has('attract')) this.startAttract();
   }
@@ -335,6 +339,7 @@ export class Game {
     this.pausedDrawT = -1e9;
     this.audio.duck(on);
     this.onPause?.(on);
+    for (const f of this.pauseListeners) f(on);
   }
   togglePause() { this.setPaused(!this.paused); }
 
