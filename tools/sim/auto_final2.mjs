@@ -1,6 +1,7 @@
 // Real-time auto-ride capture: full lap clip, player handoff clip, start-screen attract clip (60 fps canvas recordings).
-// bash tools/heavy.sh E2 node tools/capture/run.mjs tools/sim/auto_final2.mjs --nohmr --q "test&mute&mode=auto" --out E:/shots/skate-park/pass-04/autoride/final2
-// env: LAP_SECS (default 80), HANDOFF (1/0), ATTRACT_SECS (default 22, 0 = skip)
+// bash tools/heavy.sh AP node tools/capture/run.mjs tools/sim/auto_final2.mjs --nohmr --q "test&mute&mode=auto" --out E:/shots/skate-park/pass-04/autoride/final3
+// env: LAP_SECS (default 80), HANDOFF (1/0), HANDOFF_LINE (wait for the autopilot to ride this line before the takeover,
+// e.g. "to the half pipe"; default: right after the lap clip), ATTRACT_SECS (default 22, 0 = skip)
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -105,7 +106,15 @@ export default async function (ctx) {
   // ---- 2. handoff: the player steers with W/A/D for a few seconds, then idles until auto-ride takes over again
   if (handoff) {
     const hoFile = path.join(out, 'autoride_handoff.mp4');
-    const tHand = await page.evaluate(() => (performance.now() - window.__autoLog.t0) / 1000);
+    if (process.env.HANDOFF_LINE) {
+      // wait for the autopilot to start that line (already on it: wait for the next time round)
+      const line = () => page.evaluate(() => window.__skate.game.input.auto?.lineName), t0 = Date.now();
+      while (Date.now() - t0 < 120000 && (await line()) === process.env.HANDOFF_LINE) await page.waitForTimeout(100);
+      while (Date.now() - t0 < 120000 && (await line()) !== process.env.HANDOFF_LINE) await page.waitForTimeout(100);
+    }
+    const now = () => page.evaluate(() => +((performance.now() - window.__autoLog.t0) / 1000).toFixed(2));
+    const tHand = await now();
+    let tRelease = 0;
     summary.handoffMime = await record(page, hoFile, 17, async () => {
       await page.waitForTimeout(2000);
       await page.keyboard.down('KeyW');
@@ -113,12 +122,16 @@ export default async function (ctx) {
       await page.keyboard.down('KeyD'); await page.waitForTimeout(1400); await page.keyboard.up('KeyD');
       await page.waitForTimeout(600);
       await page.keyboard.up('KeyW');
+      tRelease = await now();
     });
     summary.handoff = probe(hoFile);
+    summary.handoffSheet = sheet(hoFile, path.join(out, 'handoff_sheet.jpg'), 1);
     const rows = (await page.evaluate(() => window.__autoLog.rows)).filter((r) => r[0] >= tHand);
     const first = (f) => rows.find(f)?.[0];
     const tUser = first((r) => r[9]), tBack = tUser ? rows.find((r) => r[0] > tUser && r[8] && !r[9])?.[0] : undefined;
-    summary.handoffTimes = { recordStart: +tHand.toFixed(2), playerTookOver: tUser, autoResumed: tBack, idleToResume: tBack && tUser ? +(tBack - tUser - 4.2).toFixed(2) : null };
+    summary.handoffTimes = { recordStart: tHand, line: rows[0]?.[6], playerTookOver: tUser, keysReleased: tRelease, autoResumed: tBack,
+      resumeAfterRelease: tBack ? +(tBack - tRelease).toFixed(2) : null };
+    summary.handoffBails = (await page.evaluate(() => window.__autoLog.ev)).filter((e) => e[0] >= tHand && e[1] === 'bail');
   }
   const log2 = await page.evaluate(() => window.__autoLog);
   fs.writeFileSync(path.join(out, 'autoride_log.json'), JSON.stringify({ ev: log2.ev, rows: log2.rows }));

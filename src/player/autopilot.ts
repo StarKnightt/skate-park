@@ -62,6 +62,9 @@ export class Autopilot implements AutoSource {
   private grindPlan: { pop: boolean; flip: FlipDir | null } | null = null;
   private prevMode = '';
   private _attract = false;
+  private clock = 0;
+  /** clock at the end of the last half pipe session (a re-acquire right after it must not start another one) */
+  private hpEnd = -99;
 
   constructor(public ph: SkatePhysics, opts: { attract?: boolean; seed?: number } = {}) {
     this.rnd = mulberry(opts.seed ?? (Date.now() & 0xffff));
@@ -304,6 +307,7 @@ export class Autopilot implements AutoSource {
   sample(dt: number, _airborne: boolean): SkateInput {
     const ph = this.ph, inp = emptyInput();
     const mode = ph.mode;
+    this.clock += dt;
     if (mode === 'bail' || mode === 'recover') { this.reacquire = true; this.state = 'follow'; this.prevMode = mode; this.steerF = 0; return inp; }
     if (this.prevMode === 'grind' && mode !== 'grind') { this.grindPlan = null; this.copeOut = false; }
     this.prevMode = mode;
@@ -359,11 +363,13 @@ export class Autopilot implements AutoSource {
         this.fired.add(i);
         const prev = this.nodes[(i - 1 + N) % N];
         // a straight hit needs a straight approach: way off it, just keep following the line
-        if (a.k === 'wall' && Math.abs(this.angleTo(_e.set(nd.x - prev.x, 0, nd.z - prev.z))) > 1.0) continue;
+        if (a.k === 'wall' ? !this.wallOk(i) : Math.abs(this.angleTo(_e.set(nd.x - prev.x, 0, nd.z - prev.z))) > 1.0) continue;
         this.startWall(i); this.lastAct = a.k;
         return this.wallStep(dt, inp);
       } else if (a.k === 'hpAirs' && dRem <= 0.3) {
-        this.fired.add(i); this.lastAct = 'hpAirs';
+        this.fired.add(i);
+        if (this.clock - this.hpEnd < 20) continue;
+        this.lastAct = 'hpAirs';
         this.seg = i; this.s = nd.s;
         this.hp = { node: i, cx: a.cx, z0: a.z0, z1: a.z1, want: a.airs - (this.rnd() < 0.4 ? 1 : 0), maxPasses: a.passes,
           side: ph.pos.x >= a.cx ? -1 : 1, drift: -1, passes: 0, airs: 0, onWall: false, inAir: false, t: 0, vBottom: 0, lastX: ph.pos.x,
@@ -378,7 +384,14 @@ export class Autopilot implements AutoSource {
     const L = clamp(1.3 + 0.42 * sp, 1.7, 4.6);
     const tgt = _c;
     const sT = ax >= 0 && this.ahead(this.s, this.nodes[ax].s) < L ? this.nodes[ax].s : this.s + L;
-    const wall = this.pointAt(sT, tgt);
+    let wall = this.pointAt(sT, tgt);
+    const wi = ax < 0 ? this.wallNext(L) : -1;
+    if (wi >= 0) {
+      // a straight hit: look along the approach through the hit point, not round the line that follows it
+      const nd = this.nodes[wi], pv = this.nodes[(wi - 1 + N) % N], rem = L - this.ahead(this.s, nd.s);
+      const dx = nd.x - pv.x, dz = nd.z - pv.z, l = Math.hypot(dx, dz) || 1;
+      tgt.set(nd.x + (dx / l) * rem, ph.pos.y, nd.z + (dz / l) * rem); wall = false;
+    }
     const tp = _e.copy(tgt);
     if (!wall) tp.y = ph.pos.y;
     let steer = this.pursue(tp);
@@ -396,8 +409,9 @@ export class Autopilot implements AutoSource {
       if (this.manualLeft <= 0 || sp < 1.1 || !flat) this.state = 'follow';
     } else if (flat) {
       inp.push = sp < vt - 0.25 && !crouch;
-      inp.brake = sp > vt + 1.1;
-    } else inp.push = this.pumping();
+      // a wall hit wants its own speed: faster, the turn onto it runs wide and the air drifts
+      inp.brake = sp > vt + (this.wallNext(10) >= 0 ? 0.35 : 1.1);
+    } else inp.push = this.pumping() && sp < vt + 0.5;
     // stuck against something: pivot away on the spot, push off, then look for the line again
     if (this.escapeT > 0) {
       this.escapeT -= dt;
@@ -413,7 +427,7 @@ export class Autopilot implements AutoSource {
         inp.ollie = true; inp.popCharge = 0.5; inp.steer = 0;
         return inp;
       }
-      if (this.slowT > 1.6) {
+      if (this.slowT > 1.2) {
         this.slowT = 0; this.escapeT = 1.3; this.stuck++;
         this.escapeDir = steer > 0.1 ? 1 : steer < -0.1 ? -1 : this.rnd() < 0.5 ? 1 : -1;
       }
@@ -423,6 +437,31 @@ export class Autopilot implements AutoSource {
     this.steerF += (steer - this.steerF) * (1 - Math.exp(-dt / 0.05));
     inp.steer = Math.abs(this.steerF) < 0.02 ? 0 : this.steerF;
     return inp;
+  }
+
+  /** a straight hit on wall node i still fits: approach angle, and the drift of the turn onto its fall line keeps the hit
+   * inside the wall's usable width */
+  private wallOk(i: number) {
+    const n = this.nodes, nd = n[i], prev = n[(i - 1 + n.length) % n.length], ph = this.ph;
+    const wd = _e.set(nd.x - prev.x, 0, nd.z - prev.z).normalize();
+    const ang = this.angleTo(wd);
+    if (Math.abs(ang) > 0.8) return false;
+    const w = nd.act?.k === 'wall' ? nd.act.w : undefined;
+    if (w === undefined) return true;
+    const sp = Math.max(ph.speed, 1.2), R = Math.max((sp * sp) / 7.6, sp / 2.4);
+    const off = (ph.pos.x - nd.x) * -wd.z + (ph.pos.z - nd.z) * wd.x;
+    return Math.abs(off + Math.sign(ang) * R * (1 - Math.cos(ang))) <= w;
+  }
+
+  /** next unfired wall hit within d metres along the line, or -1 */
+  private wallNext(d: number) {
+    const N = this.nodes.length;
+    for (let k = 1; k < 6; k++) {
+      const i = (this.seg + k) % N, nd = this.nodes[i];
+      if (this.ahead(this.s, nd.s) > d) return -1;
+      if (nd.act?.k === 'wall' && this.pending(i)) return i;
+    }
+    return -1;
   }
 
   private planGrind() {
@@ -500,9 +539,9 @@ export class Autopilot implements AutoSource {
     const pk = h.peaks, stalled = h.airs === 0 && pk.length >= 4 && pk[pk.length - 1] < pk[pk.length - 3] + 0.12;
     // hand back on the flat while heading for the +x wall: the line carves that wall round to the exit
     if (onFlat && !h.onWall && h.side > 0 && (h.airs >= h.want || h.passes >= h.maxPasses || stalled || h.t > 32)) {
-      this.hp = null; this.state = 'follow';
-      const nx = (h.node + 1) % this.nodes.length;
-      this.seg = nx; this.s = this.nodes[nx].s; this.acquire(false);
+      // back onto the session's own segment: the carve apex after it is then still ahead and held
+      this.hp = null; this.state = 'follow'; this.hpEnd = this.clock;
+      this.seg = h.node; this.s = this.nodes[h.node].s; this.reached.clear(); this.acquire(false);
       return inp;
     }
     if (ph.pos.z < h.z0) h.drift = 1; else if (ph.pos.z > h.z1) h.drift = -1;
@@ -595,11 +634,19 @@ export class Autopilot implements AutoSource {
         }
       }
     }
-    const steer = clamp(-2.2 * this.angleTo(dir), -1, 1);
+    let steer: number;
+    if (onFlat && wn.act?.k === 'wall' && tv.dot(this.wallDir) > 0) {
+      // converge onto the line through the hit point, not just its heading: the hit stays inside the wall's width
+      const L = clamp(1.3 + 0.42 * ph.speed, 1.7, 4.6), wd = this.wallDir;
+      const along = (ph.pos.x - wn.x) * wd.x + (ph.pos.z - wn.z) * wd.z + L;
+      steer = this.pursue(_e.set(wn.x + wd.x * along, ph.pos.y, wn.z + wd.z * along));
+    } else steer = clamp(-2.2 * this.angleTo(dir), -1, 1);
     this.steerF += (steer - this.steerF) * (1 - Math.exp(-dt / 0.05));
     inp.steer = this.steerF;
-    if (onFlat) inp.push = ph.speed < wn.v - 0.25 && tv.dot(this.wallDir) > 0;
-    else inp.push = this.pumping();
+    if (onFlat) {
+      inp.push = ph.speed < wn.v - 0.25 && tv.dot(this.wallDir) > 0;
+      inp.brake = wn.act?.k === 'wall' && tv.dot(this.wallDir) > 0 && ph.speed > wn.v + 0.35;
+    } else inp.push = this.pumping();
     return inp;
   }
 }

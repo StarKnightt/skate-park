@@ -13,8 +13,9 @@ export type Act =
   | { k: 'grindFlat' }
   /** manual for `len` metres (`p`: done on that share of laps) */
   | { k: 'manual'; len: number; p?: number }
-  /** transition: ride straight at it, let the physics kickturn or air, resume when rolling away from it */
-  | { k: 'wall' }
+  /** transition: ride straight at it, let the physics kickturn or air, resume when rolling away from it; `w` = usable
+   * half-width beside this point (side walls beyond it), the hit is skipped when the approach would land outside it */
+  | { k: 'wall'; w?: number }
   /** bowl exit: ride up the wall from this floor point, catch the coping, lean out onto the deck; on a miss go back
    * `retry` points and carve around again */
   | { k: 'copeOut'; retry?: number }
@@ -65,11 +66,12 @@ export function lapLines(attract = false): Line[] {
       ],
     } : {
       name: 'half pipe airs', f: 'halfpipe', pts: [
-        // passes stay in the south half; it hands back heading for the east wall, which is carved round to the north exit
-        P(23.6, -3.8, 6.5, { k: 'hpAirs', cx: 24, z0: -9.0, z1: -4.6, airs: 3, passes: 9 }), T(28.2, -11.6, 6), P(24.4, -13.8, 6), P(24.1, -16.4, 5.5),
+        // passes stay in the south half; it hands back heading for the east wall, which is carved low (well clear of its
+        // north end) and left heading north-west, then a braked straight run north out of the open end
+        P(23.6, -3.8, 6.5, { k: 'hpAirs', cx: 24, z0: -9.0, z1: -4.6, airs: 3, passes: 9 }), T(27.4, -10.6, 5.5), P(25.5, -12.8, 5), P(24.5, -15.0, 5), P(24.15, -17.0, 5),
       ],
     },
-    { name: 'mini quarter', f: 'qp', pts: [P(24, -18.4, 5, { k: 'wall' }), P(23.6, -17.6, 4.5), P(21, -17.2, 4.8), P(18, -17.0, 5)] },
+    { name: 'mini quarter', f: 'qp', pts: [P(24, -18.4, 5, { k: 'wall', w: 3 }), P(23.6, -17.6, 4.5), P(21, -17.2, 4.8), P(18, -17.0, 5)] },
     // straight 25 deg run-in onto the long ledge's north edge (z -12.6): no S-curve before the pop
     { name: 'to the long ledge', f: 'flat', pts: [P(13.0, -17.0, 5.4), P(9.0, -16.9, 5.6), P(6.15, -16.4, 5.6), P(3.44, -15.14, 5.6), P(0.72, -13.87, 5.6)] },
     { name: 'long ledge', f: 'ledge', pts: [P(-0.82, -13.15, 5.6, { k: 'grind', charge: 1 }), P(-6, -12.6, 4.4), P(-10.4, -12.6, 5.2)] },
