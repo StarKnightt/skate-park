@@ -600,10 +600,13 @@ export class SkatePhysics {
       this.fwd.applyQuaternion(_q);
       this.vel.applyQuaternion(_q);
     }
-    // wheel grip: kill lateral sliding
+    // wheel grip: kill lateral sliding, limited by friction on the load (gravity into the surface + a ~4 m carve's
+    // centripetal push): too slow on a steep wall the wheels can't hold and he slides down instead of creeping along it
     const vf = this.vel.dot(this.fwd);
     const lat = _v3.copy(this.vel).addScaledVector(this.fwd, -vf);
-    this.vel.copy(this.fwd).multiplyScalar(vf).addScaledVector(lat, Math.exp(-16 * dt));
+    const ls = lat.length();
+    const grip = Math.min(ls * (1 - Math.exp(-16 * dt)), 0.9 * (G * Math.max(0, this.up.y) + (s * s) / 4) * dt);
+    this.vel.copy(this.fwd).multiplyScalar(vf).addScaledVector(lat, ls > 1e-6 ? (ls - grip) / ls : 0);
     // (held through a kickturn: it picks the pivot truck and the pose, while gravity already pulls the board back down)
     if (this.kickturn.t < 0) { if (vf < -0.35) this.fakie = true; else if (vf > 0.35) this.fakie = false; }
 

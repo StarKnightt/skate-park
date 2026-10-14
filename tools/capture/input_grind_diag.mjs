@@ -4,7 +4,7 @@ import path from 'node:path';
 
 export default async function (ctx) {
   const { page, api, wait, out } = ctx;
-  await page.bringToFront();
+  // (no bringToFront: test windows must never take focus from the user)
   const runs = [];
   for (let k = 0; k < 3; k++) {
     await page.evaluate(() => { const g = window.__skate.game; if (g.paused) g.setPaused(false, true); });

@@ -23,7 +23,7 @@ export default async function (ctx) {
   const lookSum = () => G(() => { const a = window.__look.splice(0); return { n: a.length, yaw: +a.reduce((s, v) => s + v[0], 0).toFixed(4), pitch: +a.reduce((s, v) => s + v[1], 0).toFixed(4) }; });
 
   // ------------------------------------------------------------ 1. pointer lock, mouse look, Esc
-  await page.bringToFront();
+  // (no bringToFront: test windows must never take focus from the user)
   await hookLook();
   const box = await page.locator('canvas').first().boundingBox();
   const cx = Math.round(box.x + box.width / 2), cy = Math.round(box.y + box.height / 2);
@@ -172,7 +172,7 @@ export default async function (ctx) {
   const base = page.url().split('?')[0];
   await page.goto(base + '?test&mute&mode=easy', { waitUntil: 'load' });
   await page.waitForFunction(() => window.__skate && window.__skate.ready, null, { timeout: 120000 });
-  await wait(600); await page.bringToFront();
+  await wait(600);
   const EZ = [-20, 0, 10.5, 90];
   await roll(...EZ, 0); await wait(1500);
   log('easy_idle_at_rest', { speed: (await st()).speed, want: '~0 (cruise waits for the first W / A / D)' });
