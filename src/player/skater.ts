@@ -5,6 +5,7 @@ import {
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { toonMaterial } from '../render/materials';
 import { clamp, lerp, Spring } from '../core/util';
+import { MOBILE } from '../core/device';
 import { KICKTURN_T, PUSH, dropRootAng, type BailKind, type PhysView } from './physics';
 import { BoardView, deckTopY } from './board';
 import { planRecovery, standable, findStandSpot, walkPath, groundAt, groundRoute, levelness, WALK_NY, STEP_UP, STEP_DOWN, type RecoveryPlan } from './recovery';
@@ -348,6 +349,7 @@ export class Skater {
     for (const e of EXPRS) {
       tl.load(`${BASE}textures/face_${e}.webp`, (t) => {
         t.flipY = false; t.colorSpace = SRGBColorSpace;
+        if (MOBILE && (t.image as HTMLImageElement).width > 512) { const c = document.createElement('canvas'); c.width = c.height = 512; c.getContext('2d')!.drawImage(t.image as HTMLImageElement, 0, 0, 512, 512); (t as { image: unknown }).image = c; t.needsUpdate = true; }
         const g = this.glbFace;
         if (g) { t.wrapS = g.wrapS; t.wrapT = g.wrapT; t.magFilter = g.magFilter; t.minFilter = g.minFilter; t.anisotropy = g.anisotropy; }
         this.faceTex[e] = t;

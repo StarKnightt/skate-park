@@ -12,6 +12,22 @@ const MOUSE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke
 const HINT_SECONDS = 6;
 const LOCK_HINT_SECONDS = 4;
 const MODE_LABEL_SECONDS = 2.5;
+/** touch stick: knob travel for full output (px), radial dead zone (fraction, ~8 px) */
+const STICK_R = 55, STICK_DZ = 0.15;
+/** OLLIE swipe on release: SWIPE_MIN..SWIPE_MAX px of travel over the last SWIPE_MS, the thumb still moving at the lift
+ *  (a move within SWIPE_STILL ms): a slide off the button that stops before the lift, or a rolling thumb, is a plain ollie */
+const SWIPE_MS = 250, SWIPE_MIN = 40, SWIPE_MAX = 140, SWIPE_STILL = 50;
+
+type Sample = { t: number; x: number; y: number };
+function swipeDir(trail: Sample[], e: PointerEvent): FlipDir | null {
+  const T = e.timeStamp, last = trail[trail.length - 1];
+  if (!last || T - last.t > SWIPE_STILL) return null;
+  let ref = trail[0];
+  for (const s of trail) if (s.t <= T - SWIPE_MS) ref = s;
+  const dx = e.clientX - ref.x, dy = e.clientY - ref.y, d = Math.hypot(dx, dy);
+  if (d < SWIPE_MIN || d > SWIPE_MAX) return null;
+  return Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 'left' : 'right') : dy > 0 ? 'down' : 'up';
+}
 
 // ---------------------------------------------------------------- control reference (help panel + pause menu)
 export type Device = 'kb' | 'pad' | 'touch';
@@ -161,7 +177,7 @@ export class Hud {
       <div class="hint"></div>
       <div class="modelabel show"></div>
       <div class="lockpill hide">${MOUSE}<span>Click to look around · Esc for menu</span></div>
-      <div class="titlecard"><div><div class="tt">Golden Hour Skatepark</div><div class="ts">press any key or tap to ride</div></div></div>
+      <div class="titlecard"><div><div class="tt">Golden Hour Skatepark</div><div class="ts">${touch ? 'Tap to ride' : 'press any key or tap to ride'}</div></div></div>
       <div class="topbar">
         <button class="pill tod" title="Time of day (T)">${SUN}<span>Golden hour</span></button>
         <button class="pill icon snd" title="Sound">${SOUND}</button>
@@ -189,6 +205,11 @@ export class Hud {
     this.root.querySelector('.hlp')!.addEventListener('click', (e) => { e.stopPropagation(); this.toggleHelp(); });
     this.root.querySelector('.menu')!.addEventListener('click', (e) => { e.stopPropagation(); this.onMenu(); });
     this.root.querySelector('.close')!.addEventListener('click', (e) => { e.stopPropagation(); this.toggleHelp(false); });
+    // touch: the open help covers the controls; a tap anywhere outside the panel and the pills closes it
+    this.root.addEventListener('click', (e) => {
+      const tg = e.target as Node;
+      if (this.touch && this.helpOpen && !this.helpEl.contains(tg) && !this.topEl.contains(tg)) this.toggleHelp(false);
+    });
     for (const b of this.root.querySelectorAll('button')) b.addEventListener('pointerdown', (e) => { e.stopPropagation(); this.wake(4000); this.dismissPrompt(); });
     // top-right pills: faint while playing, fully visible on pointer movement / hover / tap
     addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse') this.wake(2500); });
@@ -221,10 +242,11 @@ export class Hud {
   /** help overlay; closing it brings the short controls hint back for a few seconds */
   toggleHelp(v?: boolean) {
     const open = this.helpEl.classList.toggle('show', v);
+    this.root.classList.toggle('helpopen', open);
     if (open) this.hintEl.classList.add('hide'); else this.showHint();
   }
   /** close the help overlay without bringing the hint back (the pause menu opens over it) */
-  hideHelp() { this.helpEl.classList.remove('show'); }
+  hideHelp() { this.helpEl.classList.remove('show'); this.root.classList.remove('helpopen'); }
   get helpOpen() { return this.helpEl.classList.contains('show'); }
   setTimeLabel(name: string) {
     const night = name.startsWith('Blue');
@@ -233,6 +255,7 @@ export class Hud {
   setMuted(m: boolean) { this.soundBtn.innerHTML = m ? MUTE : SOUND; }
 
   trick(name: string, pts: number, bail = false) {
+    this.hintOff();
     this.nameEl.textContent = pts > 0 ? `${name}  +${pts}` : name;
     this.nameEl.classList.toggle('bail', bail);
     this.nameEl.classList.remove('show');
@@ -246,8 +269,15 @@ export class Hud {
     this.comboEl.classList.add('show');
     this.comboT = final ? 2.0 : 99;
   }
-  toast(msg: string, t = 3) { this.toastEl.textContent = msg; this.toastEl.classList.remove('hide'); this.toastT = t; this.promptOn = false; }
+  toast(msg: string, t = 3) { this.hintOff(); this.toastEl.textContent = msg; this.toastEl.classList.remove('hide'); this.toastT = t; this.promptOn = false; }
   private toastT = 0;
+  /** touch: the start hint shares the top of a small screen with the trick popup and toasts; they replace it at once */
+  private hintOff() {
+    if (!this.touch || this.hintT >= HINT_SECONDS) return;
+    this.hintT = HINT_SECONDS;
+    this.hintEl.classList.add('hide', 'now');
+    document.body.classList.add('hints-off');
+  }
   /** small "click for sound" prompt: a few seconds, or until the first key / click / tap */
   soundPrompt() { this.toast('Click or press a key for sound', 3.5); this.promptOn = true; }
   private dismissPrompt() {
@@ -285,12 +315,12 @@ export class Hud {
     if (this.autoState) {
       const on = this.autoState();
       if (this.autoWas !== null && on !== this.autoWas && !this.titled) {
-        this.toast(on ? `Auto-ride on · ${this.touch ? 'the stick' : 'any key'} takes over` : 'Auto-ride off', 2.2);
+        this.toast(on ? (this.touch ? 'Auto-ride on' : 'Auto-ride on · any key takes over') : 'Auto-ride off', 2.2);
       }
       this.autoWas = on;
     }
   }
-  showHint() { this.hintT = 0; this.hintEl.classList.remove('hide'); document.body.classList.remove('hints-off'); }
+  showHint() { this.hintT = 0; this.hintEl.classList.remove('hide', 'now'); document.body.classList.remove('hints-off'); }
 }
 
 /**
@@ -303,46 +333,76 @@ export class TouchControls {
   private raf = 0;
   constructor(private input: Input, private canvas: HTMLElement) {
     this.root.className = 'touch';
-    this.root.innerHTML = `<div class="stick"><div class="knob"></div></div>
+    this.root.innerHTML = `<div class="stickzone"></div><div class="stick"><div class="knob"></div></div>
       <div class="tbtn ollie">OLLIE</div><div class="tbtn grind">GRIND</div><div class="tbtn manual">MANUAL</div>
       <div class="tbtn flipbtn">TRICK</div><div class="tbtn autobtn"><i></i>AUTO</div>
       <button class="pausebtn" aria-label="Pause">${PAUSE_ICON}</button>
       <div class="swipehint">swipe OLLIE for flips</div>`;
     document.body.appendChild(this.root);
+    const zone = this.root.querySelector('.stickzone') as HTMLDivElement;
     const stick = this.root.querySelector('.stick') as HTMLDivElement;
     const knob = this.root.querySelector('.knob') as HTMLDivElement;
     const t = input.touch;
-    let sid = -1, cx = 0, cy = 0;
-    stick.addEventListener('pointerdown', (e) => {
-      sid = e.pointerId; stick.setPointerCapture(e.pointerId);
-      const r = stick.getBoundingClientRect(); cx = r.left + r.width / 2; cy = r.top + r.height / 2;
+    // drag on empty space (or a second finger in the stick zone) orbits the camera
+    const drags = new Map<number, { x: number; y: number }>();
+    const dragMove = (e: PointerEvent) => {
+      const d = drags.get(e.pointerId); if (!d) return;
+      input.addCameraDrag((e.clientX - d.x) * 1.2, (e.clientY - d.y) * 1.2); d.x = e.clientX; d.y = e.clientY;
+    };
+    const dragEnd = (e: PointerEvent) => drags.delete(e.pointerId);
+
+    // floating stick: input is relative to where the thumb lands in the zone; the base is drawn there, but never past
+    // its rest place toward the screen edges (safe areas) nor outside the zone
+    let sid = -1, cx = 0, cy = 0, bx = 0, by = 0;
+    zone.addEventListener('pointerdown', (e) => {
+      zone.setPointerCapture(e.pointerId);
+      if (sid >= 0) { drags.set(e.pointerId, { x: e.clientX, y: e.clientY }); return; }
+      sid = e.pointerId; cx = e.clientX; cy = e.clientY;
+      const z = zone.getBoundingClientRect(), s = stick.getBoundingClientRect(), r = s.width / 2;
+      const rx = s.left + r, ry = s.top + r;
+      bx = Math.max(rx, Math.min(z.right - r, cx)); by = Math.min(ry, Math.max(z.top + r, cy));
+      stick.style.transform = `translate(${bx - rx}px, ${by - ry}px)`;
+      stick.classList.add('active');
       move(e);
     });
     const move = (e: PointerEvent) => {
-      if (e.pointerId !== sid) return;
-      let dx = (e.clientX - cx) / 55, dy = (e.clientY - cy) / 55;
+      if (e.pointerId !== sid) { dragMove(e); return; }
+      let dx = (e.clientX - cx) / STICK_R, dy = (e.clientY - cy) / STICK_R;
       const l = Math.hypot(dx, dy); if (l > 1) { dx /= l; dy /= l; }
-      knob.style.transform = `translate(${dx * 40}px, ${dy * 40}px)`;
-      t.steer = Math.abs(dx) > 0.12 ? dx : 0;
+      const m = Math.min(1, l), k = m < STICK_DZ ? 0 : (m - STICK_DZ) / (1 - STICK_DZ) / m;
+      let kx = cx - bx + dx * 40, ky = cy - by + dy * 40;
+      const kl = Math.hypot(kx, ky); if (kl > 52) { kx *= 52 / kl; ky *= 52 / kl; }
+      knob.style.transform = `translate(${kx}px, ${ky}px)`;
+      t.steer = dx * k;
       t.push = dy < -0.4; t.brake = dy > 0.55;
     };
-    stick.addEventListener('pointermove', move);
-    const end = (e: PointerEvent) => { if (e.pointerId !== sid) return; sid = -1; knob.style.transform = ''; t.steer = 0; t.push = false; t.brake = false; };
-    stick.addEventListener('pointerup', end); stick.addEventListener('pointercancel', end);
+    zone.addEventListener('pointermove', move);
+    const end = (e: PointerEvent) => {
+      if (e.pointerId !== sid) { dragEnd(e); return; }
+      sid = -1; knob.style.transform = stick.style.transform = ''; stick.classList.remove('active');
+      t.steer = 0; t.push = false; t.brake = false;
+    };
+    zone.addEventListener('pointerup', end); zone.addEventListener('pointercancel', end); zone.addEventListener('lostpointercapture', end);
 
     const ollie = this.root.querySelector('.ollie') as HTMLDivElement;
-    let ox = 0, oy = 0, oid = -1;
+    let oid = -1;
+    const trail: Sample[] = [];
     ollie.addEventListener('pointerdown', (e) => {
-      oid = e.pointerId; ollie.setPointerCapture(e.pointerId); ox = e.clientX; oy = e.clientY;
+      oid = e.pointerId; ollie.setPointerCapture(e.pointerId);
+      trail.length = 0; trail.push({ t: e.timeStamp, x: e.clientX, y: e.clientY });
       t.ollieHeld = true; ollie.classList.add('active');
+    });
+    ollie.addEventListener('pointermove', (e) => {
+      if (e.pointerId !== oid) return;
+      trail.push({ t: e.timeStamp, x: e.clientX, y: e.clientY });
+      while (trail.length > 2 && e.timeStamp - trail[1].t > SWIPE_MS) trail.shift();
     });
     const oend = (e: PointerEvent) => {
       if (e.pointerId !== oid) return;
-      oid = -1;
-      const dx = e.clientX - ox, dy = e.clientY - oy;
-      let f: FlipDir | null = null;
-      if (Math.hypot(dx, dy) > 28) f = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 'left' : 'right') : (dy > 0 ? 'down' : 'up');
-      t.flip = f; t.ollieHeld = false; t.ollieReleased = true; ollie.classList.remove('active');
+      oid = -1; ollie.classList.remove('active');
+      // the system took the touch (notification shade, app switcher, a call): the crouch ends without a pop
+      if (e.type === 'pointercancel') { t.ollieHeld = false; t.flip = null; t.ollieCancel = true; return; }
+      t.flip = swipeDir(trail, e); t.ollieHeld = false; t.ollieReleased = true;
     };
     ollie.addEventListener('pointerup', oend); ollie.addEventListener('pointercancel', oend);
     const hold = (sel: string, key: 'grind' | 'manual') => {
@@ -364,15 +424,9 @@ export class TouchControls {
     this.autoEl = tap('.autobtn', 'autoPressed');
     // click (not pointerdown): the finger lifts before the menu opens under it
     this.root.querySelector('.pausebtn')!.addEventListener('click', () => { t.pausePressed = true; });
-    // drag on empty space orbits the camera
-    const drags = new Map<number, { x: number; y: number }>();
     canvas.addEventListener('pointerdown', (e) => { if (e.pointerType === 'touch') drags.set(e.pointerId, { x: e.clientX, y: e.clientY }); });
-    canvas.addEventListener('pointermove', (e) => {
-      const d = drags.get(e.pointerId); if (!d) return;
-      input.addCameraDrag((e.clientX - d.x) * 1.2, (e.clientY - d.y) * 1.2); d.x = e.clientX; d.y = e.clientY;
-    });
-    const dend = (e: PointerEvent) => drags.delete(e.pointerId);
-    canvas.addEventListener('pointerup', dend); canvas.addEventListener('pointercancel', dend);
+    canvas.addEventListener('pointermove', dragMove);
+    canvas.addEventListener('pointerup', dragEnd); canvas.addEventListener('pointercancel', dragEnd);
     this.layout(settings.controlMode);
     onSettings((s, key) => { if (key === 'controlMode') this.layout(s.controlMode); });
   }

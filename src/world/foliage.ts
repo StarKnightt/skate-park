@@ -3,6 +3,7 @@ import {
   SRGBColorSpace, Vector2, Vector3, Euler,
 } from 'three';
 import { toonMaterial } from '../render/materials';
+import { FOLIAGE_DENSITY } from '../render/quality';
 
 /** Leaf-cluster atlas cells (2 x 2): broad leaves, fine olive leaves, broad + pink blossom, fine + orange blossom. */
 export const enum Leaf { Broad = 0, Fine = 1, Pink = 2, Orange = 3 }
@@ -241,7 +242,10 @@ export class FoliageBuilder {
     const E = new Vector3(s.x, s.y + ry * (1 - (s.sink ?? 0.3)), s.z);
     const rm = (rx + ry + rz) / 3;
     const rc = Math.min(0.42 * rm, 0.3);
-    const n = Math.max(5, Math.min(28, Math.round(2.3 * (rm / rc) ** 2)));
+    const n0 = Math.max(5, Math.min(28, Math.round(2.3 * (rm / rc) ** 2)));
+    // lower tiers: fewer, larger clumps over the same leaf mass
+    const n = FOLIAGE_DENSITY < 1 ? Math.max(3, Math.round(n0 * FOLIAGE_DENSITY)) : n0;
+    const grow = n < n0 ? Math.sqrt(n0 / n) : 1;
     const tint = s.tint ?? [1, 1, 1];
     const ph = rnd() * 6.28;
     const golden = Math.PI * (3 - Math.sqrt(5));
@@ -261,7 +265,7 @@ export class FoliageBuilder {
       if (C.y < s.y + 0.02) C.y = s.y + 0.02 + rnd() * 0.04;
       const cell = s.cells[Math.floor(rnd() * s.cells.length)];
       const u0 = (cell % 2) * 0.5 + 0.004, v0 = Math.floor(cell / 2) * 0.5 + 0.004, u1 = u0 + 0.492, v1 = v0 + 0.492;
-      const hs = rc * (1.18 + rnd() * 0.3) * (k < n ? 1 : 1.2);
+      const hs = rc * (1.18 + rnd() * 0.3) * (k < n ? 1 : 1.2) * grow;
       _q.setFromEuler(_e.set(rnd() * 6.28, rnd() * 6.28, rnd() * 6.28));
       const depth = Math.min(1, f / 0.75);
       const cv = (0.94 + rnd() * 0.12) * (0.5 + 0.5 * depth);

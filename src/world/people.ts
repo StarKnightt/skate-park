@@ -1,11 +1,35 @@
 import {
-  AnimationAction, AnimationClip, AnimationMixer, Box3, BoxGeometry, BufferAttribute, BufferGeometry, CanvasTexture, Color, Group, LOD,
-  Mesh, MeshLambertMaterial, Object3D, SkinnedMesh, Sphere, SRGBColorSpace, Texture, Vector3,
+  AnimationAction, AnimationClip, AnimationMixer, BackSide, Box3, BoxGeometry, BufferAttribute, BufferGeometry, CanvasTexture, Color, DoubleSide,
+  FrontSide, Group, LOD, Mesh, MeshDepthMaterial, MeshLambertMaterial, Object3D, SkinnedMesh, Sphere, SRGBColorSpace, Texture, Vector3,
+  type Material,
 } from 'three';
-import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import type { GLTF, GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { clone as skeletonClone } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { toonMaterial } from '../render/materials';
 import { boardProp } from '../player/board';
+
+/** baked distance levels: index lists[level - 1][part] for the part sizes they were baked from */
+interface LodLists { parts: { vertices: number; indices: number }[]; lists: Uint16Array[][] }
+/** what the crowd is built from: the skater's own mesh (cloned before he is dressed and posed), the crowd's clips and the
+ *  distance levels baked offline (tools/assets/bake_people_lods.mjs) */
+export interface CrowdSource { scene: Object3D; animations: AnimationClip[]; lods: LodLists | null }
+
+/** people.glb carries only the crowd's clips and baked levels. Call at t=0, before anything else awaits the skater's GLB:
+ *  the clone is taken from the untouched, unposed GLB scene. The fetch waits for `start` (the game: playable), so the
+ *  crowd never takes bandwidth or CPU from the start. */
+export function loadCrowd(loader: GLTFLoader, url: string, skater: Promise<GLTF>, start: Promise<void>): Promise<CrowdSource> {
+  const scene = skater.then((g) => skeletonClone(g.scene));
+  return Promise.all([scene, Promise.all([skater, start]).then(() => loader.loadAsync(url))]).then(async ([scene, gltf]) => {
+    const meta = gltf.userData?.lods as { parts: LodLists['parts']; levels: number[][] } | undefined;
+    const lists = meta && await Promise.all(meta.levels.map((lv) => Promise.all(lv.map(async (a) =>
+      (await gltf.parser.getDependency('accessor', a) as BufferAttribute).array as Uint16Array))));
+    return { scene, animations: gltf.animations, lods: meta && lists ? { parts: meta.parts, lists } : null };
+  });
+}
+
+/** crowd cost: people shown and animated (nearest the park first), LOD switch distance factor, animation rate (Hz, 0 =
+ *  every frame), sun / lamp shadow casting */
+export interface PeopleProfile { count: number; lodScale: number; mixerHz: number; castShadow: boolean }
 
 /** Part colours of our skater pipeline (tools/character parts, sRGB) used to recognise each part in people.glb. */
 const PARTS: Record<string, string> = {
@@ -152,7 +176,7 @@ function crowdFace(src: Texture): Texture | null {
 }
 
 /** one compact geometry from simplified index lists of several part meshes (same skin and bind space) */
-function compactMerge(parts: [BufferGeometry, Uint32Array][]): BufferGeometry {
+function compactMerge(parts: [BufferGeometry, Uint16Array][]): BufferGeometry {
   const names = ['position', 'normal', 'color', 'skinIndex', 'skinWeight'];
   const remap = parts.map(([g]) => new Int32Array(g.getAttribute('position').count).fill(-1));
   let nv = 0;
@@ -186,57 +210,89 @@ function poseSphere(sm: SkinnedMesh): Sphere {
   return s;
 }
 
-interface Person { holder: Group; mixer: AnimationMixer; spot: Spot; s: number; dir: 1 | -1; turn: number; len: number; cum: number[] }
+interface Person {
+  holder: Group; mixer: AnimationMixer; spot: Spot; s: number; dir: 1 | -1; turn: number; len: number; cum: number[];
+  board: Object3D | null; lod: LOD | null; casters: Mesh[]; rank: number;
+}
 
-/** Small, simple, gently moving people: clones of our own rig (people.glb), recoloured per instance. */
+/** Small, simple, gently moving people: clones of our own rig (the skater's mesh, people.glb clips), recoloured per instance. */
 export class People {
   group = new Group();
+  /** the built people; joins `group` on show(), once the game has compiled its shaders */
+  crowd = new Group();
+  /** resolves when the crowd is built (false: no people) */
+  loaded: Promise<boolean> = Promise.resolve(false);
   private items: Person[] = [];
   private acc = 0;
   private refs: Color[] = [];
   private refNames: string[] = [];
   private faceMap: Texture | null = null;
+  private profile: PeopleProfile = { count: Infinity, lodScale: 1, mixerHz: 30, castShadow: true };
 
-  constructor(private ground: (x: number, z: number) => number) { this.group.name = 'people'; }
+  constructor(private ground: (x: number, z: number) => number) { this.group.name = 'people'; this.crowd.name = 'crowd'; }
 
-  async load(url: string, loader: { loadAsync(u: string): Promise<GLTF> }) {
-    let gltf: GLTF;
-    try { gltf = await loader.loadAsync(url); } catch { return false; }
-    if (!gltf.animations?.length) return false;
-    this.analyse(gltf.scene);
-    gltf.scene.traverse((o) => {
+  load(src: Promise<CrowdSource>) { return (this.loaded = this.build(src)); }
+
+  get shown() { return this.crowd.parent === this.group; }
+  show() { if (!this.shown) this.group.add(this.crowd); }
+
+  setProfile(p: Partial<PeopleProfile>) { Object.assign(this.profile, p); this.applyProfile(); }
+
+  /** stand-ins drawn with three's shadow depth material the way the sun / lamp passes draw the crowd (same program
+   *  variants: skinning, side, map), so those programs can be compiled before the crowd is shown */
+  shadowStandIns() {
+    const g = new Group(), seen = new Set<string>(), flip = { [FrontSide]: BackSide, [BackSide]: FrontSide, [DoubleSide]: DoubleSide };
+    this.crowd.traverse((o) => {
+      const m = o as Mesh, mat = m.material as Material & { map?: Texture | null };
+      if (!m.isMesh || Array.isArray(mat)) return;
+      const skinned = (m as SkinnedMesh).isSkinnedMesh === true, side = mat.shadowSide ?? flip[mat.side];
+      const key = `${skinned}|${side}|${!!mat.map}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      const d = new MeshDepthMaterial({ side, map: mat.map ?? null });
+      if (!skinned) { g.add(new Mesh(m.geometry, d)); return; }
+      const s = new SkinnedMesh(m.geometry, d);
+      s.bind((m as SkinnedMesh).skeleton, (m as SkinnedMesh).bindMatrix);
+      g.add(s);
+    });
+    return g;
+  }
+
+  /** textures the crowd's first draw would upload */
+  textures() {
+    const t = new Set<Texture>();
+    this.crowd.traverse((o) => { const map = ((o as Mesh).material as MeshLambertMaterial | undefined)?.map; if (map) t.add(map); });
+    return [...t];
+  }
+
+  private async build(src: Promise<CrowdSource>) {
+    let s: CrowdSource;
+    try { s = await src; } catch (e) { console.warn('people: not loaded', e); return false; }
+    if (!s.animations?.length) return false;
+    this.analyse(s.scene);
+    s.scene.traverse((o) => {
       const map = ((o as SkinnedMesh).material as MeshLambertMaterial | undefined)?.map;
       if (map && !this.faceMap) {
         try { this.faceMap = crowdFace(map); } catch (e) { console.warn('people: crowd face skipped', e); }
         if (!this.faceMap) { map.anisotropy = 8; this.faceMap = map; }
       }
     });
-    try { await this.buildLods(gltf.scene); } catch (e) { console.warn('people: distance levels skipped', e); }
-    this.setup(gltf);
+    try { this.buildLods(s.scene, s.lods); } catch (e) { console.warn('people: distance levels skipped', e); }
+    this.setup(s);
+    this.applyProfile();
     return true;
   }
 
   /** Simplified distance levels (index-only over the shared vertex buffers; far levels are one merged draw). */
-  private async buildLods(scene: Object3D) {
-    const { MeshoptSimplifier: S } = await import('three/examples/jsm/libs/meshopt_simplifier.module.js');
-    await S.ready;
+  private buildLods(scene: Object3D, baked: LodLists | null) {
     const parts: SkinnedMesh[] = [];
     scene.traverse((o) => { if ((o as SkinnedMesh).isSkinnedMesh) parts.push(o as SkinnedMesh); });
-    if (!parts.length) return;
+    if (!parts.length || !baked) return;
+    if (baked.parts.length !== parts.length || baked.lists.length !== LODS.length - 1
+      || parts.some((m, k) => m.geometry.getAttribute('position').count !== baked.parts[k].vertices || m.geometry.index!.count !== baked.parts[k].indices)) {
+      throw new Error('baked levels were made for another mesh (re-run tools/assets/slim_glb.sh)');
+    }
     const body = parts.find((m) => !(m.material as MeshLambertMaterial).map) ?? parts[0];
-    const src = parts.map((m) => {
-      const g = m.geometry, p = g.getAttribute('position'), nm = g.getAttribute('normal'), c = g.getAttribute('color'), uv = g.getAttribute('uv');
-      // the textured part (face) also carries its UVs into the error metric, so the painted features stay where they are
-      const face = !!(m.material as MeshLambertMaterial).map && !!uv;
-      const n = p.count, pos = new Float32Array(n * 3), att = new Float32Array(n * 8);
-      for (let i = 0; i < n; i++) {
-        pos[i * 3] = p.getX(i); pos[i * 3 + 1] = p.getY(i); pos[i * 3 + 2] = p.getZ(i);
-        if (c) { att[i * 8] = c.getX(i); att[i * 8 + 1] = c.getY(i); att[i * 8 + 2] = c.getZ(i); }
-        att[i * 8 + 3] = nm.getX(i); att[i * 8 + 4] = nm.getY(i); att[i * 8 + 5] = nm.getZ(i);
-        if (face) { att[i * 8 + 6] = uv.getX(i); att[i * 8 + 7] = uv.getY(i); }
-      }
-      return { m, pos, att, face, idx: new Uint32Array(g.index!.array) };
-    });
     const mesh = (g: BufferGeometry, from: SkinnedMesh, name: string) => {
       const sm = new SkinnedMesh(g, from.material);
       sm.name = name;
@@ -246,25 +302,32 @@ export class People {
     };
     const levels: Object3D[][] = [parts];
     for (let l = 1; l < LODS.length; l++) {
-      const { keep, err, face, merge } = LODS[l];
-      // part colour keeps the part borders, the normal keeps the shading, the UVs keep the face drawing in place
-      const lists = src.map((s) => S.simplifyWithAttributes(s.idx, s.pos, 3, s.att, 8, [1, 1, 1, 0.35, 0.35, 0.35, s.face ? 3 : 0, s.face ? 3 : 0], null,
-        Math.floor((s.idx.length * (s.face ? face : keep)) / 3) * 3, err, [])[0]);
-      if (merge) levels.push([mesh(compactMerge(src.map((s, k) => [s.m.geometry, lists[k]])), body, `${body.name}_lod${l}`)]);
+      const lists = baked.lists[l - 1];
+      if (LODS[l].merge) levels.push([mesh(compactMerge(parts.map((m, k) => [m.geometry, lists[k]])), body, `${body.name}_lod${l}`)]);
       else {
-        levels.push(src.map((s, k) => {
+        levels.push(parts.map((m, k) => {
           const g = new BufferGeometry();
-          for (const [name, a] of Object.entries(s.m.geometry.attributes)) g.setAttribute(name, a);
-          g.setIndex(new BufferAttribute(new Uint16Array(lists[k]), 1));
-          return mesh(g, s.m, `${s.m.name}_lod${l}`);
+          for (const [name, a] of Object.entries(m.geometry.attributes)) g.setAttribute(name, a);
+          g.setIndex(new BufferAttribute(lists[k], 1));
+          return mesh(g, m, `${m.name}_lod${l}`);
         }));
       }
-      await new Promise((r) => setTimeout(r, 0));
     }
     const parent = parts[0].parent!, lod = new LOD();
     lod.name = 'personLod';
     levels.forEach((objs, l) => { const grp = new Group(); objs.forEach((o) => grp.add(o)); lod.addLevel(grp, LODS[l].d, 0.1); });
     parent.add(lod);
+  }
+
+  private applyProfile() {
+    const { count, lodScale, castShadow } = this.profile;
+    for (const p of this.items) {
+      const on = p.rank < count;
+      p.holder.visible = on;
+      if (p.board) p.board.visible = on;
+      p.lod?.levels.forEach((lv, l) => { lv.distance = LODS[l].d * lodScale; });
+      for (const m of p.casters) m.castShadow = castShadow;
+    }
   }
 
   private analyse(scene: Object3D) {
@@ -373,12 +436,14 @@ export class People {
     m.customProgramCacheKey = () => `${key}-ppl${N}`;
   }
 
-  private setup(gltf: GLTF) {
+  private setup(src: CrowdSource) {
     const clips = new Map<string, AnimationClip>();
-    for (const c of gltf.animations) clips.set(c.name, c);
-    const fallback = clips.get('stand_idle') ?? gltf.animations[0];
+    for (const c of src.animations) clips.set(c.name, c);
+    const fallback = clips.get('stand_idle') ?? src.animations[0];
+    // with fewer people (setProfile count) the ones nearest the park stay
+    const near = PEOPLE_SPOTS.map((s, i) => [Math.hypot(s.at[0], s.at[2]), i]).sort((a, b) => a[0] - b[0]).map(([, i]) => i);
     PEOPLE_SPOTS.forEach((spot, i) => {
-      const model = skeletonClone(gltf.scene);
+      const model = skeletonClone(src.scene);
       const look = this.look(i + 3, spot.look);
       this.materialsFor(model, look);
       const holder = new Group();
@@ -423,17 +488,25 @@ export class People {
           hand.add(ph);
         }
       }
-      this.group.add(holder);
+      this.crowd.add(holder);
+      let board: Object3D | null = null;
       if (spot.board) {
         const bm = boardProp();
         bm.position.set(...spot.board.at);
         bm.rotation.y = spot.board.yaw;
         if (spot.board.kind === 'lean') { bm.rotation.order = 'YXZ'; bm.rotation.x = -1.32; bm.position.y += 0.31; }
-        this.group.add(bm);
+        this.crowd.add(bm);
+        board = bm;
       }
+      const casters: Mesh[] = [];
+      for (const o of [holder, board]) o?.traverse((m) => { if ((m as Mesh).isMesh && m.castShadow) casters.push(m as Mesh); });
+      const lod = (model.getObjectByName('personLod') as LOD | undefined) ?? null;
       const cum = [0];
       if (spot.path) for (let k = 1; k < spot.path.length; k++) cum.push(cum[k - 1] + Math.hypot(spot.path[k][0] - spot.path[k - 1][0], spot.path[k][1] - spot.path[k - 1][1]));
-      this.items.push({ holder, mixer, spot, s: spot.path ? (i * 7.3) % cum[cum.length - 1] : 0, dir: i % 2 ? -1 : 1, turn: 0, len: cum[cum.length - 1], cum });
+      this.items.push({
+        holder, mixer, spot, s: spot.path ? (i * 7.3) % cum[cum.length - 1] : 0, dir: i % 2 ? -1 : 1, turn: 0, len: cum[cum.length - 1], cum,
+        board, lod, casters, rank: near.indexOf(i),
+      });
     });
   }
 
@@ -441,7 +514,7 @@ export class People {
     if (!this.items.length) return;
     for (const p of this.items) {
       const path = p.spot.path;
-      if (!path) continue;
+      if (!path || !p.holder.visible) continue;
       if (p.turn > 0) {
         // turning round at the end of the walk
         p.turn = Math.max(0, p.turn - dt);
@@ -459,8 +532,9 @@ export class People {
       if (p.turn === 0) p.holder.rotation.y = Math.atan2((b[0] - a[0]) * p.dir, (b[1] - a[1]) * p.dir);
     }
     this.acc += dt;
-    if (this.acc < 1 / 30 - 1e-4) return;
-    for (const p of this.items) p.mixer.update(this.acc);
+    const hz = this.profile.mixerHz;
+    if (hz > 0 && this.acc < 1 / hz - 1e-4) return;
+    for (const p of this.items) if (p.holder.visible) p.mixer.update(this.acc);
     this.acc = 0;
   }
 }

@@ -45,16 +45,32 @@ export class Post {
   tone: ToneMappingEffect;
   fxaa: FXAAEffect;
   pass: EffectPass;
-  constructor(public renderer: WebGLRenderer, scene: Scene, camera: Camera, msaa: number) {
+  bloomOn: boolean;
+  fxaaOn: boolean;
+  constructor(public renderer: WebGLRenderer, scene: Scene, private camera: Camera, msaa: number, bloom = true, fxaa = !msaa) {
     this.composer = new EffectComposer(renderer, { frameBufferType: HalfFloatType, multisampling: msaa });
     this.composer.addPass(new RenderPass(scene, camera));
     this.bloom = new BloomEffect({ mipmapBlur: true, luminanceThreshold: 0.78, luminanceSmoothing: 0.22, intensity: 0.55, radius: 0.72 });
     this.tone = new ToneMappingEffect({ mode: ToneMappingMode.NEUTRAL });
     this.grade = new GradeEffect();
     this.fxaa = new FXAAEffect();
-    // FXAA has to come first in the merged pass: it reads its neighbours from the raw input buffer, so after the grade it
-    // would mix graded and raw values and paste raw (ungraded) pixels wherever their difference crossed its threshold
-    this.pass = new EffectPass(camera, ...(msaa ? [] : [this.fxaa]), this.bloom, this.tone, this.grade);
+    this.bloomOn = bloom; this.fxaaOn = fxaa;
+    this.pass = this.effectPass();
+    this.composer.addPass(this.pass);
+  }
+  // FXAA has to come first in the merged pass: it reads its neighbours from the raw input buffer, so after the grade it
+  // would mix graded and raw values and paste raw (ungraded) pixels wherever their difference crossed its threshold
+  private effectPass() {
+    return new EffectPass(this.camera, ...(this.fxaaOn ? [this.fxaa] : []), ...(this.bloomOn ? [this.bloom] : []), this.tone, this.grade);
+  }
+  /** bloom off removes it from the merged pass (intensity 0 still runs its luminance and mip blur passes) */
+  configure(bloom: boolean, fxaa: boolean, msaa: number) {
+    this.composer.multisampling = msaa;
+    if (bloom === this.bloomOn && fxaa === this.fxaaOn) return;
+    this.composer.removePass(this.pass);
+    this.pass.dispose();
+    this.bloomOn = bloom; this.fxaaOn = fxaa;
+    this.pass = this.effectPass();
     this.composer.addPass(this.pass);
   }
   setSize(w: number, h: number) { this.composer.setSize(w, h); }

@@ -4,12 +4,10 @@ import {
   SphereGeometry, SRGBColorSpace, Vector2, Vector3, Euler,
 } from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { shared, toonMaterial } from '../render/materials';
 import { rng } from '../core/util';
 import { BOARDWALK_BENCH_X, BOARDWALK_LAMP_X, EDGE_PALMS, KIOSK } from './park';
-import { People } from './people';
+import { People, type CrowdSource } from './people';
 import { FoliageBuilder, foliageMaterial, Leaf } from './foliage';
 
 const R = rng(1234);
@@ -104,7 +102,7 @@ const HOUSES: HouseSpec[] = [
   { x: -64, z: 66, ry: 0.12, s: 1.0, style: 0 }, { x: 68, z: 63, ry: -0.08, s: 1.05, style: 2 },
 ];
 
-export function buildScenery(lampPositions: Vector3[]): Scenery {
+export function buildScenery(lampPositions: Vector3[], crowd?: Promise<CrowdSource>): Scenery {
   const group = new Group();
   const vc = (o: Partial<Parameters<typeof toonMaterial>[0]> = {}) => toonMaterial({ vertexColors: true, bands: 0.35, wrap: 0.4, rim: 0.35, ...o });
 
@@ -341,6 +339,7 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
   const lighthouseLamp = toonMaterial({ color: 0xfff0c8, emissive: 0xffe6a8, emissiveIntensity: 0.3, lamps: false, name: 'lhLamp' });
   const lamp = new Mesh(new CylinderGeometry(1.5, 1.5, 2.4, 14), lighthouseLamp);
   lamp.position.set(LH[0], LH[1] + 7 * 3.0 + 2.1, LH[2]);
+  lamp.userData.dynamic = true;
   group.add(lamp);
 
   // ------------------------------------------------------------------ lifeguard tower, umbrellas, towels, beach chair, surfboards
@@ -481,10 +480,10 @@ export function buildScenery(lampPositions: Vector3[]): Scenery {
   }
   const spillC = new Color('#ffc58c');
 
-  // ------------------------------------------------------------------ people (people.glb from the character pipeline; optional)
+  // ------------------------------------------------------------------ people (crowd loaded by the game, loadCrowd; optional)
   const people = new People(terrainHeight);
   group.add(people.group);
-  void people.load(import.meta.env.BASE_URL + 'models/people.glb', new GLTFLoader().setMeshoptDecoder(MeshoptDecoder));
+  if (crowd) void people.load(crowd);
 
   return {
     group, windows, lampHeads, lampLights, lighthouseLamp, people,

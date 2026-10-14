@@ -2,6 +2,7 @@ import type { Game } from '../game';
 import { settings, setSetting, onSettings, type ControlMode, type QualitySetting } from '../core/settings';
 import { PRESETS } from '../render/timeOfDay';
 import { TEST } from '../core/util';
+import { IOS, standalone } from '../core/device';
 import { controlsTable, MODE_DESC, MODE_NAMES, type Device } from './hud';
 
 const MODES: ControlMode[] = ['easy', 'auto', 'pro'];
@@ -38,12 +39,12 @@ export function installPauseMenu(g: Game) {
         ${row('Time of day', seg('tod', PRESETS.map((p, i) => {
           const [w0, ...rest] = p.name.replace(/^Bright n/, 'N').split(' ');
           return [String(i), `<i style="background:${TOD_DOT[i] ?? '#fff'}"></i>${w0}${rest.length ? `<span class="lw"> ${rest.join(' ')}</span>` : ''}`];
-        })), ' wide')}
-        ${row('Music', slider('musicVol', 0, 100, 5))}
-        ${row('Sound', slider('sfxVol', 0, 100, 5))}
+        })), ' wide tod')}
+        ${row('Music', slider('musicVol', 0, 100, 5), ' mus')}
+        ${row('Sound', slider('sfxVol', 0, 100, 5), ' snd')}
         ${row('Mouse sensitivity', slider('mouseSens', 20, 300, 5), ' mouse')}
-        ${row('Invert Y', toggle('invertY'))}
-        ${row('Graphics', seg('quality', QUALITY.map(([v, l]) => [String(v), l])))}
+        ${row('Invert Y', toggle('invertY'), ' inv')}
+        ${row('Graphics', seg('quality', QUALITY.map(([v, l]) => [String(v), l])), ' gfx')}
         ${row('Fullscreen', toggle('fullscreen'), ' fs')}
       </div>
       <div class="foot"></div>
@@ -62,7 +63,12 @@ export function installPauseMenu(g: Game) {
   const descEl = el.querySelector('.desc') as HTMLParagraphElement;
   const chipEl = el.querySelector('.chip') as HTMLSpanElement;
   const ctab = el.querySelector('.ctab') as HTMLDivElement;
-  if (!document.fullscreenEnabled) el.querySelector('.row.fs')?.remove();
+  if (!document.fullscreenEnabled) {
+    // iPhone Safari has no element fullscreen: a home-screen web app runs without the browser bars
+    const fs = el.querySelector('.row.fs');
+    if (fs && IOS && !standalone()) fs.outerHTML = '<p class="desc fstip">Fullscreen: Share → Add to Home Screen, then play from the icon.</p>';
+    else fs?.remove();
+  }
 
   let open = false, page: 'main' | 'ctl' = 'main';
   let relock = false, relocking = false, lastUnlock = -1e9, viaPad = false, lastPointer = false;
@@ -171,6 +177,8 @@ export function installPauseMenu(g: Game) {
   }
 
   el.addEventListener('click', (e) => {
+    // touch: a tap on the backdrop resumes (desktop clicks outside the panel do nothing, as before)
+    if (e.target === el) { if (el.classList.contains('touchui')) resume(true); return; }
     const b = (e.target as HTMLElement).closest('button');
     if (!b || !el.contains(b)) return;
     const act = b.dataset.act;
@@ -250,7 +258,8 @@ export function installPauseMenu(g: Game) {
     if (!open || e.code === 'Escape') return;
     // menu keys never reach the game (no ollie / flip edges waiting on resume); key-ups still do, so nothing sticks
     e.stopImmediatePropagation();
-    if (g.audio.ctx?.state === 'suspended') g.audio.ctx.resume();
+    // the platform's gesture listener never sees these keys: unlock / resume the audio here
+    g.unlockAudio(); g.audio.gesture();
     const c = e.code;
     const dir = c === 'KeyW' ? -2 : c === 'KeyS' ? 2 : c === 'KeyA' ? -1 : c === 'KeyD' ? 1 : 0;
     const act = c === 'Space' || c === 'Enter' || c === 'NumpadEnter';

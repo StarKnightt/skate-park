@@ -311,10 +311,10 @@ export class CameraRig {
     // smoothed speed: FOV and distance must not pump with each push
     if (snap) this.spS.set(s.speed); else this.spS.update(s.speed, dt);
     const sp = clamp(this.spS.x / 10, 0, 1);
-    this.fovS.update((portrait ? 64 : 56) + sp * 8, dt);
+    this.fovS.update((portrait ? 74 : 56) + sp * 8, dt);
     if (Math.abs(cam.fov - this.fovS.x) > 0.01) { cam.fov = this.fovS.x; cam.updateProjectionMatrix(); }
     const tH = Math.tan((cam.fov * Math.PI) / 360);
-    const sizeFrac = portrait ? 0.25 - 0.03 * sp : 0.37 - 0.05 * sp;
+    const sizeFrac = portrait ? 0.22 - 0.03 * sp : 0.37 - 0.05 * sp;
     // vert / back-and-forth: closer, the tucked skater in the air should still fill about a third of the frame
     let wantD = SKATER_H / (2 * tH * sizeFrac) * (1 - 0.15 * this.wPend) + (air && !s.vert ? 0.25 : 0) + (down ? 0.4 : 0);
     if (orbit) wantD = orbit.dist;

@@ -46,6 +46,8 @@ export class HeroShadow {
   /** penumbra width per metre between caster and receiver (time of day) */
   k = 0.0176;
   boardIn = true;
+  /** the skater and board live in this nested scene (at the origin, inside the main scene): the map pass draws only it */
+  root = new Scene();
   private sunCams: Camera[] = [];
   private boardMeshes: Object3D[] = [];
   private clear = new Color();
@@ -54,6 +56,9 @@ export class HeroShadow {
   constructor() {
     this.cam.layers.set(HERO_LAYER);
     shared.uHeroMat.value = this.M;
+    this.root.overrideMaterial = this.mat;
+    this.root.matrixAutoUpdate = false;
+    this.root.matrixWorldAutoUpdate = false;
   }
 
   get active() { return this.size > 0 && this.rt !== null; }
@@ -88,10 +93,13 @@ export class HeroShadow {
     skater.traverse((o) => { if ((o as Mesh).isMesh) { o.layers.enable(HERO_LAYER); (o as any).onBeforeShadow = skipSun; } });
     board.traverse((o) => { if ((o as Mesh).isMesh) { this.boardMeshes.push(o); (o as any).onBeforeShadow = skipBoard; } });
     for (const l of lights) l.layers.enable(HERO_LAYER);
+    skater.parent?.add(this.root);
+    this.root.add(skater, board);
   }
 
-  /** render the map around the hips (towards the sun direction in shared.uSunDir) and publish it to the toon materials */
-  update(renderer: WebGLRenderer, scene: Scene, hips: Vector3, board: Object3D) {
+  /** render the map around the hips (towards the sun direction in shared.uSunDir) and publish it to the toon materials;
+   *  world matrices must be current (the pass does not update them) */
+  update(renderer: WebGLRenderer, _scene: Scene, hips: Vector3, board: Object3D) {
     const info = shared.uHeroInfo.value;
     if (!this.active) { info.z = 0; return; }
     const L = _l.copy(shared.uSunDir.value).normalize();
@@ -131,15 +139,15 @@ export class HeroShadow {
     // render the casters with the depth material only, no background, no shadow maps
     const prevT = renderer.getRenderTarget(), prevA = renderer.getClearAlpha();
     renderer.getClearColor(this.clear);
-    const bg = scene.background, ov = scene.overrideMaterial, au = renderer.shadowMap.autoUpdate;
-    scene.background = null; scene.overrideMaterial = this.mat; renderer.shadowMap.autoUpdate = false;
+    const au = renderer.shadowMap.autoUpdate;
+    renderer.shadowMap.autoUpdate = false;
     renderer.setRenderTarget(this.rt);
     renderer.setClearColor(0x000000, 0);
     renderer.clear(true, true, false);
-    renderer.render(scene, cam);
+    renderer.render(this.root, cam);
     renderer.setRenderTarget(prevT);
     renderer.setClearColor(this.clear, prevA);
-    scene.background = bg; scene.overrideMaterial = ov; renderer.shadowMap.autoUpdate = au;
+    renderer.shadowMap.autoUpdate = au;
     info.set(ts, this.k, this.size, R);
   }
 }

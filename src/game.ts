@@ -1,7 +1,7 @@
 import {
   Color, Fog, Group, HemisphereLight, Mesh, PCFShadowMap, PerspectiveCamera, PlaneGeometry, Quaternion, Scene,
   SRGBColorSpace, Texture, TextureLoader, Vector3, WebGLRenderer, NoToneMapping, MathUtils, DoubleSide, SpotLight,
-  type LOD, type WebGLRenderTarget,
+  type LOD, type WebGLRenderTarget, type Object3D,
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
@@ -10,11 +10,14 @@ import { buildPark, meshFromBuilder, mergeTubes } from './world/park';
 import { buildParkDetail } from './world/parkDetail';
 import { CollisionWorld } from './world/collision';
 import { buildScenery, Scenery } from './world/scenery';
-import { loadSharedTextures, shared, toonMaterial, LAMP } from './render/materials';
+import { loadCrowd } from './world/people';
+import { loadSharedTextures, shared, toonMaterial, LAMP, MAX_LAMPS, setToonMobile } from './render/materials';
 import { Sky, CloudLayer, Ocean, glowPoints } from './render/environment';
 import { TimeOfDay, PRESETS, EnvState } from './render/timeOfDay';
 import { Post } from './render/post';
 import { HeroShadow } from './render/heroShadow';
+import { TIERS, ladder, startQuality, percentile, type Tier } from './render/quality';
+import { MOBILE } from './core/device';
 import { SkatePhysics, SkateInput, emptyInput, PhysView } from './player/physics';
 import { BoardView } from './player/board';
 import { Skater } from './player/skater';
@@ -103,9 +106,17 @@ export class Game {
   private pausedDrawT = 0;
 
   constructor(private container: HTMLElement) {
-    const mobile = matchMedia('(pointer: coarse)').matches || /Mobi|Android/i.test(navigator.userAgent);
-    const qs = settings.quality;
-    this.quality = params.has('quality') ? Number(params.get('quality')) : qs !== 'auto' ? qs : mobile ? 1 : 2;
+    this.quality = startQuality();
+    this.tierP = TIERS[this.quality];
+    this.renderScale = Math.min(devicePixelRatio, this.tierP.dprMax);
+    // shader paths before anything is built: no recompiles at load
+    setToonMobile(this.tierP.mobileShader);
+    this.sky.setNoise(this.tierP.noiseOct);
+    this.ocean.setNoise(this.tierP.noiseOct, this.tierP.oceanWaves);
+    shared.uLampCount.value = this.tierP.lampPools;
+    // adaptive quality ignores the first seconds after the start, a resume and a return to the tab
+    this.pauseListeners.push((p) => { if (!p) this.adaptHold = 5; });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) this.adaptHold = 5; });
     this.renderer = new WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false });
     this.renderer.outputColorSpace = SRGBColorSpace;
     this.renderer.toneMapping = NoToneMapping;
@@ -118,19 +129,30 @@ export class Game {
   async start() {
     const loading = document.querySelector('.loading') as HTMLDivElement | null;
     const bar = loading?.querySelector('.bar i') as HTMLElement | null;
-    const prog = (p: number) => { if (bar) bar.style.width = `${Math.round(p * 100)}%`; };
+    const label = loading?.querySelector('.s') as HTMLElement | null;
+    const prog = (p: number, stage?: string) => { if (bar) bar.style.width = `${Math.round(p * 100)}%`; if (stage && label) label.textContent = stage; };
+    // let the bar and label paint before a long synchronous step (a hidden tab gets no frames: 50 ms at most)
+    const painted = () => new Promise<void>((res) => { requestAnimationFrame(() => setTimeout(res, 0)); setTimeout(res, 50); });
     prog(0.05);
     loadSharedTextures(BASE);
     const tl = new TextureLoader();
     const tex = (n: string) => new Promise<Texture>((res) => tl.load(BASE + 'textures/' + n, (t) => { t.colorSpace = SRGBColorSpace; t.anisotropy = 4; res(t); }));
     const gltfLoader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
+    // the skater's bytes drive 5-70 % (no usable length, e.g. a compressed transfer: eases toward 70 %)
+    const bytes = (e: ProgressEvent) => prog(0.05 + 0.65 * (e.lengthComputable && e.loaded <= e.total ? e.loaded / e.total : 1 - Math.exp(-e.loaded / 6e5)));
+    const skaterGltf = gltfLoader.loadAsync(BASE + 'models/skater.glb', bytes);
+    // the people never hold up the start: fetched and built once playable, shown by warmPeople() once compiled
+    let peopleGo!: () => void;
+    const afterReady = new Promise<void>((res) => { peopleGo = res; });
+    const crowd = loadCrowd(gltfLoader, BASE + 'models/people.glb', skaterGltf, afterReady);
     const [gltf, deckTex, cloudTex, cloudRects, murals] = await Promise.all([
-      gltfLoader.loadAsync(BASE + 'models/skater.glb').then((g) => { prog(0.7); return g; }),
+      skaterGltf.then((g) => { prog(0.7); return g; }),
       tex('deck_graphic.webp'), tex('clouds.webp'),
       fetch(BASE + 'textures/clouds.json').then((r) => r.json()),
       Promise.all(['mural_sunwaves', 'mural_koi', 'mural_patchwork'].map((n) => tex(n + '.webp'))),
     ]);
-    prog(0.85);
+    prog(0.72, 'building the park…');
+    await painted();
 
     // ---------------- world
     const park = buildPark();
@@ -161,7 +183,7 @@ export class Game {
     }
     parkGroup.add(buildParkDetail(park));
     this.scene.add(parkGroup);
-    this.scenery = buildScenery(park.lamps);
+    this.scenery = buildScenery(park.lamps, crowd);
     this.scene.add(this.scenery.group);
     shared.uLampPos.value.forEach((v, i) => { const l = this.scenery.lampLights[i]; if (l) v.copy(l); });
     this.lampGlow = glowPoints(this.scenery.lampLights, new Color(1.0, 0.75, 0.45), 1.6);
@@ -173,9 +195,10 @@ export class Game {
     this.scene.fog = new Fog(0xf6c49e, 70, 620);
 
     // ---------------- lights
+    const T = this.tierP;
     this.sun.castShadow = true;
-    this.sun.shadow.mapSize.set(this.quality >= 2 ? 2048 : 1024, this.quality >= 2 ? 2048 : 1024);
-    this.sun.shadow.camera.far = this.quality >= 2 ? 95 : 60;
+    this.sun.shadow.mapSize.set(T.sunMap, T.sunMap);
+    this.sun.shadow.camera.far = T.sunFar;
     // toon materials add a receiver-plane bias per PCF tap and a normal offset of ~0.6 texel per cascade on top of these
     this.sun.shadow.bias = -0.00008;
     this.sun.shadow.normalBias = 0.012;
@@ -183,8 +206,9 @@ export class Game {
     this.scene.add(this.sun);
     this.scene.add(this.hemi);
     const ls = this.lampSpot;
-    ls.castShadow = this.quality >= 1;
-    ls.shadow.mapSize.set(this.quality >= 2 ? 1024 : 512, this.quality >= 2 ? 1024 : 512);
+    // no lamp shadow: no spot light either (the nearest lamp lights like the others, from the shader pools)
+    ls.castShadow = T.lampShadow > 0;
+    ls.shadow.mapSize.set(T.lampShadow || 512, T.lampShadow || 512);
     ls.shadow.camera.near = 0.3;
     ls.shadow.camera.far = LAMP.range;
     ls.shadow.bias = -0.0006;
@@ -194,7 +218,7 @@ export class Game {
     ls.shadow.needsUpdate = true; // render once so a depth texture is always bound to the shadow sampler
     ls.position.set(0, -50, 0);
     ls.target.position.set(0, -60, 0);
-    this.scene.add(ls, ls.target);
+    if (ls.castShadow) this.scene.add(ls, ls.target);
 
     // ---------------- player
     this.physics = new SkatePhysics(this.world);
@@ -231,15 +255,14 @@ export class Game {
     this.hud.onSound = () => { this.audio.setMuted(!this.audio.muted); this.hud.setMuted(this.audio.muted); this.unlockAudio(); };
     this.tricks.onTrick = (n, p, bail) => this.hud.trick(n, p, bail);
     this.tricks.onCombo = (t, m, f) => this.hud.combo(t, m, f);
-    const unlock = () => this.unlockAudio();
-    addEventListener('pointerdown', unlock); addEventListener('keydown', unlock);
     if (params.has('mute')) { this.audio.setMuted(true); this.hud.setMuted(true); }
 
     // ---------------- post
-    const msaa = this.quality >= 2 ? 4 : 0;
-    this.post = new Post(this.renderer, this.scene, this.camera, msaa);
+    this.post = new Post(this.renderer, this.scene, this.camera, T.msaa, T.bloom, T.fxaa);
     this.hero.attach(this.skater.root, this.board.root, [this.sun.shadow.getCamera(0), this.sun.shadow.getCamera(1)], [this.sun, this.hemi, this.lampSpot]);
-    this.hero.setSize(this.quality >= 2 ? 1024 : this.quality === 1 ? 512 : 0, this.renderer);
+    this.hero.setSize(T.hero, this.renderer);
+    this.setPeople(T);
+    this.freezeStatic();
     const tName = params.get('time');
     this.tod.set(tName ? Math.max(0, this.tod.byName(tName)) : 0, true);
     this.applyEnv(this.tod.cur);
@@ -251,6 +274,10 @@ export class Game {
     onSettings((s, k) => { if (k === 'quality' && !params.has('quality')) this.setQuality(s.quality); });
     if (params.has('nowarm')) this.renderer.compile(this.scene, this.camera); else await this.warmUp(prog);
     prog(1);
+    peopleGo();
+    const people = this.warmPeople();
+    // frame-stepped tests and captures expect the whole scene at ready; players never wait for the people
+    if (DEBUG) await people;
     this.ready = true;
     loading?.classList.add('done');
     setTimeout(() => loading?.remove(), 900);
@@ -265,11 +292,9 @@ export class Game {
   /** Compile every shader variant and upload every texture and buffer before the first frame (all distance levels and
    *  hidden objects, the sun / lamp / hero shadow passes, the post passes): otherwise, with a cold shader cache (a first
    *  visit), the first view of an area stalls for 100-250 ms. */
-  private async warmUp(prog: (p: number) => void) {
+  private async warmUp(prog: (p: number, stage?: string) => void) {
     const r = this.renderer, scene = this.scene, t0 = performance.now();
-    // the people load on their own: give them a few seconds to arrive
-    while (!this.scenery.people.group.children.length && performance.now() - t0 < 8000) await new Promise((res) => setTimeout(res, 50));
-    prog(0.88);
+    prog(0.88, 'warming up shaders…');
     const undo: (() => void)[] = [];
     scene.traverse((o) => {
       if (!o.visible) { o.visible = true; undo.push(() => { o.visible = false; }); }
@@ -298,6 +323,30 @@ export class Game {
   }
   /** load-time warm-up duration (ms), for tests */
   warmMs = 0;
+
+  /** The people arrive after the start: their programs (every distance level, the shadow pass variants, compiled for the
+   *  composer's buffer like warmUp) and textures are ready before they are shown, so their first view never stalls. */
+  private async warmPeople() {
+    const ppl = this.scenery.people, r = this.renderer, t0 = performance.now();
+    if (!(await ppl.loaded)) return;
+    const target = (this.post.composer as unknown as { inputBuffer?: WebGLRenderTarget }).inputBuffer ?? null;
+    const prev = r.getRenderTarget();
+    let job: Promise<unknown> = Promise.resolve();
+    try {
+      r.setRenderTarget(target);
+      job = Promise.all([r.compileAsync(ppl.crowd, this.camera, this.scene), r.compileAsync(ppl.shadowStandIns(), this.camera, this.scene)]);
+      for (const t of ppl.textures()) r.initTexture(t);
+    } catch (e) {
+      console.warn('people warm-up skipped', e);
+    } finally {
+      r.setRenderTarget(prev);
+    }
+    await job.catch(() => {});
+    ppl.show();
+    this.peopleMs = performance.now() - t0;
+  }
+  /** ready to people shown (ms), for tests */
+  peopleMs = 0;
 
   // ---------------------------------------------------------------- start screen (attract mode)
   /** the autopilot rides the calmer attract lap under the title card until the first input */
@@ -350,10 +399,15 @@ export class Game {
     this.hud.setTimeLabel(PRESETS[this.tod.index].name);
   }
 
-  /** 'auto' adapts to the frame rate; a fixed level turns the adaptation off */
+  /** 'auto' adapts to the frame rate from the device's level (mobile M, desktop high); a fixed level turns it off */
   setQuality(q: QualitySetting) {
     this.qualityAuto = q === 'auto';
-    if (q !== 'auto' && q !== this.quality) { this.quality = q; this.applyQuality(); }
+    this.ladderL = q === 'auto' ? ladder(MOBILE ? 1 : 2) : [TIERS[q]];
+    this.lvl = 0;
+    this.autoCap = 0;
+    this.adaptHold = 5;
+    const top = Math.min(devicePixelRatio, this.ladderL[0].dprMax);
+    if (this.ladderL[0] !== this.tierP || this.renderScale !== top) { this.renderScale = top; this.setLevel(0); }
   }
 
   unlockAudio() {
@@ -382,8 +436,7 @@ export class Game {
 
   resize() {
     const w = this.container.clientWidth, h = this.container.clientHeight;
-    const dprCap = this.quality >= 2 ? 1.75 : this.quality === 1 ? 1.25 : 0.85;
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio, dprCap));
+    this.renderer.setPixelRatio(Math.min(devicePixelRatio, this.renderScale));
     this.renderer.setSize(w, h, false);
     this.post?.setSize(w, h);
     this.camera.aspect = w / h;
@@ -440,6 +493,16 @@ export class Game {
     const p = this.view.pos, lamps = this.scenery.lampLights;
     const n = Math.min(lamps.length, shared.uLampPos.value.length);
     const d2 = (i: number) => (lamps[i].x - p.x) ** 2 + (lamps[i].z - p.z) ** 2;
+    if (this.tierP.lampPools < MAX_LAMPS) {
+      // capped pools (no spot light): the nearest lamps, sorted every 0.5 s
+      if (this.simTime < this.lampSortAt) return;
+      this.lampSortAt = this.simTime + 0.5;
+      const near = Array.from({ length: n }, (_, i) => i).sort((a, b) => d2(a) - d2(b)), k = Math.min(n, this.tierP.lampPools);
+      for (let i = 0; i < k; i++) shared.uLampPos.value[i].copy(lamps[near[i]]);
+      shared.uLampCount.value = k;
+      shared.uLampSkip.value = -1;
+      return;
+    }
     let best = -1, bd = Infinity;
     for (let i = 0; i < n; i++) { const d = d2(i); if (d < bd) { bd = d; best = i; } }
     if (this.lampIdx >= 0 && best !== this.lampIdx && d2(this.lampIdx) < bd * 1.2 + 1) best = this.lampIdx;
@@ -578,16 +641,28 @@ export class Game {
   }
 
   render(dt: number) {
-    this.hero.update(this.renderer, this.scene, this.skater.hipsWorld(new Vector3()), this.board.root);
-    this.post.render(dt);
+    const s = this.scene, sh = this.sun.shadow, n = this.tierP.sunEvery;
+    // one world-matrix update per frame for every pass (hero map, shadow maps, main)
+    s.updateMatrixWorld();
+    s.matrixWorldAutoUpdate = false;
+    try {
+      sh.autoUpdate = n <= 1;
+      if (n > 1 && ++this.sunFrame >= n) { this.sunFrame = 0; sh.needsUpdate = true; }
+      this.hero.update(this.renderer, s, this.skater.hipsWorld(this.hipsV), this.board.root);
+      this.post.render(dt);
+    } finally {
+      s.matrixWorldAutoUpdate = true;
+    }
   }
 
   private frame(t: number) {
     if (this.manualClock) return;
-    if (this.fpsCap > 0) {
-      const minDt = 1000 / this.fpsCap - 1.5;
+    const cap = this.fpsCap || this.autoCap;
+    if (cap > 0) {
+      const minDt = 1000 / cap - 1.5;
       if (t - this.lastFrame < minDt) return;
     }
+    const w0 = performance.now();
     const dt = Math.min(0.1, this.lastFrame ? (t - this.lastFrame) / 1000 : 1 / 60);
     this.lastFrame = t;
     this.frameInput(dt);
@@ -597,7 +672,7 @@ export class Game {
     }
     this.simulate(dt);
     this.render(dt);
-    this.adaptQuality(dt);
+    this.adaptQuality(dt, performance.now() - w0);
   }
 
   /** once per displayed frame, also while paused: input polling, input events, camera look */
@@ -618,25 +693,104 @@ export class Game {
     if (this.attract && padActive()) this.endAttract();
   }
 
+  // ---------------------------------------------------------------- quality (profiles in render/quality.ts)
+  /** current profile, the adaptive ladder it sits on (best first), render scale (pixel ratio before the device cap) */
+  tierP: Tier = TIERS[2];
+  ladderL: Tier[] = [];
+  lvl = 0;
+  renderScale = 1;
+  /** adaptive quality's last resort: a steady 30 fps */
+  autoCap = 0;
+  private adaptHold = 5;
   private qTimer = 0;
-  private adaptQuality(dt: number) {
-    if (!this.qualityAuto || params.has('quality') || DEBUG) return;
-    this.frameTimes.push(dt);
-    this.qTimer += dt;
-    if (this.qTimer < 3) return;
+  private workTimes: number[] = [];
+  private winS = 0;
+  private headroomS = 0;
+  private sunFrame = 99;
+  private lampSortAt = 0;
+  private hipsV = new Vector3();
+
+  /** Every 0.5 s on the last 6 s of frames (none for 5 s after the start, a resume or a return to the tab): a p90 frame
+   *  interval over 20 ms (missing vsync) costs features first (bloom, shadow refresh, people, lower tiers), then render
+   *  scale, then, still missing badly (p90 > 24 ms), a 30 fps cap. 20 s of headroom (frame work p90 < 12 ms) gives the
+   *  last step back. */
+  private adaptQuality(dt: number, workMs: number) {
+    if (!this.qualityAuto || params.has('quality') || DEBUG || !this.ladderL.length) return;
+    if (this.adaptHold > 0) { this.adaptHold -= dt; this.clearWindow(); return; }
+    const ft = this.frameTimes, wt = this.workTimes;
+    ft.push(dt * 1000); wt.push(workMs); this.winS += dt;
+    while (this.winS > 6 && ft.length > 1) { this.winS -= ft.shift()! / 1000; wt.shift(); }
+    if ((this.qTimer += dt) < 0.5) return;
     this.qTimer = 0;
-    const avg = this.frameTimes.reduce((a, b) => a + b, 0) / this.frameTimes.length;
-    this.frameTimes.length = 0;
-    const target = this.fpsCap ? 1 / this.fpsCap : 1 / 60;
-    if (avg > target * 1.35 && this.quality > 0) { this.quality--; this.applyQuality(); }
-    else if (avg < target * 0.7 && this.quality < 2 && !matchMedia('(pointer: coarse)').matches) { this.quality++; this.applyQuality(); }
+    if (this.winS < 5.9) return;
+    const p90 = percentile(ft, 0.9), w90 = percentile(wt, 0.9), T = this.tierP;
+    const floor = Math.min(devicePixelRatio, T.dprMin), top = Math.min(devicePixelRatio, T.dprMax);
+    if (!this.autoCap && p90 > 20) {
+      this.headroomS = 0;
+      if (this.lvl < this.ladderL.length - 1) this.setLevel(this.lvl + 1);
+      else if (this.renderScale > floor + 1e-3) { this.renderScale = Math.max(floor, this.renderScale - 0.1); this.resize(); }
+      else if (p90 > 24) this.autoCap = 30;
+      else return;
+      this.clearWindow();
+    } else if (w90 < (this.autoCap ? 10 : 12) && (this.autoCap || p90 < 18)) {
+      if ((this.headroomS += 0.5) < 20) return;
+      this.headroomS = 0;
+      if (this.autoCap) this.autoCap = 0;
+      else if (this.renderScale < top - 1e-3) { this.renderScale = Math.min(top, this.renderScale + 0.1); this.resize(); }
+      else if (this.lvl > 0) this.setLevel(this.lvl - 1);
+      else return;
+      this.clearWindow();
+    } else this.headroomS = 0;
   }
+  private clearWindow() { this.frameTimes.length = 0; this.workTimes.length = 0; this.winS = 0; this.qTimer = 0; }
+  private setLevel(i: number) {
+    this.lvl = i;
+    this.tierP = this.ladderL[i];
+    this.quality = TIERS.findIndex((t) => t.name === this.tierP.name);
+    this.applyQuality();
+  }
+  /** rebuild what the profile changes: render scale, shadow maps, lamp light, hero map, post passes, shader paths, people */
   applyQuality() {
+    const T = this.tierP;
+    this.renderScale = clamp(this.renderScale, Math.min(devicePixelRatio, T.dprMin), Math.min(devicePixelRatio, T.dprMax));
     this.resize();
-    this.post.bloom.intensity = this.quality >= 1 ? this.tod.cur.bloom : 0;
-    this.sun.shadow.camera.far = this.quality >= 2 ? 95 : this.quality === 1 ? 60 : 40;
-    this.hero.setSize(this.quality >= 2 ? 1024 : this.quality === 1 ? 512 : 0, this.renderer);
-    if (this.quality === 0) { this.lampSpot.shadow.autoUpdate = false; this.lampSpot.shadow.needsUpdate = false; }
+    const sh = this.sun.shadow;
+    if (sh.mapSize.x !== T.sunMap) { sh.map?.dispose(); sh.map = null; sh.mapSize.set(T.sunMap, T.sunMap); }
+    sh.camera.far = T.sunFar;
+    this.sunFrame = 99;
+    const ls = this.lampSpot, lampOn = T.lampShadow > 0;
+    if (lampOn && ls.shadow.mapSize.x !== T.lampShadow) { ls.shadow.map?.dispose(); ls.shadow.map = null; ls.shadow.mapSize.set(T.lampShadow, T.lampShadow); }
+    if (lampOn !== ls.castShadow) {
+      ls.castShadow = lampOn;
+      if (lampOn) this.scene.add(ls, ls.target); else this.scene.remove(ls, ls.target);
+      ls.shadow.autoUpdate = lampOn && this.tod.cur.lamps > 0.02;
+      ls.shadow.needsUpdate = true;
+      this.lampIdx = -1; shared.uLampSkip.value = -1;
+    }
+    shared.uLampCount.value = T.lampPools;
+    this.lampSortAt = 0;
+    if (T.lampPools >= MAX_LAMPS) shared.uLampPos.value.forEach((v, i) => { const l = this.scenery.lampLights[i]; if (l) v.copy(l); });
+    this.hero.setSize(T.hero, this.renderer);
+    this.post.configure(T.bloom, T.fxaa, T.msaa);
+    this.post.bloom.intensity = this.tod.cur.bloom;
+    setToonMobile(T.mobileShader);
+    this.sky.setNoise(T.noiseOct);
+    this.ocean.setNoise(T.noiseOct, T.oceanWaves);
+    this.setPeople(T);
     void MathUtils;
+  }
+  private setPeople(T: Tier) { this.scenery.people.setProfile?.(T.people); }
+  /** Static park and scenery stop composing their matrices every frame. Everything that moves keeps them: the skater
+   *  and board, people, sky / clouds / ocean (follow the camera), the lights, the lamp glow and `userData.dynamic`. */
+  private freezeStatic() {
+    const keep = new Set<Object3D>([this.hero.root, this.scenery.people.group, this.sky.mesh, this.clouds.group, this.ocean.mesh,
+      this.lampSpot, this.lampSpot.target, this.lampGlow, this.sun, this.hemi]);
+    const walk = (o: Object3D) => {
+      if (keep.has(o) || o.userData.dynamic) return;
+      o.updateMatrix();
+      o.matrixAutoUpdate = false;
+      for (const c of o.children) walk(c);
+    };
+    walk(this.scene);
   }
 }

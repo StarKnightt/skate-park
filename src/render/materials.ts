@@ -5,6 +5,21 @@ import {
 
 /** max street lamps with a light pool (shader array size) */
 export const MAX_LAMPS = 28;
+/** TOON_MOBILE: max lamp pools per pixel (the nearest lamps, uLampCount of them) */
+export const TOON_MOBILE_LAMPS = 8;
+
+let toonMobile = false;
+const toonMats = new Set<MeshLambertMaterial>();
+/** the TOON_MOBILE material path for every toon material, made from now on or already compiled (they recompile) */
+export function setToonMobile(on: boolean) {
+  if (on === toonMobile) return;
+  toonMobile = on;
+  for (const m of toonMats) { mobileDefine(m); m.needsUpdate = true; }
+}
+function mobileDefine(m: MeshLambertMaterial) {
+  if (toonMobile) m.defines = { ...m.defines, TOON_MOBILE: '' };
+  else if (m.defines) delete m.defines.TOON_MOBILE;
+}
 
 /** Street lamps: one cone shape shared by the shader light pools and the real (shadow casting) spot light. */
 export const LAMP = {
@@ -22,6 +37,8 @@ export const shared = {
   uLampPos: { value: Array.from({ length: MAX_LAMPS }, () => new Vector3(0, -999, 0)) },
   /** index into uLampPos rendered by the real spot light instead of the shader pool (-1 = none) */
   uLampSkip: { value: -1 },
+  /** TOON_MOBILE: pools from uLampPos[0 .. n-1] only (the nearest lamps, at most TOON_MOBILE_LAMPS) */
+  uLampCount: { value: MAX_LAMPS },
   uLampCone: { value: new Vector4(Math.cos(LAMP.angle), Math.cos(LAMP.angle * (1 - LAMP.penumbra)), LAMP.range, 0) },
   uRimColor: { value: new Color(1.0, 0.75, 0.55) },
   uRimStrength: { value: 0.55 },
@@ -89,6 +106,16 @@ float fbm(vec2 p){ float a = 0.5, s = 0.0; for(int i=0;i<4;i++){ s += a*vnoise(p
  */
 const SUN_SHADOW_RPDB = /* glsl */ `
 #if defined( USE_SHADOWMAP ) && defined( SHADOWMAP_TYPE_PCF ) && ( NUM_SUN_LIGHT_SHADOWS > 0 || NUM_SPOT_LIGHT_SHADOWS > 0 )
+#ifdef TOON_MOBILE
+  // four bilinear compare taps (a 4x4 texel footprint), each against the receiver plane
+  float tentPCF( sampler2DShadow map, vec2 uv, float z, vec2 dzduv, float slope, vec2 size, float R ) {
+    vec2 d = vec2( clamp( 0.5 * R, 0.5, 1.25 ) ) / size;
+    #define TT( X, Y ) textureLod( map, vec3( X, Y, z + clamp( dot( dzduv, vec2( X, Y ) - uv ), -0.02, 0.02 ) - slope ), 0.0 )
+    float s = TT( uv.x - d.x, uv.y - d.y ) + TT( uv.x + d.x, uv.y - d.y ) + TT( uv.x - d.x, uv.y + d.y ) + TT( uv.x + d.x, uv.y + d.y );
+    #undef TT
+    return s * 0.25;
+  }
+#else
   // Smooth separable tent PCF of radius R texels (1 <= R <= 3). The tent weight of every texel is folded into 3x3
   // bilinear compare taps (two texels per tap and axis), so the filter slides smoothly with the sub-texel position and
   // prints no pattern into the penumbra (a kernel rotated per screen pixel shows its rotation as a regular dot grid).
@@ -108,6 +135,7 @@ const SUN_SHADOW_RPDB = /* glsl */ `
     #undef TT
     return s / max( ( g0.x + g1.x + g2.x ) * ( g0.y + g1.y + g2.y ), 1e-5 );
   }
+#endif
 #endif
 #if defined( USE_SHADOWMAP ) && NUM_SPOT_LIGHT_SHADOWS > 0 && defined( SHADOWMAP_TYPE_PCF )
   float toonSpotShadow( sampler2DShadow shadowMap, vec2 shadowMapSize, float shadowIntensity, float shadowBias, float shadowRadius, vec4 shadowCoord ) {
@@ -173,6 +201,13 @@ const SUN_SHADOW_RPDB = /* glsl */ `
     // mip level whose (B-spline) footprint spans that penumbra; 1.65 texels is the width of level 0
     float L = clamp( log2( max( w, 1e-5 ) / ( 1.65 * tx ) ), -1.0, maxLod - 2.0 );
     float vis = 1.0;
+    #ifdef TOON_MOBILE
+    {
+      float Lm = max( L, 0.0 ), l0 = floor( Lm );
+      vec4 m = mix( heroBspline( h.xy, l0 ), heroBspline( h.xy, l0 + 1.0 ), Lm - l0 );
+      vis = 1.0 - clamp( m.x, 0.0, 1.0 ) * smoothstep( -0.02, 0.05, h.z - m.y / max( m.x, 1e-4 ) );
+    }
+    #else
     if ( L < 1.0 ) {
       mat3 M3 = mat3( uHeroMat );
       vec3 dx = M3 * gDPdx, dy = M3 * gDPdy;
@@ -186,6 +221,7 @@ const SUN_SHADOW_RPDB = /* glsl */ `
       float cv = clamp( m.x, 0.0, 1.0 ) * smoothstep( -0.02, 0.05, h.z - m.y / max( m.x, 1e-4 ) );
       vis = mix( vis, 1.0 - cv, clamp( L, 0.0, 1.0 ) );
     }
+    #endif
     return vis;
   }
   float sunShadowPCF( sampler2DShadow shadowMap, vec2 shadowMapSize, float shadowIntensity, float shadowBias, float shadowRadius, vec3 sc, vec2 dzduv, float tight ) {
@@ -196,6 +232,10 @@ const SUN_SHADOW_RPDB = /* glsl */ `
       vec2 texelSize = vec2( 1.0 ) / shadowMapSize;
       // the hardware 2x2 compare reaches a texel either way of a tap
       float slopeTexel = abs( dzduv.x ) * texelSize.x * 0.5 + abs( dzduv.y ) * texelSize.y;
+      #ifdef TOON_MOBILE
+      shadow = tentPCF( shadowMap, sc.xy, sc.z, dzduv, abs( dzduv.x ) * texelSize.x + abs( dzduv.y ) * texelSize.y,
+        shadowMapSize, clamp( shadowRadius * 0.866, 1.0, 3.0 ) );
+      #else
       float wide = 0.0, fine = 0.0;
       if ( tight < 1.0 ) {
         // ground and walls: smooth tent, as soft overall as the preset radius
@@ -214,6 +254,7 @@ const SUN_SHADOW_RPDB = /* glsl */ `
         #undef TAP
       }
       shadow = mix( wide, fine, tight );
+      #endif
     }
     return mix( 1.0, shadow, shadowIntensity );
   }
@@ -241,9 +282,22 @@ const SUN_SHADOW_RPDB = /* glsl */ `
     // kernel and leave the bend logic (meant for metre-scale ramps) out
     float small = smoothstep( 2.0, 6.0, gCurv );
     bendLit = mix( bendLit, 1.0, small );
+    // TOON_MOBILE: the nearest cascade only, no blend across the fade band. It is picked first, so the sampling loop
+    // keeps a fixed trip count (FXC unrolls it; a break would leave the shadow taps in a loop of varying iteration)
+    #ifdef TOON_MOBILE
+    int ci = -1;
+    for ( int i = SUN_LIGHT_CASCADES - 1; i >= 0; i -- ) {
+      vec4 c = sunShadowCascade[ cascadeOffset + i ];
+      if ( viewDepth >= c.x && viewDepth < c.y ) ci = i;
+    }
+    #endif
     for ( int i = SUN_LIGHT_CASCADES - 1; i >= 0; i -- ) {
       vec4 cascade = sunShadowCascade[ cascadeOffset + i ];
+      #ifdef TOON_MOBILE
+      if ( i == ci ) {
+      #else
       if ( viewDepth >= cascade.x && viewDepth < cascade.y ) {
+      #endif
         mat4 M = sunShadowMatrix[ cascadeOffset + i ];
         // world size of one shadow texel in this cascade: the normal offset scales with it
         float texelWorld = 1.0 / ( length( vec3( M[0][1], M[1][1], M[2][1] ) ) * sunLightShadow.shadowMapSize.y );
@@ -265,9 +319,13 @@ const SUN_SHADOW_RPDB = /* glsl */ `
         dzduv = clamp( dzduv, vec2( -40.0 ), vec2( 40.0 ) ) * planeW;
         float cs = sunShadowPCF( shadowMap, sunLightShadow.shadowMapSize, sunLightShadow.shadowIntensity, sunLightShadow.shadowBias,
           sunLightShadow.shadowRadius, sc, dzduv, small );
+        #ifdef TOON_MOBILE
+        shadow = cs;
+        #else
         float bl = smoothstep( cascade.z, cascade.y, viewDepth );
         shadow = mix( cs, shadow, bl );
-        #ifdef TOON_RIM
+        #endif
+        #if defined( TOON_RIM ) && !defined( TOON_MOBILE )
           // the backlight rim sits right on the terminator, where a surface shadows itself: test a point a little
           // towards the sun instead, so only real occluders (walls, other limbs) switch the rim off
           float rv = 1.0;
@@ -282,7 +340,7 @@ const SUN_SHADOW_RPDB = /* glsl */ `
     }
     // the skater is not in the cascades while his own map is on: his shadow (on himself too) comes from there
     float hero = heroShadow( wp, wn, 0.004 + 0.056 * small );
-    #ifdef TOON_RIM
+    #if defined( TOON_RIM ) && !defined( TOON_MOBILE )
       // (his own head or torso right behind the rim point does not count, as with the cascades)
       if ( gCurv > 0.5 ) rimVis = min( rimVis, heroShadow( wp + uSunDir * 0.12, wn, 0.25 ) );
     #endif
@@ -552,6 +610,8 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
   });
   if (o.emissive !== undefined) { m.emissive = new Color(o.emissive); m.emissiveIntensity = o.emissiveIntensity ?? 1; }
   m.name = o.name ?? 'toon';
+  mobileDefine(m);
+  toonMats.add(m);
   const bands = o.bands ?? 0.25, wrap = o.wrap ?? 0.35, rim = o.rim ?? 0.4, spec = o.spec ?? 0, shin = o.shininess ?? 40;
   const detail = o.detail === 'mural' && !o.map ? null : o.detail ?? null;
   const hair = !!o.vertexColors && (o.hair ?? (o.name === 'skaterVC' || o.name === 'personVC'));
@@ -626,7 +686,7 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
       uniform vec3 uLampColor, uRimColor, uWarmth, uSpillColor;
       uniform vec4 uSpillA, uSpillB, uSpillPlane;
       uniform vec3 uLampPos[${MAX_LAMPS}];
-      uniform int uLampSkip;
+      uniform int uLampSkip, uLampCount;
       uniform vec4 uLampCone;
       uniform vec3 uSunDir, uSunColor, uSkyTop, uSkySun, uSkyAnti, uGroundBounce;
       uniform sampler2D uDetail; uniform sampler2D uWood;
@@ -771,7 +831,12 @@ export function toonMaterial(o: ToonOpts = {}): MeshLambertMaterial {
         if (uLampIntensity > 0.001) {
           float acc = 0.0;
           float r2 = uLampCone.z * uLampCone.z;
+          #ifdef TOON_MOBILE
+          for (int i = 0; i < ${TOON_MOBILE_LAMPS}; i++) {
+            if (i >= uLampCount) break;
+          #else
           for (int i = 0; i < ${MAX_LAMPS}; i++) {
+          #endif
             if (i == uLampSkip) continue;
             vec3 lv = uLampPos[i] - vWorldPos;
             float d2 = dot(lv, lv);

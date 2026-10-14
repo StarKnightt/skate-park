@@ -5,7 +5,7 @@
 :root { --cream: #fff8ec; --ink: #3b2a2f; --coral: #ff8b6a; --teal: #2f8f86; }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; overflow: hidden; background: #f6c49e; overscroll-behavior: none; touch-action: none;
-  -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; }
 body { font-family: 'Nunito', system-ui, sans-serif; color: var(--cream); }
 #app { position: fixed; inset: 0; }
 #app canvas { display: block; width: 100%; height: 100%; touch-action: none; }
@@ -25,7 +25,9 @@ body { font-family: 'Nunito', system-ui, sans-serif; color: var(--cream); }
   background: rgba(59, 42, 47, .28); padding: 9px 13px; border-radius: 12px; backdrop-filter: blur(4px); transition: opacity .5s; }
 .hint kbd { font-family: inherit; font-weight: 900; background: rgba(255, 248, 236, .18); border-radius: 5px; padding: 0 5px; }
 .hint.hide { opacity: 0; visibility: hidden; transition: opacity 1.2s, visibility 0s linear 1.2s; }
-.hint.mobile { left: max(12px, env(safe-area-inset-left)); bottom: auto; top: 56px; font-size: 11.5px; padding: 7px 10px; max-width: min(92vw, 420px); }
+.hint.mobile { left: max(12px, env(safe-area-inset-left)); bottom: auto; top: calc(max(10px, env(safe-area-inset-top)) + 52px); font-size: 12.5px;
+  padding: 7px 10px; max-width: min(92vw, 420px); }
+.hint.hide.now { transition: none; }
 
 .pill { pointer-events: auto; border: 0; cursor: pointer; font-family: inherit; font-weight: 800; font-size: 13px; color: var(--ink);
   background: rgba(255, 248, 236, .78); padding: 8px 13px; border-radius: 999px; display: flex; align-items: center; gap: 7px;
@@ -35,17 +37,20 @@ body { font-family: 'Nunito', system-ui, sans-serif; color: var(--cream); }
 .pill svg { width: 17px; height: 17px; }
 .pill.icon { padding: 8px 10px; }
 /* top-right pills: small and faint while skating, fully visible on pointer movement / hover / tap */
-.topbar { position: absolute; right: 12px; top: 10px; display: flex; gap: 6px; pointer-events: auto; opacity: .32;
-  transition: opacity .6s ease; }
+.topbar { position: absolute; right: max(12px, env(safe-area-inset-right)); top: max(10px, env(safe-area-inset-top)); display: flex; gap: 6px;
+  pointer-events: auto; opacity: .32; transition: opacity .6s ease; }
 .topbar.awake, .topbar:hover, .topbar:focus-within { opacity: 1; transition: opacity .15s ease; }
 .topbar .pill { font-size: 11.5px; padding: 5px 10px; gap: 5px; box-shadow: 0 2px 8px rgba(120, 60, 50, .14); }
 .topbar .pill svg { width: 14px; height: 14px; }
 .topbar .pill.icon { padding: 5px 7px; min-width: 26px; justify-content: center; }
 @media (pointer: coarse) {
   .topbar { opacity: .5; }
-  .topbar .pill { font-size: 12px; padding: 8px 11px; }
-  .topbar .pill.icon { padding: 8px 9px; min-width: 34px; }
+  .topbar .pill { font-size: 13px; padding: 10px 14px; min-height: 44px; }
+  .topbar .pill.icon { padding: 10px; min-width: 44px; }
+  .help .close { min-height: 44px; min-width: 64px; justify-content: center; position: sticky; top: 0; z-index: 1; background: var(--cream); }
 }
+/* touch: the open help covers the controls, a tap outside it closes it (hud.ts) */
+.hud.touchui.helpopen { pointer-events: auto; z-index: 7; }
 
 .help { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); pointer-events: auto; width: min(560px, 92vw);
   max-height: 86vh; overflow: auto; background: rgba(255, 248, 236, .94); color: var(--ink); border-radius: 18px; padding: 18px 22px;
@@ -72,7 +77,12 @@ body.pm .hud:not(.touchui) .topbar .menu { display: flex; }
   opacity: 0; transition: opacity 1s ease; }
 .modelabel span { font-weight: 700; opacity: .75; }
 .modelabel.show { opacity: .92; transition: opacity .25s ease; }
-.hud.touchui .modelabel { left: calc(max(12px, env(safe-area-inset-left)) + 50px); top: calc(max(10px, env(safe-area-inset-top)) + 10px); }
+.hud.touchui .modelabel { left: calc(max(12px, env(safe-area-inset-left)) + 58px); top: calc(max(10px, env(safe-area-inset-top)) + 12px); font-size: 12px; }
+/* touch portrait: the top-right pills need the width, so the mode label sits under the pause button and the hint below it */
+@media (orientation: portrait) {
+  .hud.touchui .modelabel { left: max(12px, env(safe-area-inset-left)); top: calc(max(10px, env(safe-area-inset-top)) + 56px); }
+  .hud.touchui .hint.mobile { top: calc(max(10px, env(safe-area-inset-top)) + 86px); }
+}
 .lockpill { position: absolute; right: 16px; bottom: 16px; display: flex; align-items: center; gap: 7px; font-weight: 800; font-size: 12.5px;
   color: var(--ink); background: rgba(255, 248, 236, .8); padding: 7px 13px 7px 10px; border-radius: 999px;
   box-shadow: 0 3px 12px rgba(120, 60, 50, .16); backdrop-filter: blur(6px); transition: opacity .5s; }
@@ -92,6 +102,11 @@ body.pm .hud:not(.touchui) .topbar .menu { display: flex; }
 .toast { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); font-weight: 800; font-size: 13px; color: var(--ink);
   background: rgba(255, 248, 236, .82); padding: 7px 14px; border-radius: 999px; transition: opacity .6s; pointer-events: none; }
 .toast.hide { opacity: 0; visibility: hidden; transition: opacity .6s, visibility 0s linear .6s; }
+/* touch: toasts sit right under the top bar (centred in portrait, under the pills in landscape), never under the buttons */
+.hud.touchui .toast { bottom: auto; top: calc(max(10px, env(safe-area-inset-top)) + 58px); max-width: 80vw; text-align: center; }
+@media (orientation: landscape) {
+  .hud.touchui .toast { left: auto; right: max(12px, env(safe-area-inset-right)); transform: none; }
+}
 
 .loading { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: linear-gradient(#f7b98c, #f3a7a0 55%, #a8a6dc);
   transition: opacity .7s; }
@@ -104,10 +119,15 @@ body.pm .hud:not(.touchui) .topbar .menu { display: flex; }
 /* touch controls */
 .touch { position: fixed; inset: 0; z-index: 6; pointer-events: none; display: none; }
 .touch.on { display: block; }
+/* floating stick: a thumb anywhere in the lower-left zone steers (hud.ts); the ring is drawn at rest and follows the thumb */
+.stickzone { position: absolute; left: 0; bottom: 0; width: 45%; height: 55%; pointer-events: auto; touch-action: none; }
 .stick { position: absolute; left: max(18px, env(safe-area-inset-left)); bottom: max(22px, env(safe-area-inset-bottom)); width: 136px; height: 136px;
-  border-radius: 50%; background: rgba(255, 248, 236, .18); border: 2px solid rgba(255, 248, 236, .45); pointer-events: auto; touch-action: none; }
+  border-radius: 50%; background: rgba(255, 248, 236, .18); border: 2px solid rgba(255, 248, 236, .45); pointer-events: none; }
+.stick.active { background: rgba(255, 248, 236, .24); border-color: rgba(255, 248, 236, .6); }
 .stick .knob { position: absolute; left: 50%; top: 50%; width: 58px; height: 58px; margin: -29px 0 0 -29px; border-radius: 50%;
   background: rgba(255, 248, 236, .75); box-shadow: 0 3px 10px rgba(90, 40, 40, .25); }
+/* narrow phones: TRICK sits 20 px from OLLIE, the ring makes room for it */
+@media (max-width: 370px) { .stick { width: 120px; height: 120px; } .stick .knob { width: 52px; height: 52px; margin: -26px 0 0 -26px; } }
 .tbtn { position: absolute; pointer-events: auto; touch-action: none; border-radius: 50%; display: grid; place-items: center;
   font-weight: 900; color: var(--ink); background: rgba(255, 248, 236, .72); box-shadow: 0 4px 14px rgba(90, 40, 40, .22);
   border: 2px solid rgba(255, 255, 255, .6); font-size: 12px; letter-spacing: .04em; }
@@ -115,9 +135,9 @@ body.pm .hud:not(.touchui) .topbar .menu { display: flex; }
 .tbtn.ollie { right: max(20px, env(safe-area-inset-right)); bottom: max(26px, env(safe-area-inset-bottom)); width: 96px; height: 96px; font-size: 15px; }
 .tbtn.grind { right: max(128px, calc(env(safe-area-inset-right) + 108px)); bottom: max(34px, env(safe-area-inset-bottom)); width: 64px; height: 64px; }
 .tbtn.manual { right: max(36px, env(safe-area-inset-right)); bottom: max(136px, calc(env(safe-area-inset-bottom) + 116px)); width: 64px; height: 64px; }
-.tbtn.flipbtn { right: max(126px, calc(env(safe-area-inset-right) + 106px)); bottom: max(30px, env(safe-area-inset-bottom)); width: 72px; height: 72px; font-size: 13px; }
+.tbtn.flipbtn { right: max(136px, calc(env(safe-area-inset-right) + 116px)); bottom: max(30px, env(safe-area-inset-bottom)); width: 72px; height: 72px; font-size: 13px; }
 .tbtn.autobtn { right: max(40px, calc(env(safe-area-inset-right) + 20px)); bottom: max(140px, calc(env(safe-area-inset-bottom) + 120px)); width: 58px; height: 58px;
-  font-size: 11px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; }
+  font-size: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; }
 .tbtn.autobtn i { width: 7px; height: 7px; border-radius: 50%; background: rgba(59, 42, 47, .3); transition: background .2s, box-shadow .2s; }
 .tbtn.autobtn.on { background: rgba(47, 143, 134, .9); color: var(--cream); border-color: rgba(255, 255, 255, .75); }
 .tbtn.autobtn.on i { background: #c8ffd8; box-shadow: 0 0 7px #c8ffd8; }
@@ -130,7 +150,8 @@ body.pm .hud:not(.touchui) .topbar .menu { display: flex; }
 body.pm .pausebtn { display: grid; }
 .pausebtn svg { width: 17px; height: 17px; }
 .pausebtn:active { transform: scale(.94); }
-.swipehint { position: absolute; right: 12px; bottom: 200px; font-size: 11px; font-weight: 800; opacity: .8; text-align: right;
+@media (pointer: coarse) { .pausebtn { width: 48px; height: 48px; } .pausebtn svg { width: 19px; height: 19px; } }
+.swipehint { position: absolute; right: max(12px, env(safe-area-inset-right)); bottom: 200px; font-size: 12px; font-weight: 800; opacity: .8; text-align: right;
   transition: opacity 1.2s; }
 .hints-off .swipehint { opacity: 0; }
 @media (orientation: landscape) and (max-height: 500px) {
@@ -225,4 +246,34 @@ body.paused .hud .hint, body.paused .hud .lockpill, body.paused .hud .modelabel 
   .pause .sets .row.wide { grid-column: 1 / -1; }
   .pause .desc { grid-column: 1 / -1; margin: -2px 0 2px 122px; }
   .pause .foot { margin-top: 4px; padding-top: 5px; }
+}
+/* touch: every menu control at least 44 px tall (switches keep a 32 px track inside a 44 px hit box) */
+@media (pointer: coarse) {
+  .pause .btn, .pause .seg button { min-height: 44px; }
+  .pause .row { min-height: 48px; }
+  .pause input[type="range"] { height: 44px; }
+  .pause input[type="range"]::-webkit-slider-thumb { width: 26px; height: 26px; margin-top: -10px; }
+  .pause input[type="range"]::-moz-range-thumb { width: 22px; height: 22px; }
+  .pause .sw { width: 52px; height: 44px; border: solid transparent; border-width: 6px 0; background-clip: padding-box; }
+  .pause .sw i { width: 26px; height: 26px; }
+}
+/* touch, short landscape: title and actions share a line, settings sit in pairs, so the page fits 340 px of height */
+@media (pointer: coarse) and (max-height: 500px) and (min-width: 640px) {
+  .pause .panel { padding: 10px 14px 8px; }
+  .pause .pg.main.on { display: grid; grid-template-columns: auto 1fr; column-gap: 16px; align-items: center; }
+  .pause .pg.main .phead { margin: 0 2px; }
+  .pause .pg.main .row.acts { padding: 0; }
+  .pause .pg.main .sets, .pause .pg.main .foot { grid-column: 1 / -1; }
+  .pause .pg.main .sets { margin-top: 8px; padding-top: 2px; }
+  .pause .row { min-height: 44px; padding: 2px 8px; grid-template-columns: 96px 1fr; }
+  .pause .desc { margin: -4px 0 2px 106px; }
+}
+@media (pointer: coarse) and (max-height: 500px) and (min-width: 760px) {
+  .pause .seg .lw { display: none; }
+  .pause .sets .row.tod { grid-column: auto; order: 1; }
+  .pause .sets .row.gfx { order: 2; }
+  .pause .sets .row.mus { order: 3; }
+  .pause .sets .row.snd { order: 4; }
+  .pause .sets .row.inv { order: 5; }
+  .pause .sets .row.fs, .pause .sets .fstip { order: 6; }
 }

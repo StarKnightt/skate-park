@@ -66,6 +66,8 @@ export class Input {
     steer: 0, push: false, brake: false, ollieHeld: false, ollieReleased: false, flip: null as FlipDir | null, grind: false, grindPressed: false, manual: false,
     /** pass-4 touch buttons (edges, cleared by the input layer): TRICK (easy), AUTO toggle, pause */
     trickPressed: false, autoPressed: false, pausePressed: false,
+    /** the system took the OLLIE touch (pointercancel): the crouch ends without a pop */
+    ollieCancel: false,
   };
   events: Record<InputEvent, boolean> = { timeOfDay: false, respawn: false, recenter: false, help: false, pause: false, autoToggle: false };
   scripted: Partial<Record<string, boolean>> | null = null;
@@ -234,7 +236,7 @@ export class Input {
     if (this.idle) {
       // nothing samples while paused: presses made in the menu must not fire on resume
       this.pressedEdge.clear(); this.padDown.clear();
-      this.touch.ollieReleased = this.touch.grindPressed = this.touch.trickPressed = false;
+      this.touch.ollieReleased = this.touch.grindPressed = this.touch.trickPressed = this.touch.ollieCancel = false;
       this.wasCrouch = false; this.tapT = -1; this.airLatch = null;
     }
     this.readPad();
@@ -356,6 +358,7 @@ export class Input {
     // ---- touch
     const t = this.touch;
     if (this.usingTouch) {
+      if (t.ollieCancel) { t.ollieCancel = false; this.wasCrouch = false; this.tapT = -1; this.relFlip = null; crouch = crouchPress = false; }
       if (Math.abs(t.steer) > Math.abs(steer)) steer = t.steer;
       push ||= t.push; brake ||= t.brake;
       if (t.push) lean = 1; else if (t.brake) lean = -1;

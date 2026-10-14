@@ -9,8 +9,18 @@ const NOISE = /* glsl */ `
 float h12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f*f*(3.0-2.0*f);
   return mix(mix(h12(i), h12(i+vec2(1,0)), u.x), mix(h12(i+vec2(0,1)), h12(i+vec2(1,1)), u.x), u.y); }
-float fbm(vec2 p){ float a = 0.5, s = 0.0; for(int i=0;i<5;i++){ s += a*vnoise(p); p = p*2.02 + 13.7; a *= 0.5; } return s; }
+float fbm(vec2 p){ float a = 0.5, s = 0.0; for(int i=0;i<NOISE_OCT;i++){ s += a*vnoise(p); p = p*2.02 + 13.7; a *= 0.5; }
+#if NOISE_OCT < 5
+  s *= 0.96875 / (1.0 - exp2(-float(NOISE_OCT)));
+#endif
+  return s; }
 `;
+/** fbm octaves (and ocean wave count) of a sky / ocean material: 5 / 9 high, fewer on the mobile tiers */
+function setDefines(m: ShaderMaterial, d: Record<string, number>) {
+  if (Object.entries(d).every(([k, v]) => m.defines[k] === v)) return;
+  Object.assign(m.defines, d);
+  m.needsUpdate = true;
+}
 
 /** Painterly sky dome: layered gradient, sun glow, brushy cirrus, stars. Follows the camera. */
 export class Sky {
@@ -18,7 +28,7 @@ export class Sky {
   mat: ShaderMaterial;
   constructor() {
     this.mat = new ShaderMaterial({
-      side: BackSide, depthWrite: false, fog: false,
+      side: BackSide, depthWrite: false, fog: false, defines: { NOISE_OCT: 5 },
       uniforms: {
         uZenith: { value: new Color() }, uMid: { value: new Color() }, uHorizon: { value: new Color() },
         uSunDir: { value: new Vector3() }, uGlow: { value: new Color() }, uGlowStrength: { value: 1 },
@@ -70,6 +80,7 @@ export class Sky {
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = -10;
   }
+  setNoise(oct: number) { setDefines(this.mat, { NOISE_OCT: oct }); }
   apply(e: EnvState) {
     const u = this.mat.uniforms;
     u.uZenith.value.copy(e.zenith); u.uMid.value.copy(e.mid); u.uHorizon.value.copy(e.horizon);
@@ -149,7 +160,7 @@ export class Ocean {
   mat: ShaderMaterial;
   constructor(public level = -1.3, shoreZ = -74) {
     this.mat = new ShaderMaterial({
-      fog: false,
+      fog: false, defines: { NOISE_OCT: 5, OCEAN_WAVES: 9 },
       uniforms: {
         uTime: { value: 0 }, uDeep: { value: new Color() }, uShallow: { value: new Color() }, uSky: { value: new Color() },
         uHorizon: { value: new Color() }, uSunDir: { value: new Vector3() }, uSunCol: { value: new Color() }, uFog: { value: new Color() },
@@ -167,7 +178,7 @@ export class Ocean {
         // incommensurate directional waves with drifting swell groups; each fades once it is smaller than a few pixels
         vec2 waveGrad(vec2 p, float t, float fp){
           vec2 g = vec2(0.0);
-          for (int i = 0; i < 9; i++) {
+          for (int i = 0; i < OCEAN_WAVES; i++) {
             float fi = float(i);
             float a = fi * 2.39996323 + 0.37;
             vec2 dir = normalize(vec2(cos(a), sin(a)) + vec2(0.0, 0.85));
@@ -229,6 +240,7 @@ export class Ocean {
     this.mesh.position.y = level;
     this.mesh.receiveShadow = false;
   }
+  setNoise(oct: number, waves: number) { setDefines(this.mat, { NOISE_OCT: oct, OCEAN_WAVES: waves }); }
   apply(e: EnvState) {
     const u = this.mat.uniforms;
     u.uDeep.value.copy(e.deep); u.uShallow.value.copy(e.shallow); u.uSky.value.copy(e.zenith).lerp(e.mid, 0.4);

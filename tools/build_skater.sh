@@ -25,6 +25,8 @@ optimise() {  # <raw.glb> <out.glb>
   npx gltf-transform webp "${s}_pr.glb" "${s}_wp.glb" --quality 90 > /dev/null
   npx gltf-transform meshopt "${s}_wp.glb" "$2" --level medium > /dev/null
 }
-optimise "$B/skater_raw.glb" public/models/skater.glb
-if [ -f "$B/people_raw.glb" ]; then optimise "$B/people_raw.glb" public/models/people.glb; fi
+optimise "$B/skater_raw.glb" "$B/skater_opt.glb"
+optimise "$B/people_raw.glb" "$B/people_opt.glb"
+# web slimming: played clips only, int16 + meshopt quaternions, people.glb = crowd clips + baked LODs on the skater mesh
+bash tools/assets/slim_glb.sh "$B/skater_opt.glb" "$B/people_opt.glb" public/models
 ls -la public/models/*.glb public/textures/face_*.webp

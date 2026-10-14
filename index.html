@@ -6,6 +6,15 @@
     <meta name="theme-color" content="#f6c49e" />
     <meta name="description" content="Golden Hour Skatepark - a cosy third-person skateboarding game in the browser." />
     <title>Golden Hour Skatepark</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon-180.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Skatepark" />
+    <!-- same mode and credentials as GLTFLoader's fetch (cors, same-origin): fetched once. people.glb is not preloaded: it
+         is fetched once the game is playable (src/world/people.ts loadCrowd); sharing the link delayed the skater on 4G -->
+    <link rel="preload" href="/models/skater.glb" as="fetch" crossorigin />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='30' r='14' fill='%23ffb46a'/%3E%3Crect x='8' y='46' width='48' height='7' rx='3.5' fill='%233b2a2f'/%3E%3Ccircle cx='18' cy='57' r='3.5' fill='%23fff1d6'/%3E%3Ccircle cx='46' cy='57' r='3.5' fill='%23fff1d6'/%3E%3C/svg%3E" />
   </head>
   <body>
