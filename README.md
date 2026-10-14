@@ -8,8 +8,14 @@ Everything in the game is original: the park, the skater "Sol", the board and it
 
 ## Play
 
-- **Live:** https://starknightt.github.io/skate-park/ (GitHub Pages, once deployed)
+- **Live:** https://starknightt.github.io/skate-park/
+- **Code:** https://github.com/StarKnightt/skate-park
 - **Local:** `pnpm install` then `pnpm dev` and open http://127.0.0.1:5188/
+
+On load he skates the park by himself behind the title (attract mode); press any key or tap to take over.
+Three control modes, switched in the pause menu (Esc) and remembered: **Easy** (default: he keeps rolling, one-button
+flips, auto-grind, landing assist), **Auto-ride** (he rides authored lines through the whole park on his own; any input
+takes over, he picks it back up after a few idle seconds) and **Pro** (the full manual scheme).
 
 ### Controls
 Three control modes. Switch them in the pause menu; the choice is remembered.
@@ -88,10 +94,12 @@ pnpm typecheck
 The GitHub Pages workflow is `.github/workflows/deploy.yml` (pnpm build → actions/deploy-pages).
 
 ### URL parameters
+`?mode=easy|auto|pro` control mode for this visit (not saved) · `?sens=<x>` / `?invertY` mouse look ·
 `?fps=30` frame cap · `?quality=0|1|2` force quality (auto by default) · `?time=sunset|blue|noon` start time ·
 `?touch` force touch controls · `?mute` · `?debug` / `?test` expose `window.__skate` (teleport, setTime, scripted
 input, manual frame stepping `manual(true)` + `advance(n)`, camera views, state, event log) for deterministic
-recordings — see `src/debug/testHooks.ts` and `tools/capture/`.
+recordings — see `src/debug/testHooks.ts` and `tools/capture/` (under `?test` the default mode is Pro, no attract;
+add `&attract` to see the start screen). Real-time smoothness protocol: `tools/realtime/README.md`.
 
 ## How it is made
 
@@ -104,9 +112,15 @@ recordings — see `src/debug/testHooks.ts` and `tools/capture/`.
   benches, sand drifts) and murals on a pavilion, a kiosk and the half-pipe wall. People hang out around the park:
   skaters waiting on the decks, friends on the steps, walkers on the boardwalk, a couple on the beach and a lifeguard.
 - **Physics:** custom kinematic skateboard controller (`src/player/physics.ts`, 120 Hz): slope gravity, rolling
-  resistance, diminishing push, carving, pumping, kickturns, ballistic air with spin control, vert assist and a
-  landing-prediction assist, grinds on polylines, manual balance, wall / curb impacts and a rag-doll-free bail with a
-  tumbling board.
+  resistance, smooth push strokes, ramped steering capped by lateral grip (more on banked walls), pumping, forward and
+  fakie kickturns that keep their height, ballistic air with spin control, vert assist and a landing-prediction assist,
+  grinds on polylines, manual balance, wall / curb impacts and a rag-doll-free bail with a tumbling board; recovery
+  always gets up on level ground (`src/player/recovery.ts`). Easy mode adds landing assist, auto-grind and fast recovery.
+- **Smoothness:** the fixed-step physics is drawn interpolated (`PhysView`: positions, orientations and every pose
+  clock), with Hermite arcs in the air and a lag-free filter on the ground, frame-rate-independent springs and an eased
+  camera, so it is smooth at 60, 144 or 200 Hz alike (measured with `tools/realtime/`).
+- **Auto-ride:** an autopilot (`src/player/autopilot.ts`, lines in `src/player/lines.ts`) that only produces input:
+  pure-pursuit steering along authored lines, speed management, pumping, ollies, flips, grinds, manuals, half-pipe airs.
 - **Skater:** an original character modelled from signed distance fields fitted to the Mixamo reference skeleton
   (`tools/character/sdf_skater.py`), face painted procedurally (`tools/character/paint_face.py`), rigged and exported
   in Blender (`tools/blender/build_skater.py`: automatic weights through a voxel proxy + data transfer), optimised with
