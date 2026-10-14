@@ -6,10 +6,11 @@ const require = createRequire('C:/Code/skate-park/package.json');
 export const { chromium } = require('playwright-core');
 
 export const CHROME = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-// only the main monitor exists (1920x1080 @ ~200 Hz at 0,0): keep the window inside it
-export const SCREEN = { x: 0, y: 0, w: 1920, h: 1080 };
+// test windows live on the portrait second monitor (DISPLAY2: x 1920..3000, work area 1080x1862), never at x < 1920
+export const SCREEN = { x: 1920, y: 0, w: 1080, h: 1862 };
 
-export async function launch({ url, winW = 880, winH = 640, wx = 40, wy = 40, nohmr = true }) {
+export async function launch({ url, winW = 880, winH = 640, wx = 1930, wy = 20, nohmr = true }) {
+  wx = Math.max(1930, wx); wy = Math.max(0, wy); winW = Math.min(winW, 1060); winH = Math.min(winH, 1840);
   const browser = await chromium.launch({
     executablePath: CHROME, headless: false,
     args: [`--window-position=${wx},${wy}`, `--window-size=${winW},${winH}`, '--disable-background-timer-throttling',

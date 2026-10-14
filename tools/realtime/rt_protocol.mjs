@@ -1,4 +1,4 @@
-// Real-time motion protocol for the skate park (builder + critic). Uncapped, headed Chrome on the main monitor, real
+// Real-time motion protocol for the skate park (builder + critic). Uncapped, headed Chrome on the second monitor (DISPLAY2), real
 // keyboard / mouse input, per-frame logs (+ per-physics-step and key logs), optional true-60 fps canvas recordings,
 // then the jitter metric and the feel metric.
 //

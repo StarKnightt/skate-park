@@ -1,5 +1,5 @@
 // Real-time auto-ride check in the browser (run through the capture harness):
-// bash tools/heavy.sh E2 node tools/capture/run.mjs tools/sim/auto_browser.mjs --nohmr --wx 40 --q "test&mute&mode=auto" --out E:/shots/skate-park/pass-04/autoride
+// bash tools/heavy.sh E2 node tools/capture/run.mjs tools/sim/auto_browser.mjs --nohmr --q "test&mute&mode=auto" --out E:/shots/skate-park/pass-04/autoride
 // env: AUTO_SECS (screenshot pass length, default 75), AUTO_CLIP (60 fps canvas clip seconds, default 20, 0 = off)
 import fs from 'node:fs';
 import path from 'node:path';

@@ -1,5 +1,5 @@
 // Real-time auto-ride capture: full lap clip, player handoff clip, start-screen attract clip (60 fps canvas recordings).
-// bash tools/heavy.sh E2 node tools/capture/run.mjs tools/sim/auto_final2.mjs --nohmr --wx 40 --q "test&mute&mode=auto" --out E:/shots/skate-park/pass-04/autoride/final2
+// bash tools/heavy.sh E2 node tools/capture/run.mjs tools/sim/auto_final2.mjs --nohmr --q "test&mute&mode=auto" --out E:/shots/skate-park/pass-04/autoride/final2
 // env: LAP_SECS (default 80), HANDOFF (1/0), ATTRACT_SECS (default 22, 0 = skip)
 import fs from 'node:fs';
 import path from 'node:path';

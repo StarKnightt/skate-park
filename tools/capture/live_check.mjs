@@ -1,4 +1,4 @@
-// Load a deployed (or local production) build in headed Chrome on the main monitor, play a few seconds with real input
+// Load a deployed (or local production) build in headed Chrome on the second monitor (DISPLAY2), play a few seconds with real input
 // and report console errors, failed requests, the default control mode and whether the pause menu opens and closes.
 // node tools/capture/live_check.mjs [--url https://starknightt.github.io/skate-park/] [--out E:/shots/skate-park/pass-04/deploy] [--name live]
 import { chromium } from 'playwright-core';
@@ -14,7 +14,8 @@ fs.mkdirSync(out, { recursive: true });
 
 const browser = await chromium.launch({
   executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: false,
-  args: ['--window-position=60,40', '--window-size=1300,860', '--no-first-run', '--no-default-browser-check',
+  // second monitor only (DISPLAY2, x >= 1920); the 1280x720 viewport is emulated inside the smaller window
+  args: ['--window-position=1930,20', '--window-size=1060,900', '--no-first-run', '--no-default-browser-check',
     '--mute-audio', '--ignore-gpu-blocklist', '--disable-features=CalculateNativeWinOcclusion'],
 });
 const page = await (await browser.newContext({ viewport: { width: 1280, height: 720 }, deviceScaleFactor: 1 })).newPage();

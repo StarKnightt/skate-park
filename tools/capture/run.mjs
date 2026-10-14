@@ -16,11 +16,12 @@ const query = opt('q', 'test&fps=30&mute');
 fs.mkdirSync(out, { recursive: true });
 
 const chrome = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-// only the main 1920x1080 monitor exists now: keep the window inside it (--wx/--wy move it)
-const WX = Number(opt('wx', 40)), WY = Number(opt('wy', 40));
+// test windows live on the portrait second monitor (DISPLAY2: x 1920..3000, work area 1080x1862), never at x < 1920;
+// the emulated viewport (W x H) is independent of the window size
+const WX = Math.max(1930, Number(opt('wx', 1930))), WY = Math.max(0, Number(opt('wy', 20)));
 const browser = await chromium.launch({
   executablePath: chrome, headless: false,
-  args: [`--window-position=${WX},${WY}`, `--window-size=${Math.min(1880, W + 40)},${Math.min(1040, H + 160)}`, '--disable-background-timer-throttling',
+  args: [`--window-position=${WX},${WY}`, `--window-size=${Math.min(1060, W + 40)},${Math.min(1840, H + 160)}`, '--disable-background-timer-throttling',
     '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', '--mute-audio', '--no-first-run',
     '--no-default-browser-check', '--disable-features=CalculateNativeWinOcclusion', '--ignore-gpu-blocklist'],
 });

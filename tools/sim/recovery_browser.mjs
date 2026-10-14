@@ -1,6 +1,6 @@
 // Browser check of the user's bowl case (feedback #5): ride up the main bowl's east wall, bail just under the coping,
 // frame-step the recovery and log, per frame, the skater phase and the ground under his feet while he is up.
-//   bash tools/heavy.sh D node tools/capture/run.mjs tools/sim/recovery_browser.mjs --nohmr --wx 40 --out E:/shots/skate-park/pass-04/recovery
+//   bash tools/heavy.sh D node tools/capture/run.mjs tools/sim/recovery_browser.mjs --nohmr --out E:/shots/skate-park/pass-04/recovery
 import fs from 'node:fs';
 import path from 'node:path';
 

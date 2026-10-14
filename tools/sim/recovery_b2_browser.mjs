@@ -1,6 +1,6 @@
 // Batch 2 browser check in Easy mode (assists from the control mode): an ollie along the long ledge (auto-grind without
 // E, rides off the end without re-catching it) and a bail just under the main bowl's coping (quick recovery).
-//   bash tools/heavy.sh D node tools/capture/run.mjs tools/sim/recovery_b2_browser.mjs --nohmr --wx 40 --q "test&mute&mode=easy" --out E:/shots/skate-park/pass-04/recovery/b2
+//   bash tools/heavy.sh D node tools/capture/run.mjs tools/sim/recovery_b2_browser.mjs --nohmr --q "test&mute&mode=easy" --out E:/shots/skate-park/pass-04/recovery/b2
 import fs from 'node:fs';
 import path from 'node:path';
 
