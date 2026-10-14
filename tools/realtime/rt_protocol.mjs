@@ -26,7 +26,7 @@ let url = opt('url', 'http://127.0.0.1:5188/?test&mute');
 if (FPS && !SWEEP) url += (url.includes('?') ? '&' : '?') + 'fps=' + FPS;
 const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '_').slice(0, 15);
 const name = opt('name', (SWEEP ? 'sweep' + SWEEP.join('-') : FPS ? 'rt' + FPS : 'rt') + '_' + stamp);
-const out = opt('out', 'E:/shots/skate-park/pass-04/realtime/' + name);
+const out = opt('out', 'E:/shots/skate-park/pass-05/realtime/' + name);
 const ONLY = opt('only', '') ? opt('only', '').split(',') : null;
 const RECORD = flag('record') && !SWEEP;
 const LOGS = path.join(out, 'logs'), RAW = path.join(out, 'video', 'raw'), EXACT = path.join(out, 'exact200');

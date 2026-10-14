@@ -8,7 +8,7 @@ import path from 'node:path';
 const args = process.argv.slice(2);
 const opt = (k, d) => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : d; };
 const url = opt('url', 'https://starknightt.github.io/skate-park/');
-const out = opt('out', 'E:/shots/skate-park/pass-04/deploy');
+const out = opt('out', 'E:/shots/skate-park/pass-05/deploy');
 const name = opt('name', 'live');
 fs.mkdirSync(out, { recursive: true });
 
