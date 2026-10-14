@@ -81,6 +81,27 @@ const expect = (name, cond, detail) => { n++; if (cond) pass++; console.log(`${c
   expect('bowl deck along the coping, Easy: coping 50-50 (approach runs along it)', has(on, 'grindStart'), on.ev.filter((e) => /grind|dropIn|bail/.test(e.type)).map((e) => e.type + '@' + e.t).join(' '));
 }
 
+// ---- regression (E2, batch 1): on top of the long ledge at its end after a recovery, auto-grind caught the line end while
+// moving off it and looped grindStart / grindEnd every 0.3 s. Easy cruise is emulated by pushing below 3.8 m/s.
+{
+  const cruise = (t, ph) => ({ push: ph.speed < 3.8 });
+  let worst = 0, shortCatch = 0, cases = 0;
+  for (const [x, z, hd] of [[-10, -12.6, 270], [-9.9, -12.55, 270], [-9.8, -12.3, 270], [-10, -12.05, 250], [-9.85, -12.58, 290], [-0.1, -12.3, 90], [-0.15, -12.55, 80], [-0.05, -12.05, 100]]) {
+    for (const sp of [0, 1.6, 2.2, 3.0]) {
+      const c = { pos: [x, 0.6, z], heading: hd, speed: sp, T: 4, input: cruise };
+      const r = run(c, true);
+      cases++;
+      const n = r.ev.filter((e) => e.type === 'grindStart').length;
+      worst = Math.max(worst, n);
+      // a grind that ends within 0.15 s of starting was caught at an end
+      const st = r.ev.filter((e) => e.type === 'grindStart'), en = r.ev.filter((e) => e.type === 'grindEnd');
+      for (const s of st) { const e = en.find((q) => q.t >= s.t); if (e && e.t - s.t < 0.15) shortCatch++; }
+    }
+  }
+  expect(`long ledge end, on top, Easy (${cases} starts): no grind loop (most grind starts in 4 s: ${worst})`, worst <= 1);
+  expect(`long ledge end: no catch that ends at once (${shortCatch})`, shortCatch === 0);
+}
+
 // ---- landing assist
 {
   // ollie on flat, spin the board ~70 degrees off the travel in the air

@@ -103,9 +103,52 @@ export function grindDist(world: CollisionWorld, p: Vector3) {
   return best;
 }
 
+/** p is on the top of a ledge, manual pad or funbox: grindable edges at its height on both sides of it */
+export function onTop(world: CollisionWorld, p: Vector3) {
+  let sides = 0;
+  for (const l of world.grindLines) {
+    if (l.kind === 'coping') continue;
+    const n = l.pts.length, segs = l.closed ? n : n - 1;
+    for (let i = 0; i < segs; i++) {
+      const a = l.pts[i], c = l.pts[(i + 1) % n];
+      const abx = c.x - a.x, abz = c.z - a.z, l2 = abx * abx + abz * abz;
+      if (l2 < 1e-9) continue;
+      const u = ((p.x - a.x) * abx + (p.z - a.z) * abz) / l2;
+      if (u < -0.02 || u > 1.02 || Math.abs(a.y + (c.y - a.y) * u - p.y) > 0.12) continue;
+      const sd = (abx * (p.z - a.z) - abz * (p.x - a.x)) / Math.sqrt(l2);
+      if (Math.abs(sd) < 3.5) sides |= sd > 0 ? 1 : 2;
+    }
+  }
+  return sides === 3;
+}
+
+/**
+ * The ground under the straight line a -> b (5 cm steps, seen from above): the way a board rolls along the surface
+ * from one level to another (over a coping and down the wall, or up it and out). Normals are smoothed over ~25 cm so it
+ * turns over a lip instead of snapping. null where there is no ground.
+ */
+export function groundRoute(world: CollisionWorld, a: Vector3, b: Vector3) {
+  const L = Math.hypot(b.x - a.x, b.z - a.z), n = Math.max(2, Math.ceil(L / 0.05));
+  const top = Math.max(a.y, b.y) + 1.5, pts: Vector3[] = [], nrm: Vector3[] = [];
+  for (let i = 0; i <= n; i++) {
+    const k = i / n;
+    const h = world.raycast(_o.set(a.x + (b.x - a.x) * k, top, a.z + (b.z - a.z) * k), DOWN, top - Math.min(a.y, b.y) + 1);
+    if (!h) return null;
+    pts.push(h.point); nrm.push(h.normal);
+  }
+  const sm = nrm.map((_, i) => {
+    const s = new Vector3();
+    for (let j = Math.max(0, i - 2); j <= Math.min(n, i + 2); j++) s.add(nrm[j]);
+    return s.normalize();
+  });
+  let len = 0;
+  for (let i = 1; i < pts.length; i++) len += pts[i].distanceTo(pts[i - 1]);
+  return { pts, nrm: sm, len };
+}
+
 /** open flat ground for the board at p: level all around, no wall, no grind line close by (tight: just room for it) */
 export function boardSpotOK(world: CollisionWorld, p: Vector3, n: Vector3, tight = false) {
-  if (n.y < FLAT_NY) return false;
+  if (n.y < FLAT_NY || onTop(world, p)) return false;
   if (world.closestPoint(_c.set(p.x, p.y + 0.8, p.z), tight ? 0.5 : 0.7)) return false;
   if (grindDist(world, p) < (tight ? 0.7 : 1.0)) return false;
   for (const [r, k] of tight ? [[0.5, 8]] : [[0.6, 8], [1.05, 10]]) {
@@ -176,10 +219,11 @@ export function planRecovery(world: CollisionWorld, stand: Vector3, board: Board
       const h = groundAt(world, pos.x + fwd.x * s, pos.z + fwd.z * s, pos.y, 0.3, 0.4);
       flat = !!h && h.normal.y >= WALK_NY && Math.abs(h.point.y - pos.y) <= 0.05;
     }
-    const room = flat && standClear(world, _d.copy(pos).addScaledVector(up, 0.12));
+    const top = flat && onTop(world, pos);
+    const room = flat && !top && standClear(world, _d.copy(pos).addScaledVector(up, 0.12));
     const s = room ? stepOnFrom(world, stand, pos, fwd, up, maxWalk) : null;
     if (s) return { stand: stand.clone(), ride: pos.clone(), fwd: s.fwd, up: up.clone(), target: s.target, faceYaw: s.faceYaw, relocate: false, path: s.path, why: 'walk' };
-    miss = !flat ? 'not flat' : !room ? 'no room' : 'no walk';
+    miss = !flat ? 'not flat' : top ? 'on top' : !room ? 'no room' : 'no walk';
   }
   const prefer = o.prefer ?? board?.fwd;
   // right in front of him (he only has to step on), then rings outward

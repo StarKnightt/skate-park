@@ -37,7 +37,7 @@ for (const seed of seeds) {
   let cur = mk();
   const lapsOut = [];
   const prevPos = ph.pos.clone();
-  let prevLine = '';
+  let prevLine = '', prevHp = null;
   while (t < secs && lap <= laps) {
     ph.events.length = 0;
     const inp = ap.sample(STEP, ph.mode === 'air');
@@ -55,12 +55,14 @@ for (const seed of seeds) {
       if (e.type === 'grindStart') { cur.grinds.push(e.name); cur.cov.add(e.kind === 'rail' ? 'rail' : e.kind === 'ledge' ? 'ledge' : 'coping'); cur.tricks++; }
       if (e.type === 'manualStart') { cur.manuals++; cur.cov.add('manual'); cur.tricks++; }
       if (e.type === 'kickturn') { cur.kicks++; cur.tricks++; if (f === 'qp') cur.cov.add('qp'); if (f === 'halfpipe') cur.cov.add('halfpipe'); }
-      if (e.type === 'vertAir') { cur.airs++; cur.tricks++; if (f === 'qp') cur.cov.add('qp'); if (f === 'halfpipe') cur.cov.add('halfpipe'); if (f === 'bowl') cur.cov.add('bowl'); }
+      if (e.type === 'vertAir') { cur.airs++; cur.tricks++; if (f === 'qp') cur.cov.add('qp'); if (f === 'halfpipe') { cur.cov.add('halfpipe'); cur.cov.add('hpAir'); } if (f === 'bowl') cur.cov.add('bowl'); }
       if (e.type === 'pop') { if (e.flip) { cur.flips++; } cur.tricks++; if (f === 'funbox') cur.cov.add('funbox'); }
       if (e.type === 'land' && e.quality === 'wobble') cur.wobbles++;
       if (e.type === 'dropIn' && f === 'bowl') cur.cov.add('bowl');
     }
     if (ph.mode === 'ride' && ph.up.y < 0.75) { if (f === 'halfpipe') cur.cov.add('halfpipe'); if (f === 'qp') cur.cov.add('qp'); if (f === 'bowl') cur.cov.add('bowl'); }
+    if (prevHp && !ap.hp) cur.hp = `${prevHp.passes} passes, ${prevHp.airs} airs, ${prevHp.t.toFixed(1)} s, last bottom ${prevHp.vBottom.toFixed(2)} m/s`;
+    prevHp = ap.hp ? { ...ap.hp } : null;
     cur.dist += ph.pos.distanceTo(prevPos); prevPos.copy(ph.pos);
     if (ph.mode === 'ride' && ph.speed < 0.3 && ph.kickturn.t < 0) { slow += STEP; if (slow > 3 && slow - STEP <= 3) cur.stuck++; } else slow = 0;
     if (Math.abs(ph.pos.x) > 39.3 || ph.pos.z < -27.6 || ph.pos.z > 26.4 || ph.pos.y < -3 || ph.pos.y > 8) cur.out++;
@@ -85,6 +87,7 @@ for (const seed of seeds) {
     const line = `seed ${seed} lap ${i + 1}${l.unfinished ? ' (UNFINISHED at ' + ap.lineName + ')' : ''}: ${l.t.toFixed(1)} s, ${l.dist.toFixed(0)} m, avg ${(l.dist / Math.max(1, l.t)).toFixed(2)} m/s, bails ${l.bails.length}, stuck ${l.stuck}, out ${l.out}, tricks ${l.tricks} (flips ${l.flips}, grinds ${l.grinds.length}, manuals ${l.manuals}, kickturns ${l.kicks}, airs ${l.airs}), wobbles ${l.wobbles}, cov [${[...l.cov].sort().join(',')}]`;
     console.log(line);
     for (const b of l.bails) console.log('    bail ' + b);
+    if (l.hp) console.log('    half pipe: ' + l.hp);
     if (flag('grinds')) console.log('    grinds: ' + l.grinds.slice(0, 12).join(', '));
     all.push({ seed, ...l });
   }

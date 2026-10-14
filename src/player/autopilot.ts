@@ -2,13 +2,15 @@ import { Vector3 } from 'three';
 import type { Game } from '../game';
 import type { AutoSource } from '../core/input';
 import { emptyInput, type FlipDir, type SkateInput, type SkatePhysics } from './physics';
-import { lapLines, type Act, type Feature, type Line } from './lines';
+import { lapLines, SPAWN_INTRO, type Act, type Feature, type Line } from './lines';
 
 interface Node { x: number; z: number; y: number; v: number; act?: Act; f: Feature; y3: boolean; s: number; line: number }
-type State = 'follow' | 'wall' | 'manual';
+type State = 'follow' | 'wall' | 'manual' | 'hp';
+interface HpSession { node: number; cx: number; z0: number; z1: number; want: number; maxPasses: number; side: number; drift: number;
+  passes: number; airs: number; onWall: boolean; inAir: boolean; t: number; vBottom: number; lastX: number; peak: number; peaks: number[] }
 
 const Y = new Vector3(0, 1, 0);
-const _a = new Vector3(), _b = new Vector3(), _c = new Vector3(), _d = new Vector3(), _e = new Vector3();
+const _a = new Vector3(), _b = new Vector3(), _c = new Vector3(), _d = new Vector3(), _e = new Vector3(), _tv = new Vector3();
 const FLIPS: [FlipDir, number][] = [['left', 0.3], ['right', 0.25], ['down', 0.25], ['up', 0.2]];
 
 function mulberry(seed: number) {
@@ -51,6 +53,9 @@ export class Autopilot implements AutoSource {
   private escapeT = 0; private escapeDir = 1; private trapT = 0;
   /** unstick manoeuvres so far (stats) */
   stuck = 0;
+  /** current half pipe session (passes, airs, speed at the bottom of the last pass) */
+  hp: HpSession | null = null;
+  private intro: { i: number; join: number } | null = null;
   private airTrickDone = false;
   private reacquire = true;
   private copeOut = false;
@@ -92,7 +97,45 @@ export class Autopilot implements AutoSource {
 
   reset() {
     this.state = 'follow'; this.reacquire = true; this.grindHold = 0; this.manualLeft = 0;
-    this.slowT = 0; this.copeOut = false; this.grindPlan = null; this.steerF = 0; this.escapeT = 0;
+    this.slowT = 0; this.copeOut = false; this.grindPlan = null; this.steerF = 0; this.escapeT = 0; this.hp = null;
+    // standing at the spawn (load, respawn): ride the intro line onto the lap
+    const ph = this.ph, f = SPAWN_INTRO.from;
+    this.intro = null;
+    if (this.nodes.length && ph.speed < 0.8 && Math.hypot(ph.pos.x - f.x, ph.pos.z - f.z) < 3) {
+      let join = 0, bd = Infinity;
+      this.nodes.forEach((n, i) => { const d = Math.hypot(n.x - SPAWN_INTRO.join.x, n.z - SPAWN_INTRO.join.z); if (d < bd) { bd = d; join = i; } });
+      this.intro = { i: 0, join };
+    }
+  }
+
+  /** follow the spawn intro; false once it has handed over to the lap */
+  private introStep(dt: number, inp: SkateInput) {
+    const ph = this.ph, it = this.intro!, pts = SPAWN_INTRO.pts, sp = ph.speed;
+    while (it.i < pts.length) {
+      const p = pts[it.i], q = it.i > 0 ? pts[it.i - 1] : SPAWN_INTRO.from;
+      const dx = p.x - q.x, dz = p.z - q.z, t = ((ph.pos.x - q.x) * dx + (ph.pos.z - q.z) * dz) / (dx * dx + dz * dz || 1);
+      if (Math.hypot(ph.pos.x - p.x, ph.pos.z - p.z) < 1.5 || t > 1) it.i++; else break;
+    }
+    if (it.i >= pts.length) {
+      this.intro = null;
+      this.seg = it.join; this.s = this.nodes[it.join].s; this.fired.clear(); this.reached.clear();
+      return false;
+    }
+    // lookahead along the rest of the intro and on into the lap
+    const route = [...pts.slice(it.i), ...[0, 1, 2].map((k) => this.nodes[(it.join + k) % this.nodes.length])];
+    let L = clamp(1.3 + 0.42 * sp, 1.7, 4.6), px = ph.pos.x, pz = ph.pos.z;
+    const tgt = _e.set(route[0].x, ph.pos.y, route[0].z);
+    for (const r of route) {
+      const d = Math.hypot(r.x - px, r.z - pz);
+      if (d >= L) { tgt.set(px + ((r.x - px) * L) / d, ph.pos.y, pz + ((r.z - pz) * L) / d); break; }
+      L -= d; px = r.x; pz = r.z; tgt.set(px, ph.pos.y, pz);
+    }
+    const steer = this.pursue(tgt);
+    this.steerF += (steer - this.steerF) * (1 - Math.exp(-dt / 0.05));
+    inp.steer = Math.abs(this.steerF) < 0.02 ? 0 : this.steerF;
+    const vt = pts[it.i].v * (this._attract ? 0.92 : 1);
+    inp.push = sp < vt - 0.25; inp.brake = sp > vt + 1.1;
+    return true;
   }
 
   /** feature of the line being ridden (for coverage stats) */
@@ -248,6 +291,9 @@ export class Autopilot implements AutoSource {
     return clamp(-omega / wmax, -1, 1);
   }
 
+  /** W on a transition while moving down it pumps (released on the way up, so the lip still gives a vert air) */
+  private pumping() { const ph = this.ph; return ph.up.y > 0.2 && ph.up.y < 0.97 && ph.vel.y < -0.05; }
+
   private pickFlip(): FlipDir {
     let r = this.rnd();
     for (const [d, w] of FLIPS) { if ((r -= w) <= 0) return d; }
@@ -269,10 +315,14 @@ export class Autopilot implements AutoSource {
     this.airTrickDone = false;
 
     // ---- ride
+    if (this.intro && this.introStep(dt, inp)) return inp;
     if (this.reacquire) { this.acquire(false); this.reacquire = false; }
-    if (ph.dropin || ph.kickturn.t >= 0) { this.steerF = 0; return inp; }
+    // kickturn: gravity already pulls the board back down the wall during the pivot, so keep pumping
+    if (ph.kickturn.t >= 0) { this.steerF = 0; inp.push = this.pumping(); return inp; }
+    if (ph.dropin) { this.steerF = 0; return inp; }
     const sp = ph.speed;
     if (this.state === 'wall') return this.wallStep(dt, inp);
+    if (this.state === 'hp') return this.hpStep(dt, inp);
     const ax = this.apex(dt);
     this.acquire(false);
     // down in a bowl floor while the line runs on the deck above: climb out first
@@ -297,7 +347,7 @@ export class Autopilot implements AutoSource {
           this.fired.add(i);
           inp.ollie = true; crouch = false;
           inp.popCharge = a.charge ?? 0.6;
-          if (a.k === 'ollie' && a.flip && !this._attract) inp.flip = this.pickFlip();
+          if (a.k === 'ollie' && a.flip) inp.flip = this._attract ? (this.rnd() < 0.5 ? 'left' : 'down') : this.pickFlip();
           if (a.k === 'grind') { inp.grindPressed = true; this.grindHold = 0.7; this.grindPlan = this.planGrind(); }
           this.lastAct = a.k + (inp.flip ? ':' + inp.flip : '');
         }
@@ -306,8 +356,20 @@ export class Autopilot implements AutoSource {
       } else if (a.k === 'manual' && dRem <= 0.1) {
         this.fired.add(i); this.state = 'manual'; this.manualLeft = a.len * (this._attract ? 1.25 : 1); this.lastAct = 'manual';
       } else if ((a.k === 'wall' || a.k === 'copeOut') && dRem <= 0.25) {
-        this.fired.add(i); this.startWall(i); this.lastAct = a.k;
+        this.fired.add(i);
+        const prev = this.nodes[(i - 1 + N) % N];
+        // a straight hit needs a straight approach: way off it, just keep following the line
+        if (a.k === 'wall' && Math.abs(this.angleTo(_e.set(nd.x - prev.x, 0, nd.z - prev.z))) > 1.0) continue;
+        this.startWall(i); this.lastAct = a.k;
         return this.wallStep(dt, inp);
+      } else if (a.k === 'hpAirs' && dRem <= 0.3) {
+        this.fired.add(i); this.lastAct = 'hpAirs';
+        this.seg = i; this.s = nd.s;
+        this.hp = { node: i, cx: a.cx, z0: a.z0, z1: a.z1, want: a.airs - (this.rnd() < 0.4 ? 1 : 0), maxPasses: a.passes,
+          side: ph.pos.x >= a.cx ? -1 : 1, drift: -1, passes: 0, airs: 0, onWall: false, inAir: false, t: 0, vBottom: 0, lastX: ph.pos.x,
+          peak: 0, peaks: [] };
+        this.state = 'hp';
+        return this.hpStep(dt, inp);
       }
     }
     if (this.grindHold > 0) { this.grindHold -= dt; inp.grind = true; }
@@ -335,10 +397,7 @@ export class Autopilot implements AutoSource {
     } else if (flat) {
       inp.push = sp < vt - 0.25 && !crouch;
       inp.brake = sp > vt + 1.1;
-    } else if (ph.up.y > 0.2) {
-      // pump the downhill side of transitions
-      inp.push = ph.vel.y < -0.4;
-    }
+    } else inp.push = this.pumping();
     // stuck against something: pivot away on the spot, push off, then look for the line again
     if (this.escapeT > 0) {
       this.escapeT -= dt;
@@ -375,6 +434,7 @@ export class Autopilot implements AutoSource {
   private airStep(inp: SkateInput) {
     const ph = this.ph;
     if (this.grindHold > 0) { this.grindHold -= 1 / 120; inp.grind = true; }
+    if (ph.vert && this.state === 'hp' && this.hp && !this.hp.inAir) { this.hp.inAir = true; this.hp.airs++; }
     // vert airs: sometimes a late flip while hanging over the ramp
     if (ph.vert && !this.airTrickDone && !this._attract && ph.airTime > 0.06) {
       this.airTrickDone = true;
@@ -425,6 +485,40 @@ export class Autopilot implements AutoSource {
     return inp;
   }
 
+  /** half pipe session: straight passes between the walls, pump every downhill, vert airs once the speed is there */
+  private hpStep(dt: number, inp: SkateInput) {
+    const ph = this.ph, h = this.hp!;
+    h.t += dt; h.inAir = false;
+    const onFlat = ph.up.y > 0.97;
+    const tv = this.travel(_tv);
+    if ((ph.pos.x - h.cx) * (h.lastX - h.cx) < 0) h.vBottom = ph.speed;
+    h.lastX = ph.pos.x;
+    if (!onFlat && (ph.pos.x - h.cx) * h.side > 0) { h.onWall = true; h.peak = Math.max(h.peak, ph.pos.y); }
+    // back on the flat rolling away from that wall: one pass done, head for the other one
+    if (onFlat && h.onWall && ph.vel.x * h.side < -0.5) { h.passes++; h.side = -h.side; h.onWall = false; h.peaks.push(h.peak); h.peak = 0; }
+    // pumping that no longer gains height (or airs out of reach) is not worth watching for long
+    const pk = h.peaks, stalled = h.airs === 0 && pk.length >= 4 && pk[pk.length - 1] < pk[pk.length - 3] + 0.12;
+    // hand back on the flat while heading for the +x wall: the line carves that wall round to the exit
+    if (onFlat && !h.onWall && h.side > 0 && (h.airs >= h.want || h.passes >= h.maxPasses || stalled || h.t > 32)) {
+      this.hp = null; this.state = 'follow';
+      const nx = (h.node + 1) % this.nodes.length;
+      this.seg = nx; this.s = this.nodes[nx].s; this.acquire(false);
+      return inp;
+    }
+    if (ph.pos.z < h.z0) h.drift = 1; else if (ph.pos.z > h.z1) h.drift = -1;
+    let dir: Vector3;
+    if (onFlat) dir = _d.set(h.side, 0, 0.17 * h.drift).normalize();
+    else {
+      const up = _d.copy(Y).addScaledVector(ph.up, -ph.up.y);
+      if (up.lengthSq() < 1e-6) dir = tv; else { up.normalize(); dir = tv.dot(up) >= 0 ? up : up.negate(); }
+    }
+    const steer = clamp(-2.2 * this.angleTo(dir), -1, 1);
+    this.steerF += (steer - this.steerF) * (1 - Math.exp(-dt / 0.05));
+    inp.steer = this.steerF;
+    inp.push = onFlat ? ph.speed < 9 && tv.dot(dir) > 0.3 : this.pumping();
+    return inp;
+  }
+
   private startWall(i: number) {
     const n = this.nodes, prev = n[(i - 1 + n.length) % n.length], w = n[i];
     this.wallDir.set(w.x - prev.x, 0, w.z - prev.z).normalize();
@@ -466,7 +560,7 @@ export class Autopilot implements AutoSource {
   private wallStep(dt: number, inp: SkateInput) {
     const ph = this.ph, wn = this.wallN!;
     this.wallT += dt;
-    const tv = this.travel(_c);
+    const tv = this.travel(_tv);
     const onFlat = ph.up.y > 0.97;
     const away = onFlat && this.wallT > 0.6 && tv.dot(this.wallDir) < -0.2;
     if (wn.line === -1 && wn.act?.k === 'copeOut') {
@@ -483,7 +577,7 @@ export class Autopilot implements AutoSource {
         return inp;
       }
       if (ph.pos.y > wn.y + 1.5) { inp.grind = true; inp.grindPressed = true; }
-    } else if (away || this.wallT > 8) { this.leaveWall(this.wallNode + 1); return inp; }
+    } else if (away || this.wallT > 8 || onFlat && this.wallT > 1.5 && ph.speed < 0.3) { this.leaveWall(this.wallNode + 1); return inp; }
     let dir: Vector3;
     if (onFlat) dir = tv.dot(this.wallDir) >= 0 ? this.wallDir : _d.copy(this.wallDir).negate();
     else {
@@ -505,7 +599,7 @@ export class Autopilot implements AutoSource {
     this.steerF += (steer - this.steerF) * (1 - Math.exp(-dt / 0.05));
     inp.steer = this.steerF;
     if (onFlat) inp.push = ph.speed < wn.v - 0.25 && tv.dot(this.wallDir) > 0;
-    else inp.push = ph.up.y > 0.2 && ph.vel.y < -0.4;
+    else inp.push = this.pumping();
     return inp;
   }
 }

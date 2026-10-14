@@ -1,6 +1,7 @@
 import {
   Color, Fog, Group, HemisphereLight, Mesh, PCFShadowMap, PerspectiveCamera, PlaneGeometry, Quaternion, Scene,
   SRGBColorSpace, Texture, TextureLoader, Vector3, WebGLRenderer, NoToneMapping, MathUtils, DoubleSide, SpotLight,
+  type LOD, type WebGLRenderTarget,
 } from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
@@ -20,7 +21,7 @@ import { Skater } from './player/skater';
 import { CameraRig } from './player/cameraRig';
 import { TrickTracker } from './player/tricks';
 import { createAutopilot } from './player/autopilot';
-import { Input } from './core/input';
+import { Input, type AutoSource } from './core/input';
 import { settings, onSettings, type QualitySetting } from './core/settings';
 import { Hud, TouchControls } from './ui/hud';
 import { installPauseMenu } from './ui/pauseMenu';
@@ -33,6 +34,12 @@ export const STEP = 1 / 120;
 /** physics steps per displayed frame at most; a longer hitch becomes a brief slow-down */
 const MAX_STEPS = 12;
 const _f = new Vector3(), _g = new Vector3();
+const MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock', 'NumLock', 'ScrollLock', 'OS', 'Fn']);
+/** any gamepad button down or stick out of its deadzone */
+const padActive = () => {
+  for (const p of navigator.getGamepads?.() ?? []) if (p && (p.buttons.some((b) => b.pressed) || p.axes.some((a) => Math.abs(a) > 0.3))) return true;
+  return false;
+};
 
 export class Game {
   renderer: WebGLRenderer;
@@ -80,6 +87,8 @@ export class Game {
   /** physics state after the previous / the last step, and the interpolated state every visual layer draws */
   prevV = new PhysView();
   curV = new PhysView();
+  groundPos = new Vector3();
+  groundMode = 'ride';
   view = new PhysView();
   /** last displayed frame: physics steps run, interpolation fraction */
   frameSteps = 0;
@@ -237,7 +246,7 @@ export class Game {
     if (DEBUG) installTestHooks(this);
     if (!params.has('quality')) this.setQuality(settings.quality);
     onSettings((s, k) => { if (k === 'quality' && !params.has('quality')) this.setQuality(s.quality); });
-    this.renderer.compile(this.scene, this.camera);
+    if (params.has('nowarm')) this.renderer.compile(this.scene, this.camera); else await this.warmUp(prog);
     prog(1);
     this.ready = true;
     loading?.classList.add('done');
@@ -245,6 +254,77 @@ export class Game {
     if (!touchMode && !params.has('mute')) this.hud.soundPrompt();
     this.renderer.setAnimationLoop((t) => this.frame(t));
     installPauseMenu(this);
+    // start screen: he skates the park by himself under the title card until the first input
+    if (!DEBUG || params.has('attract')) this.startAttract();
+  }
+
+  /** Compile every shader variant and upload every texture and buffer before the first frame (all distance levels and
+   *  hidden objects, the sun / lamp / hero shadow passes, the post passes): otherwise, with a cold shader cache (a first
+   *  visit), the first view of an area stalls for 100-250 ms. */
+  private async warmUp(prog: (p: number) => void) {
+    const r = this.renderer, scene = this.scene, t0 = performance.now();
+    // the people load on their own: give them a few seconds to arrive
+    while (!this.scenery.people.group.children.length && performance.now() - t0 < 8000) await new Promise((res) => setTimeout(res, 50));
+    prog(0.88);
+    const undo: (() => void)[] = [];
+    scene.traverse((o) => {
+      if (!o.visible) { o.visible = true; undo.push(() => { o.visible = false; }); }
+      const lod = o as LOD;
+      if (lod.isLOD && lod.autoUpdate) { lod.autoUpdate = false; undo.push(() => { lod.autoUpdate = true; }); }
+      if (o.frustumCulled) { o.frustumCulled = false; undo.push(() => { o.frustumCulled = true; }); }
+    });
+    try {
+      // the scene is drawn into the composer's linear half-float buffer: compile for that target, not the canvas
+      const target = (this.post.composer as unknown as { inputBuffer?: WebGLRenderTarget }).inputBuffer ?? null;
+      r.setRenderTarget(target);
+      await r.compileAsync(scene, this.camera);
+      r.setRenderTarget(null);
+      prog(0.96);
+      // one frame through the real pipeline with nothing culled: shadow maps, hero shadow, post passes, uploads
+      this.lampSpot.shadow.needsUpdate = true;
+      this.render(1 / 60);
+    } catch (e) {
+      console.warn('warm-up skipped', e); // whatever is left compiles on first use
+    } finally {
+      r.setRenderTarget(null);
+      undo.forEach((f) => f());
+      this.lampSpot.shadow.needsUpdate = true;
+    }
+    this.warmMs = performance.now() - t0;
+  }
+  /** load-time warm-up duration (ms), for tests */
+  warmMs = 0;
+
+  // ---------------------------------------------------------------- start screen (attract mode)
+  /** the autopilot rides the calmer attract lap under the title card until the first input */
+  attract = false;
+  private attractOff: (() => void) | null = null;
+  private titleHide = false;
+  private startAttract() {
+    const auto = this.input.auto as (AutoSource & { attract?: boolean }) | null;
+    if (!auto) return;
+    this.attract = true;
+    if ('attract' in auto) auto.attract = true;
+    this.input.setAuto(true);
+    this.hud.showTitle(true);
+    const end = () => this.endAttract();
+    const key = (e: KeyboardEvent) => { if (!MODIFIER_KEYS.has(e.key)) end(); };
+    // pointerdown: a canvas click (also the one that locks the pointer) or a tap; the HUD pills stop propagation
+    addEventListener('keydown', key);
+    addEventListener('pointerdown', end);
+    this.attractOff = () => { removeEventListener('keydown', key); removeEventListener('pointerdown', end); };
+  }
+  /** first input: the title goes, the player takes over (he keeps rolling; Easy keeps cruising); Auto keeps riding */
+  endAttract() {
+    if (!this.attract) return;
+    this.attract = false;
+    this.attractOff?.(); this.attractOff = null;
+    const auto = this.input.auto as (AutoSource & { attract?: boolean }) | null;
+    if (auto && 'attract' in auto) auto.attract = false;
+    if (settings.controlMode === 'auto') this.input.setAuto(true);
+    else { this.input.setAuto(false); this.input.armCruise(); }
+    // hidden after the HUD has seen auto-ride go off, so the hand-over shows no "Auto-ride off" toast
+    this.titleHide = true;
   }
 
   // ---------------------------------------------------------------- pause / time / quality (used by the pause menu)
@@ -456,6 +536,14 @@ export class Game {
     this.frameSteps = n;
     this.frameAlpha = clamp(this.acc / STEP, 0, 1);
     const v = this.view.lerp(this.prevV, this.curV, this.frameAlpha);
+    // sub-mm ground position noise (snapping to the collision facets) is filtered without lag: follow the view velocity
+    // and pull toward the samples (12 ms); air, grinds and jumps over 5 cm draw the samples as they are
+    if (v.mode === 'ride' && this.groundMode === 'ride') {
+      this.groundPos.addScaledVector(v.vel, dt);
+      if (this.groundPos.distanceToSquared(v.pos) < 0.0025) { this.groundPos.lerp(v.pos, 1 - Math.exp(-dt / 0.012)); v.pos.copy(this.groundPos); }
+      else this.groundPos.copy(v.pos);
+    } else this.groundPos.copy(v.pos);
+    this.groundMode = v.mode;
     this.processEvents();
 
     this.tod.update(dt);
@@ -471,6 +559,7 @@ export class Game {
     this.rig.update(dt, focus, v);
     this.tricks.update(dt, ph.mode === 'ride', ph.manual.active || ph.kickturn.t >= 0);
     this.hud.update(dt);
+    if (this.titleHide) { this.titleHide = false; this.hud.showTitle(false); }
     this.audio.update(dt, v.speed, v.surface, v.mode === 'ride', v.grind ? v.grind.speed : 0);
     shared.uTime.value = this.simTime;
     this.ocean.mat.uniforms.uTime.value = this.simTime;
@@ -521,6 +610,7 @@ export class Game {
     if (ev.recenter) this.rig.recenter();
     if (ev.help) this.hud.toggleHelp();
     this.rig.look(lk.yaw, lk.pitch);
+    if (this.attract && padActive()) this.endAttract();
   }
 
   private qTimer = 0;

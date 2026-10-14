@@ -184,6 +184,8 @@ export class Input {
   get autoActive() { return this.autoOn && !!this.auto; }
   set autoActive(on: boolean) { this.setAuto(on); }
   setAuto(on: boolean) { this.autoOn = on; this.autoSuspended = false; this.autoIdle = 0; this.auto?.reset(); }
+  /** counts as the first W / A / D for the Easy cruise (the start-screen hand-over: he keeps rolling) */
+  armCruise() { this.cruiseOff = false; this.stuckT = 0; }
   /** seconds until a suspended auto-ride takes over again (0 when not suspended) */
   get autoResumeIn() { return this.autoSuspended ? Math.max(0, AUTO_RESUME - this.autoIdle) : 0; }
 

@@ -72,7 +72,7 @@ const stats = { n: 0, pass: 0, noBail: 0, relocate: 0, walk: 0, here: 0, fails: 
 const bodyStandFail = [], times = [], shuffles = [];
 let flatBodies = 0;
 const whyMoved = {};
-let farMax = 0, farBodyMax = 0;
+let farMax = 0, farBodyMax = 0, levelMoves = 0, rolls = 0;
 const check = (ok, msg, c, extra = '') => { if (!ok) c.fail.push(msg + extra); return ok; };
 
 for (const c of cases.filter((c) => !process.env.ONLY || c.name === process.env.ONLY)) {
@@ -130,8 +130,14 @@ for (const c of cases.filter((c) => !process.env.ONLY || c.name === process.env.
   if (plan.relocate) whyMoved[plan.why.split(' ').slice(1).join(' ')] = (whyMoved[plan.why.split(' ').slice(1).join(' ')] ?? 0) + 1;
   if (process.env.HERE && plan.why.startsWith('here')) console.log(`here: ${c.name} stand (${stand.x.toFixed(2)},${stand.y.toFixed(2)},${stand.z.toFixed(2)})`);
   if (plan.relocate) {
-    bl.board.moveTo(plan.ride, plan.fwd, plan.up, 0.6);
-    for (let i = 0; i < 120 && bl.board.gliding; i++) ph.step(STEP, inp);
+    // as the skater does it: to another level the board rolls along the ground, otherwise a short hop
+    const from = bl.board.rootPos(new Vector3());
+    const level = Math.abs(plan.ride.y - from.y) > 0.3;
+    const route = level ? R.groundRoute(world, from, plan.ride) : null;
+    if (level) { levelMoves++; if (route) rolls++; }
+    if (route) bl.board.rollTo(route, plan.fwd, FAST ? Math.min(0.75, Math.max(0.45, route.len / 6)) : Math.min(1.8, Math.max(0.7, route.len / 3.2)));
+    else bl.board.moveTo(plan.ride, plan.fwd, plan.up, 0.6);
+    for (let i = 0; i < 300 && bl.board.gliding; i++) ph.step(STEP, inp);
     const rp = new Vector3(), rf = new Vector3(), ru = new Vector3();
     bl.board.ridePose(rp, rf, ru);
     check(rp.distanceTo(plan.ride) < 0.08, 'relocated board off its spot', c, ` d=${rp.distanceTo(plan.ride).toFixed(2)}`);
@@ -142,6 +148,7 @@ for (const c of cases.filter((c) => !process.env.ONLY || c.name === process.env.
   check(!!rg && rg.normal.y >= R.WALK_NY, 'ride spot not walkable', c, rg ? ` ny=${rg.normal.y.toFixed(2)}` : ' no ground');
   check(R.standClear(world, plan.ride.clone().add(new Vector3(0, 0.12, 0))), 'rider on the board clips geometry', c);
   check(R.standClear(world, plan.target), 'step-on spot clips geometry', c);
+  check(!R.onTop(world, plan.ride), 'ride spot on top of a ledge / pad / funbox', c, ` (${plan.why})`);
   const far = Math.hypot(plan.ride.x - bailAt.x, plan.ride.z - bailAt.z);
   const farBody = Math.hypot(plan.ride.x - body.x, plan.ride.z - body.z);
   check(far < 7.5 || farBody < 5.5, 'ride spot far from the bail', c, ` ${far.toFixed(1)} m from the bail, ${farBody.toFixed(1)} m from the body (${plan.why})`);
@@ -169,6 +176,7 @@ console.log(`${FAST ? 'FAST ' : ''}recovery sim: ${stats.pass}/${stats.n} pass (
 console.log(`settle time (body + board at rest) median ${times[times.length >> 1]?.toFixed(2)} s, p90 ${times[Math.floor(times.length * 0.9)]?.toFixed(2)} s`);
 if (bodyStandFail.length) console.log(`body not standable: ${bodyStandFail.length}`);
 console.log(`body at rest on level ground (normal.y >= 0.96): ${flatBodies}/${stats.n}`);
+console.log(`board moved to another level (deck <-> bowl etc.): ${levelMoves}, rolled along the ground ${rolls}, hopped ${levelMoves - rolls}`);
 console.log(`why the board could not stay where it lay: ${JSON.stringify(whyMoved)}; ride spot max ${farMax.toFixed(1)} m from the bail point, ${farBodyMax.toFixed(1)} m from where the body came to rest`);
 shuffles.sort((a, b) => a - b);
 console.log(`body shuffled over to a standable spot: ${shuffles.length} cases, median ${shuffles[shuffles.length >> 1]?.toFixed(2) ?? '-'} m, max ${shuffles[shuffles.length - 1]?.toFixed(2) ?? '-'} m`);

@@ -7,7 +7,7 @@ import { toonMaterial } from '../render/materials';
 import { clamp, lerp, Spring } from '../core/util';
 import { KICKTURN_T, PUSH, dropRootAng, type BailKind, type PhysView } from './physics';
 import { BoardView, deckTopY } from './board';
-import { planRecovery, standable, findStandSpot, walkPath, groundAt, levelness, WALK_NY, STEP_UP, STEP_DOWN, type RecoveryPlan } from './recovery';
+import { planRecovery, standable, findStandSpot, walkPath, groundAt, groundRoute, levelness, WALK_NY, STEP_UP, STEP_DOWN, type RecoveryPlan } from './recovery';
 
 const X = new Vector3(1, 0, 0), Y = new Vector3(0, 1, 0), Z = new Vector3(0, 0, 1);
 const ONE = new Vector3(1, 1, 1);
@@ -691,15 +691,16 @@ export class Skater {
       const mp = 0.27 + ph.manual.balance * 0.07 + A * 0.32 * Math.sin(this.time * 3.3) + A * 0.14 * Math.sin(this.time * 7.3 + 1);
       pitch = lerp(pitch, mp, man); pivot = lerp(pivot, -0.18, man);
     }
-    // kickturn: the nose lifts ~28 deg and sets down as the board swings round on its back wheels
+    // kickturn: the leading end lifts ~28 deg and sets down as the board swings round on the downhill wheels (forward: nose
+    // up on the back wheels; fakie: tail up on the front wheels)
     if (ph.kickturn.t >= 0) {
-      const k = clamp(ph.kickturn.t / KICKTURN_T, 0, 1);
-      pitch = Math.max(pitch, 0.5 * Math.sin(Math.PI * Math.min(1, k * 1.08)));
-      pivot = -0.18;
+      const k = clamp(ph.kickturn.t / KICKTURN_T, 0, 1), kick = 0.5 * Math.sin(Math.PI * Math.min(1, k * 1.08));
+      if (ph.fakie) { pitch = Math.min(pitch, -kick); pivot = 0.18; } else { pitch = Math.max(pitch, kick); pivot = -0.18; }
     }
     // drop-in: the part of the board's pitch the board root doesn't carry yet (set-up nose-up, start of the pivot) is a
     // deck pose about the trailing truck (tail on the coping)
     const dI = ph.dropin;
+    this.inDropin = !!dI;
     if (dI) { const dp = dropRootAng(dI) - dI.ang; if (dp > 1e-4) { pitch = dp * dI.lead; pivot = -0.18 * dI.lead; } }
     // flips: the board turns in open air under the feet, the deck is back to identity at the catch
     let useDeck = true, fp = 0, kind = '';
@@ -739,12 +740,43 @@ export class Skater {
       const e = sm((this.phaseT - this.stepDelay) / this.stepDur);
       this.root.position.lerpVectors(this.clipRootPos, board.root.position, e);
       this.root.quaternion.slerpQuaternions(this.clipRootQ, rq, e);
+      this.rootS.t = -1;
     } else {
       this.root.position.copy(board.root.position);
-      this.root.quaternion.copy(rq);
+      this.root.quaternion.copy(this.followBoard(rq));
     }
     this.root.updateMatrixWorld(true);
   }
+
+  private rootS = { q: new Quaternion(), prev: new Quaternion(), w: new Vector3(), t: -1, d: new Quaternion(), wB: new Vector3() };
+  private vTti = 0.5;
+  private vTtiT = -1;
+  /**
+   * Body orientation: follows the board through its angular rate (filtered over 35 ms) plus a pull onto it (120 ms), so a
+   * steady turn has no lag while the start or end of a transition's curvature never jolts the body. Kept within 0.12 rad
+   * of the board (kickturns, pivots, spins); the feet stay on the deck through the leg IK.
+   */
+  private followBoard(rq: Quaternion) {
+    const s = this.rootS, dt = this.time - s.t;
+    if (s.t >= 0 && dt <= 0) return s.q;
+    s.t = this.time;
+    if (dt > 0.1 || s.q.angleTo(rq) > 0.5) { s.q.copy(rq); s.prev.copy(rq); s.w.set(0, 0, 0); return s.q; }
+    const d = s.d.copy(rq).multiply(_q.copy(s.prev).invert()); // this frame's board rotation (world): rq = d * prev
+    if (d.w < 0) d.set(-d.x, -d.y, -d.z, -d.w);
+    const sh = Math.hypot(d.x, d.y, d.z), ang = 2 * Math.atan2(sh, d.w);
+    s.wB.set(d.x, d.y, d.z).multiplyScalar(sh > 1e-9 ? ang / (sh * dt) : 0);
+    s.prev.copy(rq);
+    s.w.lerp(s.wB, 1 - Math.exp(-dt / 0.035));
+    const wl = s.w.length();
+    if (wl > 1e-9) s.q.premultiply(_q.setFromAxisAngle(_v.copy(s.w).divideScalar(wl), wl * dt));
+    s.q.slerp(rq, 1 - Math.exp(-dt / 0.12)).normalize();
+    // soft limit on the body-board angle (C1, no corner when it engages), exact during a drop-in (its own eased pivot)
+    const e = s.q.angleTo(rq);
+    if (this.inDropin) s.q.copy(rq);
+    else if (e > 0.1) s.q.slerp(rq, 1 - (0.1 + 0.06 * Math.tanh((e - 0.1) / 0.06)) / e);
+    return s.q;
+  }
+  private inDropin = false;
 
   // ------------------------------------------------------------------------------------- riding pose
   private ridePose(dt: number, ph: PhysView, board: BoardView) {
@@ -833,7 +865,8 @@ export class Skater {
       const uphill = _v.set(0, 1, 0).addScaledVector(ph.up, -ph.up.y);
       const goingUp = uphill.lengthSq() > 1e-4 ? ph.vel.dot(uphill.normalize()) : 0;
       const steep = 1 - ph.up.y;
-      const pumpT = !onTrans ? 0 : goingUp > 0.4 ? 0.05 : goingUp < -0.4 ? -0.15 * (1 - steep) - 0.02 : 0;
+      // continuous in the climb rate and the transition weight: no target steps for the spring to turn into corners
+      const pumpT = trans * (0.05 * sm((goingUp - 0.2) / 0.4) + (-0.15 * (1 - steep) - 0.02) * sm((-goingUp - 0.2) / 0.4));
       const pump = this.pumpS.update(pumpT * (1 - this.dropS.x), dt);
       P.hipH += pump; P.pPitch -= pump * 0.9;
       P.hipH += 0.016 * Math.sin(t * 2.6) * trans;
@@ -852,7 +885,7 @@ export class Skater {
     const dw = this.dropS.update(dropOn ? 1 : 0, dt);
     if (dw > 0.001) {
       const lead = dI ? dI.lead : ph.fakie ? -1 : 1;
-      const lean = dI ? (dI.phase === 'pivot' ? sm(dI.pk * 1.4) : 0) : 1;
+      const lean = dI ? (dI.phase === 'pivot' ? sm(dI.pk * 1.15) : 0) : 1;
       P.hipH = lerp(P.hipH, lerp(0.76, 0.5, lean), dw);
       hipShift += dw * lead * lerp(-0.12, 0.08, lean);
       P.pYaw += dw * lead * 0.32 * lean; P.cYaw += dw * lead * 0.22 * lean;
@@ -918,7 +951,7 @@ export class Skater {
       const k = clamp(ph.kickturn.t / KICKTURN_T, 0, 1);
       const kw = sm(k / 0.28) * (1 - sm((k - 0.72) / 0.28)); // >= 0.12 s edges: no hip pop at either end
       const d = ph.kickturn.dir;
-      P.hipH -= 0.09 * kw; hipShift -= 0.07 * kw; P.pRoll += 0.12 * kw;
+      P.hipH -= 0.09 * kw; hipShift -= 0.07 * kw * (ph.fakie ? -1 : 1); P.pRoll += 0.12 * kw;
       P.cYaw += d * 0.55 * Math.sin(Math.PI * Math.min(1, k * 1.5));
       P.pYaw += d * 0.2 * Math.sin(Math.PI * Math.min(1, k * 1.3));
       P.aL.raise += 0.5 * kw; P.aR.raise += 0.5 * kw; P.aL.hang *= 1 - kw; P.aR.hang *= 1 - kw;
@@ -944,7 +977,11 @@ export class Skater {
     // ---- air
     if (inAir) {
       if (ph.vert) {
-        const tti = ph.predicted ? ph.predicted.tti : 0.5;
+        // the landing estimate is re-predicted every few steps: count it down smoothly so the hips don't step with it
+        const raw = ph.predicted ? ph.predicted.tti : 0.5;
+        this.vTti = this.time - this.vTtiT > 0.1 ? raw : Math.max(0, this.vTti - dt) + (raw - Math.max(0, this.vTti - dt)) * (1 - Math.exp(-dt / 0.08));
+        this.vTtiT = this.time;
+        const tti = this.vTti;
         P.hipH = lerp(0.5, 0.72, sm((0.3 - tti) / 0.24));
         P.pPitch = 0.3; P.cPitch = 0.12; P.hPitch = 0.2;
         Object.assign(P.aL, arm(1.0, 0.35, 0.45)); Object.assign(P.aR, arm(0.95, -0.25, 0.45));
@@ -1402,8 +1439,13 @@ export class Skater {
     const usable = !bb.gliding && (!moving || (bb.v.length() < 0.3 && bb.w.length() < 2));
     const plan = planRecovery(ph.world, stand, usable ? rest : null,
       this.fast ? { maxWalk: 1.2, face: yaw, prefer: rest.fwd, tight: true } : { maxWalk: 5, prefer: rest.fwd });
-    if (plan.relocate) bb.moveTo(plan.ride, plan.fwd, plan.up, this.fast ? 0.42 : 0.6);
-    else if (moving) bb.asleep = true;
+    if (plan.relocate) {
+      // to another level (deck <-> bowl): it rolls there along the ground (over the coping, down or up the wall)
+      const from = bb.rootPos(new Vector3());
+      const route = Math.abs(plan.ride.y - from.y) > 0.3 ? groundRoute(ph.world, from, plan.ride) : null;
+      if (route) bb.rollTo(route, plan.fwd, this.fast ? clamp(route.len / 6, 0.45, 0.75) : clamp(route.len / 3.2, 0.7, 1.8));
+      else bb.moveTo(plan.ride, plan.fwd, plan.up, this.fast ? 0.42 : 0.6);
+    } else if (moving) bb.asleep = true;
     this.plan = plan;
     return true;
   }
