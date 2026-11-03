@@ -401,3 +401,5 @@ via @fontsource (SIL OFL 1.1) · Blender (GPL, build tool only) · NumPy, SciPy,
 ### Skills consulted
 
 cloudai-x/threejs-skills, dgreenheck/webgpu-claude-skill, majidmanzarpour/threejs-game-skills and skills from skills.sh.
+
+☕ like it? [buy me a coffee](https://buymeacoffee.com/prasenx) or [sponsor on github](https://github.com/sponsors/StarKnightt)
